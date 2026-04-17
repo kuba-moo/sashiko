@@ -28,6 +28,37 @@ use aws_smithy_types::{Document, Number};
 use std::collections::HashMap;
 use tracing::info;
 
+// --- JSON Schema normalization for Bedrock ---
+
+/// Bedrock requires standard JSON Schema type names (lowercase: "object",
+/// "string", etc.) but Gemini-style schemas use uppercase ("OBJECT", "STRING").
+/// Recursively normalize all "type" values to lowercase.
+fn normalize_json_schema(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(obj) => {
+            let map: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| {
+                    if k == "type" {
+                        if let Some(s) = v.as_str() {
+                            (k.clone(), serde_json::Value::String(s.to_lowercase()))
+                        } else {
+                            (k.clone(), normalize_json_schema(v))
+                        }
+                    } else {
+                        (k.clone(), normalize_json_schema(v))
+                    }
+                })
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(normalize_json_schema).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 // --- serde_json::Value <-> aws_smithy_types::Document conversion ---
 
 fn json_to_document(value: &serde_json::Value) -> Document {
@@ -293,7 +324,7 @@ fn translate_request(
         let mut bedrock_tools: Vec<Tool> = tools
             .iter()
             .filter_map(|t| {
-                let schema_doc = json_to_document(&t.parameters);
+                let schema_doc = json_to_document(&normalize_json_schema(&t.parameters));
                 Some(Tool::ToolSpec(
                     ToolSpecification::builder()
                         .name(&t.name)

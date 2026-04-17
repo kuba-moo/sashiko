@@ -34,7 +34,8 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage, ProviderCapabilities,
+    ToolCall,
 };
 
 pub struct ClaudeCliProvider {
@@ -209,6 +210,13 @@ pub fn build_prompt(request: &AiRequest) -> String {
              For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
              Do not mix both. Output exactly one JSON object.\n",
         );
+    } else if let Some(AiResponseFormat::Json { schema }) = &request.response_format {
+        out.push_str(
+            "RESPONSE FORMAT: You MUST respond with a SINGLE valid JSON object only (no markdown, no explanation).\n",
+        );
+        if let Some(s) = schema {
+            out.push_str(&format!("The JSON MUST conform to this schema: {}\n", s));
+        }
     }
 
     out

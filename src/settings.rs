@@ -169,6 +169,9 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    /// Directory to dump full conversation JSON for each AI turn.
+    #[serde(default)]
+    pub dump_conversation: Option<String>,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,

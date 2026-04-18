@@ -399,6 +399,7 @@ async fn main() -> Result<()> {
                                 custom_prompt: args.custom_prompt.clone(),
                                 series_range,
                                 stages: args.stages.clone(),
+                                dump_conversation: settings.ai.dump_conversation.as_ref().map(PathBuf::from),
                             },
                         );
 

@@ -100,6 +100,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub dump_conversation: Option<PathBuf>,
 }
 
 pub struct WorkerResult {
@@ -401,6 +402,7 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    dump_conversation: Option<PathBuf>,
 }
 
 impl Worker {
@@ -420,6 +422,7 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            dump_conversation: config.dump_conversation,
         }
     }
 
@@ -502,8 +505,10 @@ impl Worker {
                             .map(|prefix| format!("{}s:0] ", &prefix[..prefix.len() - 2])),
                     };
 
+                    self.dump_json("s0", 1, "req", &req);
                     match self.provider.generate_content(req).await {
                         Ok(resp) => {
+                            self.dump_json("s0", 1, "resp", &resp);
                             if let Some(usage) = &resp.usage {
                                 total_tokens_in += usage.prompt_tokens as u32;
                                 total_tokens_out += usage.completion_tokens as u32;
@@ -660,8 +665,10 @@ CRITICAL: Always err on the side of running more stages. If you are not absolute
             };
 
             info!("Running planning pre-phase");
+            self.dump_json("sp", 1, "req", &req);
             match self.provider.generate_content(req).await {
                 Ok(resp) => {
+                    self.dump_json("sp", 1, "resp", &resp);
                     if let Some(usage) = &resp.usage {
                         total_tokens_in += usage.prompt_tokens as u32;
                         total_tokens_out += usage.completion_tokens as u32;
@@ -1191,6 +1198,8 @@ Example:
         let mut t_in = 0;
         let mut t_out = 0;
         let mut t_cached = 0;
+        let mut prev_msg_count = local_history.len();
+        let stage_label = format!("s{}", _stage);
 
         loop {
             turns += 1;
@@ -1211,7 +1220,16 @@ Example:
                     .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
             };
 
+            if turns == 1 {
+                self.dump_json(&stage_label, turns, "req", &request);
+            } else {
+                let new_msgs = &local_history[prev_msg_count..];
+                self.dump_json(&stage_label, turns, "req", &new_msgs);
+            }
+            prev_msg_count = local_history.len();
+
             let resp = self.provider.generate_content(request).await?;
+            self.dump_json(&stage_label, turns, "resp", &resp);
 
             if let Some(usage) = &resp.usage {
                 t_in += usage.prompt_tokens as u32;
@@ -1258,6 +1276,25 @@ Example:
         }
 
         Err(ReviewError::LimitExceeded.into())
+    }
+
+    fn dump_json(&self, stage_label: &str, turn: usize, suffix: &str, data: &impl serde::Serialize) {
+        let Some(dir) = &self.dump_conversation else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("Failed to create dump dir {:?}: {}", dir, e);
+            return;
+        }
+        let path = dir.join(format!("{}_{:03}_{}.json", stage_label, turn, suffix));
+        match serde_json::to_string_pretty(data) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!("Failed to write dump {:?}: {}", path, e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize dump: {}", e),
+        }
     }
 }
 
@@ -1498,6 +1535,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            dump_conversation: None,
         };
         let mut worker = Worker::new(provider, tools, prompts, config);
 

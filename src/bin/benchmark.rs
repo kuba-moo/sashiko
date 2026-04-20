@@ -1318,7 +1318,7 @@ async fn process_corpus_case(
             tool_call_id: None,
         }],
         tools: None,
-        temperature: Some(0.2),
+        temperature: None,
         response_format: Some(AiResponseFormat::Json {
             schema: Some(schema.clone()),
         }),

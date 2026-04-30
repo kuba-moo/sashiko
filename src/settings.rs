@@ -438,6 +438,20 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(unused)]
+pub struct SemcodeSettings {
+    /// Path to the semcode-mcp binary. Defaults to "semcode-mcp" (found via PATH).
+    #[serde(default)]
+    pub mcp_binary: Option<String>,
+    /// Path to the semcode-index binary. Defaults to "semcode-index" (found via PATH).
+    #[serde(default)]
+    pub index_binary: Option<String>,
+    /// Enable semcode tools for AI review. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct Settings {
@@ -457,6 +471,8 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+    #[serde(default)]
+    pub semcode: Option<SemcodeSettings>,
 }
 
 fn default_subsystems() -> SubsystemsSettings {

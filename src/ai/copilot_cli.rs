@@ -168,6 +168,7 @@ pub fn parse_jsonl_events(raw: &str) -> Result<AiResponse> {
                         completion_tokens: out_tokens as usize,
                         total_tokens: out_tokens as usize,
                         cached_tokens: None,
+                        cache_write_tokens: None,
                     });
                 }
             }

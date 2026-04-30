@@ -409,6 +409,7 @@ impl AiProvider for KiroCliProvider {
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
             cached_tokens: None,
+            cache_write_tokens: None,
         });
 
         parse_inner_response(&text, usage)

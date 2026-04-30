@@ -750,6 +750,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
         completion_tokens: m.candidates_token_count.unwrap_or(0) as usize,
         total_tokens: m.total_token_count as usize,
         cached_tokens: m.cached_content_token_count.map(|c| c as usize),
+        cache_write_tokens: None,
     });
 
     Ok(AiResponse {

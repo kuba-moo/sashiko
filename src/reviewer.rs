@@ -3070,6 +3070,7 @@ fi
                     completion_tokens: self.completion_tokens,
                     total_tokens: self.prompt_tokens + self.completion_tokens,
                     cached_tokens: Some(self.cached_tokens),
+                    cache_write_tokens: None,
                 }),
                 truncated: false,
             })

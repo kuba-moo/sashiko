@@ -328,6 +328,7 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
         completion_tokens: resp.eval_count as usize,
         total_tokens: (resp.prompt_eval_count + resp.eval_count) as usize,
         cached_tokens: None,
+        cache_write_tokens: None,
     });
 
     Ok(AiResponse {

@@ -337,6 +337,7 @@ impl<'a> SessionRunner<'a> {
                         completion_tokens: total_completion_tokens,
                         total_tokens: total_prompt_tokens + total_completion_tokens,
                         cached_tokens: Some(total_cached_tokens),
+                        cache_write_tokens: None,
                     };
                     return Ok(SessionResult {
                         output,

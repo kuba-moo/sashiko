@@ -404,8 +404,7 @@ fn translate_response(
     }
 
     // Bedrock splits input into uncached + cache_read + cache_write; sum all
-    // three for the true total.  cache_write isn't in AiUsage because Gemini
-    // has no equivalent — the Bedrock log line still prints it for cost analysis.
+    // three for the true total.
     let usage = output.usage.as_ref().map(|u| {
         let cache_read = u.cache_read_input_tokens().unwrap_or(0);
         let cache_write = u.cache_write_input_tokens().unwrap_or(0);
@@ -416,6 +415,11 @@ fn translate_response(
             total_tokens: (total_input + u.output_tokens()) as usize,
             cached_tokens: if cache_read > 0 {
                 Some(cache_read as usize)
+            } else {
+                None
+            },
+            cache_write_tokens: if cache_write > 0 {
+                Some(cache_write as usize)
             } else {
                 None
             },

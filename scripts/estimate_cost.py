@@ -53,8 +53,23 @@ def load_sessions(dump_dir: Path):
     return sessions
 
 
-def analyze_session(turns):
-    prompt = 0
+def detect_prompt_includes_cached(turns):
+    """Detect whether prompt_tokens already includes cached_tokens.
+
+    Before commit 6a39913, sashiko logged prompt_tokens as uncached-only input
+    and cached_tokens separately (so cached could exceed prompt).  After that
+    fix, prompt_tokens = uncached + cache_read + cache_write, always >= cached.
+    """
+    for _, u in turns:
+        p = u.get("prompt_tokens", 0)
+        c = u.get("cached_tokens", 0)
+        if c > p and p > 0:
+            return False
+    return True
+
+
+def analyze_session(turns, prompt_includes_cached: bool):
+    total_input = 0
     cached = 0
     completion = 0
     cache_writes = 0
@@ -65,7 +80,12 @@ def analyze_session(turns):
         p = u.get("prompt_tokens", 0)
         c = u.get("cached_tokens", 0)
         o = u.get("completion_tokens", 0)
-        prompt += p
+
+        if prompt_includes_cached:
+            total_input += p
+        else:
+            total_input += p + c
+
         cached += c
         completion += o
         if first_cached is None:
@@ -76,7 +96,7 @@ def analyze_session(turns):
 
     return {
         "turns": len(turns),
-        "prompt": prompt,
+        "total_input": total_input,
         "cached": cached,
         "completion": completion,
         "cache_writes": cache_writes,
@@ -109,13 +129,18 @@ def main():
         print(f"Error: no *_resp.json files found in {args.dump_dir}", file=sys.stderr)
         sys.exit(1)
 
+    # Detect accounting scheme from all turns
+    all_turns = [t for lst in sessions.values() for t in lst]
+    prompt_includes_cached = detect_prompt_includes_cached(all_turns)
+
     results = {}
     for sid in sorted(sessions):
-        results[sid] = analyze_session(sessions[sid])
+        results[sid] = analyze_session(sessions[sid], prompt_includes_cached)
 
-    grand = {k: sum(r[k] for r in results.values()) for k in ["prompt", "cached", "completion", "cache_writes"]}
+    grand = {k: sum(r[k] for r in results.values()) for k in ["total_input", "cached", "completion", "cache_writes"]}
 
-    input_cost = cost(grand["prompt"], args.input_rate)
+    uncached_input = grand["total_input"] - grand["cached"]
+    input_cost = cost(uncached_input, args.input_rate)
     read_cost = cost(grand["cached"], args.cache_read_rate)
     write_cost = cost(grand["cache_writes"], args.cache_write_rate)
     output_cost = cost(grand["completion"], args.output_rate)
@@ -135,23 +160,22 @@ def main():
             },
         }
         if args.no_cache:
-            no_cache_input = grand["prompt"] + grand["cached"]
             out["cost"]["no_cache_total"] = round(
-                cost(no_cache_input, args.input_rate) + cost(grand["completion"], args.output_rate), 2
+                cost(grand["total_input"], args.input_rate) + cost(grand["completion"], args.output_rate), 2
             )
         json.dump(out, sys.stdout, indent=2)
         print()
         return
 
     # Table header
-    print(f"{'session':<8} {'turns':>5} {'input':>10} {'cached':>10} {'writes':>10} {'output':>10} {'1st cached':>10}")
+    print(f"{'session':<8} {'turns':>5} {'total in':>10} {'cached':>10} {'writes':>10} {'output':>10} {'1st cached':>10}")
     print("-" * 75)
 
     for sid in sorted(results):
         r = results[sid]
         print(
             f"{sid:<8} {r['turns']:>5} "
-            f"{fmt_tokens(r['prompt']):>10} "
+            f"{fmt_tokens(r['total_input']):>10} "
             f"{fmt_tokens(r['cached']):>10} "
             f"{fmt_tokens(r['cache_writes']):>10} "
             f"{fmt_tokens(r['completion']):>10} "
@@ -161,22 +185,21 @@ def main():
     print("-" * 75)
     print(
         f"{'TOTAL':<8} {sum(r['turns'] for r in results.values()):>5} "
-        f"{fmt_tokens(grand['prompt']):>10} "
+        f"{fmt_tokens(grand['total_input']):>10} "
         f"{fmt_tokens(grand['cached']):>10} "
         f"{fmt_tokens(grand['cache_writes']):>10} "
         f"{fmt_tokens(grand['completion']):>10}"
     )
 
     print()
-    print(f"  Input ({args.input_rate}/M):       ${input_cost:>8.2f}")
-    print(f"  Cache read ({args.cache_read_rate}/M):   ${read_cost:>8.2f}")
-    print(f"  Cache write ({args.cache_write_rate}/M):  ${write_cost:>8.2f}")
-    print(f"  Output ({args.output_rate}/M):      ${output_cost:>8.2f}")
-    print(f"  {'TOTAL':24s} ${total:>8.2f}")
+    print(f"  Uncached input ({fmt_tokens(uncached_input)}) @ ${args.input_rate}/M:  ${input_cost:>8.2f}")
+    print(f"  Cache read ({fmt_tokens(grand['cached'])}) @ ${args.cache_read_rate}/M:    ${read_cost:>8.2f}")
+    print(f"  Cache write ({fmt_tokens(grand['cache_writes'])}) @ ${args.cache_write_rate}/M:   ${write_cost:>8.2f}")
+    print(f"  Output ({fmt_tokens(grand['completion'])}) @ ${args.output_rate}/M:       ${output_cost:>8.2f}")
+    print(f"  {'TOTAL':40s} ${total:>8.2f}")
 
     if args.no_cache:
-        no_cache_input = grand["prompt"] + grand["cached"]
-        no_cache_total = cost(no_cache_input, args.input_rate) + cost(grand["completion"], args.output_rate)
+        no_cache_total = cost(grand["total_input"], args.input_rate) + cost(grand["completion"], args.output_rate)
         print()
         print(f"  Without caching:         ${no_cache_total:>8.2f}")
         print(f"  Savings:                 ${no_cache_total - total:>8.2f} ({(no_cache_total - total) / no_cache_total * 100:.0f}%)")

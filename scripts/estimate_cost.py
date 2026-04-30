@@ -32,6 +32,7 @@ def parse_args():
     p.add_argument("--output-rate", type=float, default=25.0, help="$/M for output tokens (default: 25.0)")
     p.add_argument("--no-cache", action="store_true", help="Show hypothetical cost with no caching")
     p.add_argument("--context-split", action="store_true", help="Show how much input is initial context vs tool-use interaction")
+    p.add_argument("--output-split", action="store_true", help="Show output tokens split by mid-conversation (tool calls) vs final response")
     p.add_argument("--json", action="store_true", help="Output as JSON")
     return p.parse_args()
 
@@ -47,10 +48,13 @@ def load_sessions(dump_dir: Path):
             continue
         sid, turn = m.group(1), int(m.group(2))
         try:
-            usage = json.loads(f.read_text()).get("usage", {})
+            resp = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        sessions[sid].append((turn, usage))
+        usage = resp.get("usage", {})
+        has_tool_calls = bool(resp.get("tool_calls"))
+        has_content = resp.get("content") is not None and len(str(resp.get("content", ""))) > 0
+        sessions[sid].append((turn, usage, has_tool_calls, has_content))
 
     for lst in sessions.values():
         lst.sort(key=lambda x: x[0])
@@ -64,7 +68,8 @@ def detect_prompt_includes_cached(turns):
     and cached_tokens separately (so cached could exceed prompt).  After that
     fix, prompt_tokens = uncached + cache_read + cache_write, always >= cached.
     """
-    for _, u in turns:
+    for t in turns:
+        u = t[1]
         p = u.get("prompt_tokens", 0)
         c = u.get("cached_tokens", 0)
         if c > p and p > 0:
@@ -80,12 +85,17 @@ def analyze_session(turns, prompt_includes_cached: bool):
     completion = 0
     prev_cached = 0
     first_cached = None
-    has_explicit_write = any(u.get("cache_write_tokens") is not None for _, u in turns)
+    has_explicit_write = any(u.get("cache_write_tokens") is not None for _, u, _, _ in turns)
 
     # Track per-turn prompt_tokens for context vs interactive breakdown
     per_turn_prompt = []
 
-    for _, u in turns:
+    # Output split: mid-conversation (tool-call turns) vs final (text-only response)
+    mid_output = 0
+    final_output_tokens = 0
+    max_mid_output = 0
+
+    for i, (_, u, has_tools, has_content) in enumerate(turns):
         p = u.get("prompt_tokens", 0)
         c = u.get("cached_tokens", 0)
         o = u.get("completion_tokens", 0)
@@ -115,6 +125,13 @@ def analyze_session(turns, prompt_includes_cached: bool):
             first_cached = c
         prev_cached = c
 
+        is_final = (i == len(turns) - 1) or (has_content and not has_tools)
+        if is_final:
+            final_output_tokens += o
+        else:
+            mid_output += o
+            max_mid_output = max(max_mid_output, o)
+
     # Context vs interactive breakdown
     # Turn 1's prompt_tokens = initial context (system + tools + user message)
     initial_context = per_turn_prompt[0] if per_turn_prompt else 0
@@ -138,7 +155,7 @@ def analyze_session(turns, prompt_includes_cached: bool):
         "uncached": uncached,
         "completion": completion,
         "first_cached": first_cached or 0,
-        "max_cached": max((u.get("cached_tokens", 0) for _, u in turns), default=0),
+        "max_cached": max((u.get("cached_tokens", 0) for _, u, _, _ in turns), default=0),
         "initial_context": initial_context,
         "overall_context": overall_context,
         "overall_interactive": overall_interactive,
@@ -146,6 +163,9 @@ def analyze_session(turns, prompt_includes_cached: bool):
         "final_context": initial_context,
         "final_interactive": final_interactive,
         "final_output": final_output,
+        "mid_output": mid_output,
+        "final_output_tokens": final_output_tokens,
+        "max_mid_output": max_mid_output,
     }
 
 
@@ -327,6 +347,25 @@ def main():
                 fc_pct = fc * 100 / fp
                 fi_pct = fi * 100 / fp
                 print(f"      {sid}: {fmt_tokens(fp)} in  =  {fmt_tokens(fc)} context ({fc_pct:.0f}%) + {fmt_tokens(fi)} interactive ({fi_pct:.0f}%),  {fmt_tokens(fo)} out")
+
+    if args.output_split:
+        total_mid = sum(r["mid_output"] for r in results.values())
+        total_final = sum(r["final_output_tokens"] for r in results.values())
+        total_out = total_mid + total_final
+        print()
+        print("  Output Token Breakdown (mid-conversation vs final response)")
+        print("  " + "-" * 60)
+        print(f"  {'stage':<8} {'turns':>5} {'mid':>8} {'max mid':>8} {'final':>8} {'total':>8}  {'final%':>6}")
+        print(f"  {'-----':<8} {'-----':>5} {'-----':>8} {'-------':>8} {'-----':>8} {'-----':>8}  {'------':>6}")
+        for sid in sorted(results):
+            r = results[sid]
+            mid = r["mid_output"]
+            final = r["final_output_tokens"]
+            stage_out = mid + final
+            pct = f"{final * 100 / stage_out:.0f}%" if stage_out > 0 else "-"
+            print(f"  {sid:<8} {r['turns']:>5} {fmt_tokens(mid):>8} {fmt_tokens(r['max_mid_output']):>8} {fmt_tokens(final):>8} {fmt_tokens(stage_out):>8}  {pct:>6}")
+        if total_out > 0:
+            print(f"  {'TOTAL':<8} {sum(r['turns'] for r in results.values()):>5} {fmt_tokens(total_mid):>8} {'':>8} {fmt_tokens(total_final):>8} {fmt_tokens(total_out):>8}  {total_final * 100 / total_out:.0f}%")
 
 
 if __name__ == "__main__":

@@ -151,9 +151,12 @@ pub struct AiUsage {
     pub completion_tokens: usize,
     /// Total tokens used (prompt + completion).
     pub total_tokens: usize,
-    /// Optional number of tokens served from cache.
+    /// Optional number of tokens served from cache (cache reads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<usize>,
+    /// Optional number of tokens written to cache this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<usize>,
 }
 
 /// Information about the capabilities and constraints of an AI provider.

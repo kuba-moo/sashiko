@@ -230,11 +230,17 @@ fn parse_usage(outer: &Value) -> Option<AiUsage> {
     let input = u["input_tokens"].as_u64().unwrap_or(0) as usize;
     let output = u["output_tokens"].as_u64().unwrap_or(0) as usize;
     let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0) as usize;
+    let cache_write = u["cache_creation_input_tokens"].as_u64().unwrap_or(0) as usize;
     Some(AiUsage {
         prompt_tokens: input,
         completion_tokens: output,
         total_tokens: input + output,
         cached_tokens: Some(cached),
+        cache_write_tokens: if cache_write > 0 {
+            Some(cache_write)
+        } else {
+            None
+        },
     })
 }
 

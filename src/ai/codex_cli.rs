@@ -111,6 +111,7 @@ impl AiProvider for CodexCliProvider {
                                 completion_tokens: output_tokens,
                                 total_tokens: input + output_tokens,
                                 cached_tokens: if cached > 0 { Some(cached) } else { None },
+                                cache_write_tokens: None,
                             });
                         }
                     }

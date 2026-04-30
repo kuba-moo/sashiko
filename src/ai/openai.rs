@@ -436,6 +436,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         completion_tokens: resp.usage.completion_tokens as usize,
         total_tokens: resp.usage.total_tokens as usize,
         cached_tokens: None,
+        cache_write_tokens: None,
     });
 
     Ok(AiResponse {

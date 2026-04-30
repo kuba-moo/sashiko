@@ -490,6 +490,7 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             None
         },
+        cache_write_tokens: resp.usage.cache_creation_input_tokens.map(|c| c as usize),
     };
 
     Ok(AiResponse {

@@ -940,12 +940,15 @@ Example:
                                 result_json.get("concerns").and_then(|c| c.as_array())
                             {
                                 for c in concerns {
-                                    if c.is_object() {
-                                        all_concerns.push(c.clone());
+                                    if let Some(obj) = c.as_object() {
+                                        let mut tagged = obj.clone();
+                                        tagged.insert("source_stage".into(), json!(stage));
+                                        all_concerns.push(serde_json::Value::Object(tagged));
                                     } else if let Some(s) = c.as_str() {
                                         all_concerns.push(serde_json::json!({
                                             "type": "General",
-                                            "description": s
+                                            "description": s,
+                                            "source_stage": stage
                                         }));
                                     }
                                 }
@@ -1028,6 +1031,7 @@ Example:
         // Stage 8
         info!("Running Stage 8");
         let findings_json;
+        let mut dedup_stats = serde_json::Value::Null;
         {
             let stage = 8;
             let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
@@ -1068,11 +1072,11 @@ Example:
             let aggregated_concerns_json =
                 serde_json::to_string_pretty(&all_concerns).unwrap_or_default();
             let user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nAggregated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof).\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\"\n    }}\n  ]\n}}\n```",
+                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nAggregated Concerns (each concern has a \"source_stage\" field indicating which review stage raised it):\n{}\n\nReturn ONLY a JSON object with a 'findings' array and a 'dedup_stats' object.\n\nEach object in the 'findings' array MUST use exactly the following keys:\n- \"problem\" (a string containing the vulnerability description)\n- \"severity\" (a string: Low, Medium, High, or Critical)\n- \"severity_explanation\" (a string detailing the reasoning and proof)\n- \"source_stages\" (an array of stage numbers that independently raised this concern — use the \"source_stage\" fields from the input concerns)\n\nThe 'dedup_stats' object MUST contain:\n- \"total_concerns\": total number of input concerns\n- \"unique_findings\": number of deduplicated findings produced\n- \"multi_stage_count\": number of findings raised by 2 or more stages\n- \"multi_stage_pct\": percentage of findings raised by 2 or more stages\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"source_stages\": [3, 4]\n    }}\n  ],\n  \"dedup_stats\": {{\n    \"total_concerns\": 8,\n    \"unique_findings\": 3,\n    \"multi_stage_count\": 2,\n    \"multi_stage_pct\": 66.7\n  }}\n}}\n```",
                 stage_prompt, full_series_context, aggregated_concerns_json
             );
             let clean_user_prompt = format!(
-                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nAggregated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof).\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\"\n    }}\n  ]\n}}\n```",
+                "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nAggregated Concerns (each concern has a \"source_stage\" field indicating which review stage raised it):\n{}\n\nReturn ONLY a JSON object with a 'findings' array and a 'dedup_stats' object.\n\nEach object in the 'findings' array MUST use exactly the following keys:\n- \"problem\" (a string containing the vulnerability description)\n- \"severity\" (a string: Low, Medium, High, or Critical)\n- \"severity_explanation\" (a string detailing the reasoning and proof)\n- \"source_stages\" (an array of stage numbers that independently raised this concern — use the \"source_stage\" fields from the input concerns)\n\nThe 'dedup_stats' object MUST contain:\n- \"total_concerns\": total number of input concerns\n- \"unique_findings\": number of deduplicated findings produced\n- \"multi_stage_count\": number of findings raised by 2 or more stages\n- \"multi_stage_pct\": percentage of findings raised by 2 or more stages\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"source_stages\": [3, 4]\n    }}\n  ],\n  \"dedup_stats\": {{\n    \"total_concerns\": 8,\n    \"unique_findings\": 3,\n    \"multi_stage_count\": 2,\n    \"multi_stage_pct\": 66.7\n  }}\n}}\n```",
                 clean_stage_prompt, aggregated_concerns_json
             );
             match self
@@ -1103,6 +1107,17 @@ Example:
                             "Stage 8 failed to produce a valid 'findings' array in output."
                         ));
                     }
+
+                    if let Some(ds) = result_json.get("dedup_stats") {
+                        info!(
+                            "Stage 8 dedup: {} total concerns → {} unique findings, {} from multiple stages ({:.1}%)",
+                            ds["total_concerns"],
+                            ds["unique_findings"],
+                            ds["multi_stage_count"],
+                            ds["multi_stage_pct"].as_f64().unwrap_or(0.0)
+                        );
+                        dedup_stats = ds.clone();
+                    }
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!("Stage 8 AI execution failed: {}", e));
@@ -1118,7 +1133,8 @@ Example:
                 "findings": findings_json,
                 "review_inline": "No issues found.",
                 "fixes": "",
-                "concerns_count": all_concerns.len()
+                "concerns_count": all_concerns.len(),
+                "dedup_stats": dedup_stats
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1267,7 +1283,8 @@ Example:
             "findings": findings_json,
             "review_inline": review_inline_text,
             "fixes": fixes_text,
-            "concerns_count": all_concerns.len()
+            "concerns_count": all_concerns.len(),
+            "dedup_stats": dedup_stats
         });
 
         Ok(WorkerResult {

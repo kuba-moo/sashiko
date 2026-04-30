@@ -1224,6 +1224,10 @@ impl Reviewer {
                                         let severity_explanation = f["severity_explanation"]
                                             .as_str()
                                             .map(|s| s.to_string());
+                                        let source_stages = f
+                                            .get("source_stages")
+                                            .filter(|v| v.is_array())
+                                            .map(|v| v.to_string());
 
                                         let _ = ctx
                                             .db
@@ -1232,9 +1236,20 @@ impl Reviewer {
                                                 severity,
                                                 severity_explanation,
                                                 problem,
+                                                source_stages,
                                             })
                                             .await;
                                     }
+                                }
+
+                                if let Some(ds) = review_content.get("dedup_stats") {
+                                    let total = ds["total_concerns"].as_i64().unwrap_or(0);
+                                    let unique = ds["unique_findings"].as_i64().unwrap_or(0);
+                                    let multi = ds["multi_stage_count"].as_i64().unwrap_or(0);
+                                    let _ = ctx
+                                        .db
+                                        .update_review_dedup_stats(review_id, total, unique, multi)
+                                        .await;
                                 }
 
                                 let summary =

@@ -1497,6 +1497,13 @@
                             critical: p.findings_critical || 0
                         };
                         findingsHtml = renderFindingsBadges(counts, statusLabel);
+                        if (p.findings_multi_stage != null && p.findings_multi_stage > 0) {
+                            const totalFindings = counts.low + counts.medium + counts.high + counts.critical;
+                            if (totalFindings > 0) {
+                                const uniquePct = Math.ceil((totalFindings - p.findings_multi_stage) * 100 / totalFindings);
+                                findingsHtml += ` <span style="color:var(--text-dim); font-size:0.85em;" title="${p.findings_multi_stage} of ${totalFindings} findings flagged by multiple review stages">${uniquePct}% unique</span>`;
+                            }
+                        }
                     }
 
                     row.innerHTML = `
@@ -2047,12 +2054,12 @@
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
             let displayResult = '';
-            
+            let outputJson = null;
+
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
             try {
                 if (r.output) {
-                    let outputJson = null;
                     if (typeof r.output === 'string') {
                         outputJson = JSON.parse(r.output);
                     } else if (typeof r.output === 'object') {
@@ -2080,6 +2087,12 @@
                             parts.push(`Medium: <span style="${counts.medium > 0 ? 'color:#FF9800;font-weight:bold' : 'color:var(--text-dim)'}">${counts.medium}</span>`);
                             parts.push(`Low: <span style="${counts.low > 0 ? 'color:#FBC02D;font-weight:bold' : 'color:var(--text-dim)'}">${counts.low}</span>`);
                             displayResult = parts.join(' · ');
+                        }
+
+                        const multiStageFindings = outputJson.findings.filter(f => f.source_stages && Array.isArray(f.source_stages) && f.source_stages.length > 1);
+                        if (multiStageFindings.length > 0) {
+                            const uniquePct = Math.ceil((total - multiStageFindings.length) * 100 / total);
+                            displayResult += ` <span style="color:var(--text-dim); font-size:0.85em;" title="${multiStageFindings.length} of ${total} findings were flagged by multiple review stages">(${uniquePct}% unique)</span>`;
                         }
                         parsedFindings = true;
                     }
@@ -2121,6 +2134,33 @@
                 if (tags.length) budgetIndicators = ` &middot; Budget: ${tags.join(' ')}`;
             }
 
+            let findingsDetailHtml = '';
+            if (parsedFindings && outputJson && outputJson.findings) {
+                const hasMultiStage = outputJson.findings.some(f => f.source_stages && f.source_stages.length > 1);
+                if (hasMultiStage) {
+                    const rows = outputJson.findings.map(f => {
+                        const sev = (f.severity || 'Low').toLowerCase();
+                        const sevColors = { critical: '#B71C1C', high: '#FF5722', medium: '#FF9800', low: '#FBC02D' };
+                        const sevColor = sevColors[sev] || 'var(--text-dim)';
+                        const stages = f.source_stages && f.source_stages.length > 1
+                            ? `<span style="color:var(--text-muted); font-size:0.85em;" title="Independently found by stages ${f.source_stages.join(', ')}">stages ${f.source_stages.join(', ')}</span>`
+                            : '';
+                        const problem = escapeHtml((f.problem || '').substring(0, 120)) + (f.problem && f.problem.length > 120 ? '...' : '');
+                        return `<tr><td style="white-space:nowrap;"><span style="color:${sevColor}; font-weight:bold;">${escapeHtml(f.severity || 'Low')}</span></td><td>${problem}</td><td>${stages}</td></tr>`;
+                    });
+                    findingsDetailHtml = `
+                        <div style="margin-top:8px;">
+                            <button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button>
+                            <div id="findings-${uniqueId}" class="collapsible">
+                                <table style="width:100%; font-size:0.9em; border-collapse:collapse;">
+                                    <thead><tr><th style="text-align:left; padding:4px 8px;">Severity</th><th style="text-align:left; padding:4px 8px;">Problem</th><th style="text-align:left; padding:4px 8px;">Stages</th></tr></thead>
+                                    <tbody>${rows.join('')}</tbody>
+                                </table>
+                            </div>
+                        </div>`;
+                }
+            }
+
             let inlineHtml = '';
             if (r.inline_review) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
@@ -2158,6 +2198,7 @@
                     </div>
                     ${showDetails ? `
                     ${inlineHtml}
+                    ${findingsDetailHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
                         <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">

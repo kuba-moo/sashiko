@@ -56,6 +56,9 @@ pub struct PatchsetRow {
     pub prompts_git_hash: Option<String>,
     pub baseline_logs: Option<String>,
     pub provider: Option<String>,
+    pub concerns_total: Option<i64>,
+    pub concerns_unique: Option<i64>,
+    pub findings_multi_stage: Option<i64>,
     #[serde(skip)]
     pub embargo_until: Option<i64>,
 }
@@ -140,6 +143,7 @@ pub struct Finding {
     pub severity: Severity,
     pub severity_explanation: Option<String>,
     pub problem: String,
+    pub source_stages: Option<String>,
 }
 
 pub struct EmailOutboxRow {
@@ -478,6 +482,18 @@ impl Database {
             .try_add_column("reviews", "budget_flags", "INTEGER DEFAULT 0")
             .await;
         let _ = self
+            .try_add_column("findings", "source_stages", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "concerns_total", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "concerns_unique", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "findings_multi_stage", "INTEGER")
+            .await;
+        let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",
                 "patchsets",
@@ -767,6 +783,22 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_review_dedup_stats(
+        &self,
+        review_id: i64,
+        concerns_total: i64,
+        concerns_unique: i64,
+        findings_multi_stage: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
+                libsql::params![concerns_total, concerns_unique, findings_multi_stage, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)
@@ -873,13 +905,14 @@ impl Database {
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem)
-             VALUES (?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, source_stages)
+             VALUES (?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
                     finding.severity_explanation,
                     finding.problem,
+                    finding.source_stages,
                 ],
             )
             .await?;
@@ -930,6 +963,7 @@ impl Database {
                             severity,
                             severity_explanation,
                             problem,
+                            source_stages: None,
                         })
                         .await;
                 }
@@ -2218,7 +2252,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until
+             p.embargo_until, d.concerns_total, d.concerns_unique, d.findings_multi_stage
              FROM patchsets p
              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
@@ -2233,7 +2267,16 @@ impl Database {
                 WHERE r.status = 'Reviewed'
                 GROUP BY r.patchset_id
              ) f ON p.id = f.patchset_id
-             {} 
+             LEFT JOIN (
+                SELECT r.patchset_id,
+                    SUM(r.concerns_total) as concerns_total,
+                    SUM(r.concerns_unique) as concerns_unique,
+                    SUM(r.findings_multi_stage) as findings_multi_stage
+                FROM reviews r
+                WHERE r.status = 'Reviewed' AND r.concerns_total IS NOT NULL
+                GROUP BY r.patchset_id
+             ) d ON p.id = d.patchset_id
+             {}
              GROUP BY p.id
              ORDER BY p.date DESC LIMIT ? OFFSET ?",
             where_clause
@@ -2313,6 +2356,9 @@ impl Database {
                         prompts_git_hash: None,
                         baseline_logs: None,
                         provider: None,
+                        concerns_total: row.get(20).ok(),
+                        concerns_unique: row.get(21).ok(),
+                        findings_multi_stage: row.get(22).ok(),
                         embargo_until: row.get(19).ok(),
                     });
                 }
@@ -3082,6 +3128,9 @@ impl Database {
                 prompts_git_hash: None,
                 baseline_logs: None,
                 provider: None,
+                concerns_total: None,
+                concerns_unique: None,
+                findings_multi_stage: None,
                 embargo_until: row.get(14).ok(),
             });
         }
@@ -3134,6 +3183,9 @@ impl Database {
                         prompts_git_hash: None,
                         baseline_logs: None,
                         provider: None,
+                        concerns_total: None,
+                        concerns_unique: None,
+                        findings_multi_stage: None,
                         embargo_until: row.get(14).ok(),
                     });
                 }

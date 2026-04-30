@@ -475,6 +475,9 @@ impl Database {
             .try_add_column("patchsets", "embargo_until", "INTEGER")
             .await;
         let _ = self
+            .try_add_column("reviews", "budget_flags", "INTEGER DEFAULT 0")
+            .await;
+        let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",
                 "patchsets",
@@ -753,11 +756,12 @@ impl Database {
         interaction_id: Option<&str>,
         inline_review: Option<&str>,
         logs: Option<&str>,
+        budget_flags: Option<u8>,
     ) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ? WHERE id = ?",
+                libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, review_id],
             )
             .await?;
         Ok(())
@@ -2587,8 +2591,8 @@ impl Database {
                 in_clause = "-1".to_string(); // Fallback so SQL doesn't error
             }
             let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw,
+                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -2615,6 +2619,7 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(10).ok(),
                     "id": r.get::<i64>(11).ok(),
                     "tokens_cached": r.get::<Option<u32>>(12).ok(),
+                    "budget_flags": r.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -2824,8 +2829,8 @@ impl Database {
                 in_clause = "-1".to_string();
             }
             let query_str = format!(
-                "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                "SELECT r.summary, r.created_at, ai.output_raw,
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -2851,6 +2856,7 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(8).ok(),
                     "id": r.get::<i64>(9).ok(),
                     "tokens_cached": r.get::<Option<u32>>(10).ok(),
+                    "budget_flags": r.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -2951,10 +2957,10 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
+                "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw,
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_git_hash, r.result_description,
-                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
+                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached, r.budget_flags
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -2986,6 +2992,7 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "budget_flags": r.get::<Option<i64>>(19).ok().flatten().unwrap_or(0),
             })))
         } else {
             Ok(None)
@@ -4974,6 +4981,7 @@ mod tests {
             "desc",
             None,
             Some("int_id"),
+            None,
             None,
             None,
         )

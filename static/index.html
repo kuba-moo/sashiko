@@ -2106,6 +2106,21 @@
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
+            const bf = r.budget_flags || 0;
+            let budgetIndicators = '';
+            if (bf) {
+                const tags = [];
+                if (bf & 0x02) tags.push('<span title="Stage input budget severe" style="color:var(--error-text);font-weight:bold;">S:in</span>');
+                else if (bf & 0x01) tags.push('<span title="Stage input budget warning" style="color:var(--warn-text);">S:in</span>');
+                if (bf & 0x08) tags.push('<span title="Stage output budget severe" style="color:var(--error-text);font-weight:bold;">S:out</span>');
+                else if (bf & 0x04) tags.push('<span title="Stage output budget warning" style="color:var(--warn-text);">S:out</span>');
+                if (bf & 0x20) tags.push('<span title="Review input budget severe" style="color:var(--error-text);font-weight:bold;">R:in</span>');
+                else if (bf & 0x10) tags.push('<span title="Review input budget warning" style="color:var(--warn-text);">R:in</span>');
+                if (bf & 0x80) tags.push('<span title="Review output budget severe" style="color:var(--error-text);font-weight:bold;">R:out</span>');
+                else if (bf & 0x40) tags.push('<span title="Review output budget warning" style="color:var(--warn-text);">R:out</span>');
+                if (tags.length) budgetIndicators = ` &middot; Budget: ${tags.join(' ')}`;
+            }
+
             let inlineHtml = '';
             if (r.inline_review) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
@@ -2146,7 +2161,7 @@
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
                         <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">
-                            <strong>Tokens used:</strong> ${tokenStr}
+                            <strong>Tokens used:</strong> ${tokenStr}${budgetIndicators}
                         </div>
                     </div>
                     <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; font-size: 0.9em;">

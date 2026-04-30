@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     model TEXT,
     prompts_hash TEXT,
     provider TEXT,
+    budget_flags INTEGER DEFAULT 0,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(patch_id) REFERENCES patches(id),
     FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id),

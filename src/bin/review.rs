@@ -446,7 +446,8 @@ async fn main() -> Result<()> {
                                     "history": result.history,
                                     "tokens_in": result.tokens_in,
                                     "tokens_out": result.tokens_out,
-                                    "tokens_cached": result.tokens_cached
+                                    "tokens_cached": result.tokens_cached,
+                                    "budget_flags": result.budget_flags
                                 }));
                                 break;
                             }

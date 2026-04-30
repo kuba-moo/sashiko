@@ -239,6 +239,10 @@ impl TokenBudget {
         }
     }
 
+    pub fn flags(&self) -> u8 {
+        self.fired
+    }
+
     /// Reset per-stage state (keep review-level bits, counters, and
     /// severe_grace if a review-level severe was the trigger).
     pub fn reset_stage(&mut self) {
@@ -264,6 +268,7 @@ pub struct WorkerResult {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
+    pub budget_flags: u8,
 }
 
 pub struct PromptRegistry {
@@ -1000,6 +1005,7 @@ Example:
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
                 tokens_cached: total_tokens_cached,
+                budget_flags: self.budget.flags(),
             });
         }
 
@@ -1108,6 +1114,7 @@ Example:
                 tokens_in: total_tokens_in,
                 tokens_out: total_tokens_out,
                 tokens_cached: total_tokens_cached,
+                budget_flags: self.budget.flags(),
             });
         }
 
@@ -1257,6 +1264,7 @@ Example:
             tokens_in: total_tokens_in,
             tokens_out: total_tokens_out,
             tokens_cached: total_tokens_cached,
+            budget_flags: self.budget.flags(),
         })
     }
 

@@ -920,6 +920,39 @@
         };
 
         // =====================================================================
+        // COST ESTIMATION
+        // =====================================================================
+        const PRICING = {
+            'gemini-2.5-pro':       { input: 1.25,  cached: 0.3125, output: 10.0 },
+            'gemini-2.5-flash':     { input: 0.15,  cached: 0.0375, output: 0.60 },
+            'gemini-3.1-pro':       { input: 1.25,  cached: 0.3125, output: 10.0 },
+            'claude-opus-4-7':      { input: 5.0,   cached: 0.50,   output: 25.0 },
+            'claude-opus-4-6':      { input: 5.0,   cached: 0.50,   output: 25.0 },
+            'claude-opus-4-5':      { input: 5.0,   cached: 0.50,   output: 25.0 },
+            'claude-opus-4-1':      { input: 15.0,  cached: 1.50,   output: 75.0 },
+            'claude-sonnet-4-6':    { input: 3.0,   cached: 0.30,   output: 15.0 },
+            'claude-sonnet-4-5':    { input: 3.0,   cached: 0.30,   output: 15.0 },
+            'claude-haiku-4-5':     { input: 1.0,   cached: 0.10,   output: 5.0  },
+            'claude-haiku-3-5':     { input: 0.80,  cached: 0.08,   output: 4.0  },
+        };
+        const PRICING_KEYS = Object.keys(PRICING).sort((a, b) => b.length - a.length);
+
+        function estimateCost(model, tokensIn, tokensOut, tokensCached) {
+            if (!model) return null;
+            const key = PRICING_KEYS.find(k => model.includes(k));
+            if (!key) return null;
+            const p = PRICING[key];
+            const uncachedIn = Math.max(0, tokensIn - tokensCached);
+            return (uncachedIn * p.input + tokensCached * p.cached + tokensOut * p.output) / 1_000_000;
+        }
+
+        function formatCost(cost) {
+            if (cost === null) return '';
+            if (cost < 0.01) return ' &middot; ~&lt;$0.01';
+            return ` &middot; ~$${cost.toFixed(2)}`;
+        }
+
+        // =====================================================================
         // ROUTER
         // =====================================================================
         function parseHash() {
@@ -2117,7 +2150,8 @@
             const tokensOut = (r.tokens_out || 0);
             const tokensCached = (r.tokens_cached || 0);
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
-            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
+            const reviewCost = estimateCost(r.model, r.tokens_in || 0, tokensOut, tokensCached);
+            const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
 
             const bf = r.budget_flags || 0;
             let budgetIndicators = '';
@@ -2731,10 +2765,20 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const avgTokensOut = tokenReviewCount ? Math.round(totalTokensOut / tokenReviewCount) : 0;
                 const avgTokensCached = tokenReviewCount ? Math.round(totalTokensCached / tokenReviewCount) : 0;
 
+                const totalEstCost = tokenReviews.reduce((acc, r) => {
+                    const c = estimateCost(r.model, r.tokens_in || 0, r.tokens_out || 0, r.tokens_cached || 0);
+                    return c !== null ? acc + c : acc;
+                }, 0);
+                const avgEstCost = tokenReviewCount ? totalEstCost / tokenReviewCount : 0;
+
                 html += '<h3>Token Usage</h3><div class="stat-card-grid">';
                 html += renderStatCard('Input tokens/patch', avgTokensIn);
                 html += renderStatCard('Cached tokens/patch', avgTokensCached);
                 html += renderStatCard('Out tokens/patch', avgTokensOut);
+                if (totalEstCost > 0) {
+                    html += renderStatCard('Est. cost/patch', '$' + avgEstCost.toFixed(2));
+                    html += renderStatCard('Est. total cost', '$' + totalEstCost.toFixed(2));
+                }
                 html += '</div>';
                 
                 html += '<h2>Tool Usage</h2><div class="chart-section"><div id="chart-tools" style="width:100%; height:500px;"></div></div>';

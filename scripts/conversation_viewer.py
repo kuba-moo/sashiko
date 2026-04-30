@@ -12,14 +12,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import re
+
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
     Header,
+    Input,
     Static,
     TextArea,
     Tree,
@@ -239,6 +243,87 @@ def build_turn_text(
     return "\n".join(lines)
 
 
+def build_tool_result_index(data: dict) -> dict[str, str]:
+    """Build a map from tool_call_id to formatted tool result content."""
+    index: dict[str, str] = {}
+    for stage in data:
+        for turn in data[stage]:
+            req = data[stage][turn].get("req")
+            msgs = []
+            if isinstance(req, list):
+                msgs = req
+            elif isinstance(req, dict) and "messages" in req:
+                msgs = req["messages"]
+            for msg in msgs:
+                if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                    tc_id = msg["tool_call_id"]
+                    content = msg.get("content", "") or ""
+                    index[tc_id] = _format_tool_result(content)
+    return index
+
+
+def _format_tool_result(content: str) -> str:
+    """Pretty-print tool result content, expanding nested JSON."""
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if isinstance(parsed, dict):
+        parts = []
+        for k, v in parsed.items():
+            if isinstance(v, str) and len(v) > 80:
+                parts.append(f"── {k} ──\n{v}\n")
+            else:
+                parts.append(f"{k}: {json.dumps(v)}")
+        return "\n".join(parts)
+    return json.dumps(parsed, indent=2)
+
+
+class ToolResultScreen(ModalScreen):
+    """Modal showing a tool call result."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("q", "dismiss", "Close"),
+    ]
+
+    CSS = """
+    ToolResultScreen {
+        align: center middle;
+    }
+    #tool-result-container {
+        width: 90%;
+        height: 85%;
+        border: solid $primary;
+        background: $surface;
+    }
+    #tool-result-header {
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+    }
+    #tool-result-area {
+        width: 100%;
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, tc_id: str, content: str):
+        super().__init__()
+        self.tc_id = tc_id
+        self.content = content
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Vertical
+        with Vertical(id="tool-result-container"):
+            yield Static(f"Tool Result: {self.tc_id}  (q/Esc to close)", id="tool-result-header")
+            yield TextArea(id="tool-result-area", read_only=True, show_line_numbers=True)
+
+    def on_mount(self) -> None:
+        self.query_one("#tool-result-area", TextArea).load_text(self.content)
+
+
 class StageTree(Tree):
     """Tree widget showing stages and turns."""
     pass
@@ -263,7 +348,16 @@ class ConversationViewer(App):
     }
     #content-area {
         width: 100%;
-        height: 100%;
+        height: 1fr;
+    }
+    #search-bar {
+        height: 3;
+        display: none;
+        border-top: solid $primary;
+        padding: 0 1;
+    }
+    #search-bar.visible {
+        display: block;
     }
     #status-bar {
         height: 1;
@@ -287,6 +381,11 @@ class ConversationViewer(App):
         Binding("p", "prev_stage", "Prev Stage"),
         Binding("t", "toggle_truncate", "Toggle Truncate"),
         Binding("f", "full_system", "Full System Prompt"),
+        Binding("enter", "open_tool_result", "Open Tool Result", priority=False),
+        Binding("slash", "search", "Search"),
+        Binding("bracketright", "search_next", "Next Match"),
+        Binding("bracketleft", "search_prev", "Prev Match"),
+        Binding("escape", "search_close", "Close Search"),
     ]
 
     show_full_system = reactive(False)
@@ -299,6 +398,10 @@ class ConversationViewer(App):
         self.stages_sorted = sorted(self.data.keys(), key=self._stage_sort_key)
         self.current_stage: str | None = None
         self.current_turn: int | None = None
+        self.search_matches: list[tuple[str, int]] = []  # (stage, turn) pairs
+        self.search_match_idx: int = -1
+        self.search_query: str = ""
+        self.tool_result_index = build_tool_result_index(self.data)
 
     @staticmethod
     def _stage_sort_key(s: str) -> tuple[int, str]:
@@ -350,6 +453,7 @@ class ConversationViewer(App):
             with Vertical(id="content"):
                 yield Static("", id="stage-summary")
                 yield TextArea(id="content-area", read_only=True, show_line_numbers=True)
+                yield Input(placeholder="Search (regex)...", id="search-bar")
         yield Static("", id="status-bar")
         yield Footer()
 
@@ -465,6 +569,89 @@ class ConversationViewer(App):
     def action_full_system(self) -> None:
         self.show_full_system = not self.show_full_system
         self._update_display()
+
+    def action_open_tool_result(self) -> None:
+        content_area = self.query_one("#content-area", TextArea)
+        if not self.focused or self.focused.id != "content-area":
+            return
+        cursor_row = content_area.cursor_location[0]
+        lines = content_area.text.split("\n")
+        if cursor_row >= len(lines):
+            return
+        # Search current line and nearby lines for a tool call ID
+        for offset in range(0, 6):
+            for row in [cursor_row - offset, cursor_row + offset]:
+                if 0 <= row < len(lines):
+                    match = re.search(r"tooluse_\w+", lines[row])
+                    if match:
+                        tc_id = match.group(0)
+                        if tc_id in self.tool_result_index:
+                            self.push_screen(ToolResultScreen(tc_id, self.tool_result_index[tc_id]))
+                            return
+        self.query_one("#status-bar", Static).update("No tool result found near cursor")
+
+    def action_search(self) -> None:
+        search_bar = self.query_one("#search-bar", Input)
+        search_bar.add_class("visible")
+        search_bar.focus()
+
+    def action_search_close(self) -> None:
+        search_bar = self.query_one("#search-bar", Input)
+        search_bar.remove_class("visible")
+        self.search_matches = []
+        self.search_match_idx = -1
+        self.query_one("#content-area", TextArea).focus()
+
+    @on(Input.Submitted, "#search-bar")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip()
+        if not query:
+            return
+        self.search_query = query
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error:
+            self.query_one("#status-bar", Static).update(f"Invalid regex: {query}")
+            return
+        self.search_matches = []
+        for stage in self.stages_sorted:
+            for turn in sorted(self.data[stage].keys()):
+                text = build_turn_text(
+                    self.data[stage][turn], stage, turn, self.data,
+                    show_full_system=True, truncate_tool_results=False,
+                )
+                if pattern.search(text):
+                    self.search_matches.append((stage, turn))
+        if not self.search_matches:
+            self.query_one("#status-bar", Static).update(f"No matches for: {query}")
+            return
+        self.search_match_idx = 0
+        self._goto_search_match()
+
+    def _goto_search_match(self) -> None:
+        if not self.search_matches:
+            return
+        stage, turn = self.search_matches[self.search_match_idx]
+        self.current_stage = stage
+        self.current_turn = turn
+        self._update_display()
+        n = len(self.search_matches)
+        i = self.search_match_idx + 1
+        self.query_one("#status-bar", Static).update(
+            f"Search: [{i}/{n}] '{self.search_query}' — ] next, [ prev"
+        )
+
+    def action_search_next(self) -> None:
+        if not self.search_matches:
+            return
+        self.search_match_idx = (self.search_match_idx + 1) % len(self.search_matches)
+        self._goto_search_match()
+
+    def action_search_prev(self) -> None:
+        if not self.search_matches:
+            return
+        self.search_match_idx = (self.search_match_idx - 1) % len(self.search_matches)
+        self._goto_search_match()
 
 
 def find_dump_dir(path: Path) -> Path:

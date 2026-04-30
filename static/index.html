@@ -919,18 +919,37 @@
         // Authorization header when a token is present.
         const BYPASS_TOKEN_KEY = 'sashiko_bypass_token';
         (function initBypassToken() {
-            const params = new URLSearchParams(window.location.search);
-            if (!params.has('token')) return;
-            const v = params.get('token');
-            if (v === '-1') {
-                localStorage.removeItem(BYPASS_TOKEN_KEY);
-            } else if (v) {
-                localStorage.setItem(BYPASS_TOKEN_KEY, v);
+            // The router uses hash-based routes like #/patchset/<msgid>?token=…,
+            // so the token can live in either the real query string or inside
+            // the hash's query portion. Handle both, then scrub whichever one
+            // carried it.
+            let searchParams = new URLSearchParams(window.location.search);
+            let hash = window.location.hash;
+            let hashPath = hash;
+            let hashParams = new URLSearchParams();
+            const hashQueryIdx = hash.indexOf('?');
+            if (hashQueryIdx >= 0) {
+                hashPath = hash.slice(0, hashQueryIdx);
+                hashParams = new URLSearchParams(hash.slice(hashQueryIdx + 1));
             }
-            params.delete('token');
-            const qs = params.toString();
+
+            const token = searchParams.get('token') ?? hashParams.get('token');
+            if (token === null) return;
+
+            if (token === '-1') {
+                localStorage.removeItem(BYPASS_TOKEN_KEY);
+            } else if (token) {
+                localStorage.setItem(BYPASS_TOKEN_KEY, token);
+            }
+
+            searchParams.delete('token');
+            hashParams.delete('token');
+            const searchStr = searchParams.toString();
+            const hashQs = hashParams.toString();
+            const newHash = hashPath + (hashQs ? '?' + hashQs : '');
             const newUrl = window.location.pathname +
-                (qs ? '?' + qs : '') + window.location.hash;
+                (searchStr ? '?' + searchStr : '') +
+                newHash;
             window.history.replaceState(null, '', newUrl);
         })();
 

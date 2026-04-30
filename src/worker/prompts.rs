@@ -614,6 +614,27 @@ impl Worker {
             .unwrap_or_else(|| "multi".to_string());
         self.context_tag = Some(format!("[ps:{} p:{}] ", ps_id, p_id));
 
+        if let Some(base) = &self.dump_conversation {
+            let now = chrono::Utc::now();
+            let suffix: String = (0..4)
+                .map(|_| {
+                    let idx = fastrand::u8(0..36);
+                    if idx < 10 {
+                        (b'0' + idx) as char
+                    } else {
+                        (b'a' + idx - 10) as char
+                    }
+                })
+                .collect();
+            let subdir = base.join(format!("{}-{}", now.format("%Y%m%d-%H%M"), suffix));
+            if let Err(e) = std::fs::create_dir_all(&subdir) {
+                warn!("Failed to create dump subdir {:?}: {}", subdir, e);
+            } else {
+                info!("Conversation dumps: {:?}", subdir);
+                self.dump_conversation = Some(subdir);
+            }
+        }
+
         if let Some(patches) = patchset["patches"].as_array() {
             for p in patches {
                 if let Some(show) = p["git_show"].as_str() {

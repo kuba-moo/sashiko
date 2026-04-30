@@ -19,6 +19,7 @@ use crate::ai::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
+use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, InferenceConfiguration,
     Message, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
@@ -452,12 +453,32 @@ impl AiProvider for BedrockClient {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                let is_throttle = format!("{e:?}").contains("ThrottlingException");
+                let raw = e.raw_response();
+                let status = raw.map(|r| r.status().as_u16());
+                let request_id = raw
+                    .and_then(|r| r.headers().get("x-amzn-requestid"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let code = e.code().unwrap_or("unknown");
+                let is_throttle = code.contains("Throttling");
+                let msg = e.message().unwrap_or("no message");
+                tracing::error!(
+                    status = status,
+                    code = code,
+                    request_id = request_id,
+                    "Bedrock API error: {msg}"
+                );
                 if is_throttle {
                     tracing::warn!("Bedrock throttled, waiting 30s before retry...");
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
-                return Err(anyhow::anyhow!("Bedrock Converse API error: {e:#}"));
+                return Err(anyhow::anyhow!(
+                    "Bedrock Converse API error: status={} code={} request_id={} message={}",
+                    status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                    code,
+                    request_id,
+                    msg,
+                ));
             }
         };
 

@@ -478,7 +478,13 @@ pub struct LocalReviewSettings {
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
-        Self::from_file("Settings")
+        let s = Config::builder()
+            .add_source(File::with_name("Settings"))
+            .add_source(File::with_name("Settings.local").required(false))
+            .add_source(Environment::with_prefix("SASHIKO").separator("__"))
+            .build()?;
+
+        s.try_deserialize()
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {

@@ -15,6 +15,7 @@
 pub mod email;
 pub mod prefetch;
 pub mod prompts;
+pub mod semcode_tools;
 pub mod tools;
 #[cfg(test)]
 mod tools_test;

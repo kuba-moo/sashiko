@@ -14,6 +14,7 @@
 
 use crate::ai::AiTool;
 use crate::ai::truncator::Truncator;
+use crate::worker::semcode_tools::SemcodeToolBox;
 use anyhow::{Result, anyhow, ensure};
 use grep::printer::StandardBuilder;
 use grep::regex::RegexMatcher;
@@ -28,6 +29,7 @@ use tokio::process::Command;
 pub struct ToolBox {
     worktree_path: PathBuf,
     prompts_path: Option<PathBuf>,
+    semcode: Option<SemcodeToolBox>,
 }
 
 impl ToolBox {
@@ -35,7 +37,13 @@ impl ToolBox {
         Self {
             worktree_path,
             prompts_path,
+            semcode: None,
         }
+    }
+
+    pub fn with_semcode(mut self, semcode: SemcodeToolBox) -> Self {
+        self.semcode = Some(semcode);
+        self
     }
 
     pub fn get_worktree_path(&self) -> &Path {
@@ -219,6 +227,10 @@ impl ToolBox {
             });
         }
 
+        if let Some(sc) = &self.semcode {
+            decls.extend(sc.get_declarations());
+        }
+
         decls
     }
 
@@ -239,6 +251,13 @@ impl ToolBox {
             "find_files" => self.find_files(args).await,
             "todowrite" => self.todowrite(args).await,
             "read_prompt" => self.read_prompt(args).await,
+            n if n.starts_with("sc_") => {
+                if let Some(sc) = &self.semcode {
+                    sc.call(n, args).await
+                } else {
+                    Err(anyhow!("Semcode tools not available: {}", name))
+                }
+            }
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
     }

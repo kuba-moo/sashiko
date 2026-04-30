@@ -19,14 +19,16 @@ use sashiko::{
     settings::Settings,
     worker::{
         PatchInput, TokenBudget, Worker, WorkerConfig, calculate_series_range,
-        prompts::PromptRegistry, tools::ToolBox,
+        prompts::PromptRegistry,
+        semcode_tools::{SemcodeToolBox, run_semcode_index},
+        tools::ToolBox,
     },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -365,6 +367,39 @@ async fn main() -> Result<()> {
 
                     let mut review_result_to_print = None;
 
+                    // Set up semcode: reflink-copy DB from main repo, then index the patch range
+                    let semcode_settings = settings.semcode.clone().unwrap_or_default();
+                    let semcode_ok = if semcode_settings.enabled {
+                        let setup = async {
+                            use sashiko::worker::semcode_tools::copy_semcode_db;
+                            copy_semcode_db(&repo_path, &worktree.path).await?;
+
+                            // patch_shas is a HashMap (insertion-order-unstable);
+                            // pick by the highest patch index so the indexing
+                            // range deterministically reaches the last patch.
+                            let last_sha = patch_shas
+                                .iter()
+                                .max_by_key(|(idx, _)| *idx)
+                                .map(|(_, sha)| sha.clone())
+                                .unwrap_or_else(|| "HEAD".to_string());
+                            let git_range = format!("{}..{}", baseline_sha, last_sha);
+                            info!("Running semcode indexing for range {}", git_range);
+                            run_semcode_index(&semcode_settings, &worktree.path, &git_range).await
+                        };
+                        match setup.await {
+                            Ok(()) => {
+                                info!("Semcode DB ready in worktree");
+                                true
+                            }
+                            Err(e) => {
+                                warn!("Semcode setup failed, continuing without: {}", e);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
                     for attempt in 1..=3 {
                         if attempt > 1 {
                             info!("Restarting AI review (attempt {}/3)...", attempt);
@@ -377,7 +412,22 @@ async fn main() -> Result<()> {
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));
 
-                        let tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+                        let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+
+                        if semcode_ok {
+                            match SemcodeToolBox::start(&semcode_settings, &worktree.path).await {
+                                Ok(sc) => {
+                                    info!("Semcode MCP tools enabled");
+                                    tools = tools.with_semcode(sc);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to start semcode-mcp, continuing without: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                         let prompts = PromptRegistry::new(args.prompts.clone());
 
                         // Calculate series range (baseline..last_patch)

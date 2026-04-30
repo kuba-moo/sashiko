@@ -122,6 +122,17 @@ pub enum Severity {
     Critical = 4,
 }
 
+/// Outcome of attempting to cancel a patchset. The HTTP layer maps each
+/// variant to a distinct status code.
+#[derive(Debug)]
+pub enum CancelOutcome {
+    Cancelled,
+    NotFound,
+    /// Patchset exists but was not in Pending state. Carries the observed
+    /// status so the caller can tell the user why.
+    NotPending(String),
+}
+
 impl Severity {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
@@ -3320,6 +3331,78 @@ impl Database {
             libsql::params![],
         ).await?;
         Ok(count)
+    }
+
+    pub async fn cancel_pending_patchset(&self, id: i64) -> Result<CancelOutcome> {
+        // BEGIN IMMEDIATE takes a write lock up-front so a concurrent
+        // scheduler read-then-write can't race us from Pending -> In Review
+        // between the status check and our UPDATE.
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let lookup = async {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT status FROM patchsets WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            let row = rows.next().await?;
+            // `row` is Option<Row>. If present, pull status which may still
+            // be NULL in the DB (hence the inner Option).
+            let current = row.map(|r| r.get::<Option<String>>(0).ok().flatten());
+            anyhow::Ok(current)
+        }
+        .await;
+
+        let current_status = match lookup {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e);
+            }
+        };
+
+        let Some(status_opt) = current_status else {
+            self.conn.execute("ROLLBACK", ()).await?;
+            return Ok(CancelOutcome::NotFound);
+        };
+
+        if status_opt.as_deref() != Some("Pending") {
+            self.conn.execute("ROLLBACK", ()).await?;
+            return Ok(CancelOutcome::NotPending(
+                status_opt.unwrap_or_else(|| "Unknown".to_string()),
+            ));
+        }
+
+        let update_result = async {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status = 'Pending'",
+                    libsql::params![id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "UPDATE patches SET status = 'Cancelled' \
+                     WHERE patchset_id = ? AND (status IS NULL OR status = 'Pending')",
+                    libsql::params![id],
+                )
+                .await?;
+            anyhow::Ok(())
+        }
+        .await;
+
+        match update_result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(CancelOutcome::Cancelled)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {

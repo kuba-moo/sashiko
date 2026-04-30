@@ -341,6 +341,7 @@ pub async fn run_server(
         .route("/api/stats/tools", get(stats_tools))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
+        .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
@@ -1014,6 +1015,42 @@ async fn rerun_patchset(
     })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
+}
+
+async fn cancel_patchset(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PatchQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !state.allow_all_submit && !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let id = query
+        .id
+        .parse::<i64>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    match state.db.cancel_pending_patchset(id).await {
+        Ok(crate::db::CancelOutcome::Cancelled) => {
+            info!("Cancelled patchset {}", id);
+            Ok(Json(serde_json::json!({ "status": "cancelled", "id": id })))
+        }
+        Ok(crate::db::CancelOutcome::NotFound) => Err(StatusCode::NOT_FOUND),
+        Ok(crate::db::CancelOutcome::NotPending(current)) => {
+            // 409 Conflict — the patchset exists but isn't in a cancellable
+            // state (e.g. already In Review, Reviewed, Cancelled).
+            info!("Refusing to cancel patchset {}: status is {}", id, current);
+            Err(StatusCode::CONFLICT)
+        }
+        Err(e) => {
+            error!("Failed to cancel patchset {}: {}", id, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn rerun_patch(

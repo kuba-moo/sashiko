@@ -365,9 +365,9 @@ impl PromptRegistry {
             1 => {
                 "# Stage 1. Analyze commit main goal
 
-SCOPE: You review ONLY high-level intent and design. Other pipeline agents cover: implementation completeness (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do not investigate those areas.
+SCOPE: You review ONLY high-level intent and design — the \"what\" and \"why\", not the \"how\". Other pipeline agents cover: implementation completeness (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do NOT analyze locking correctness, sleeping-in-atomic-context, lock ordering, race conditions, or any concurrency concern — Stage 5 handles all of that. Do not read source code to trace lock/context interactions.
 
-You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally flawed concepts? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
+You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally wrong approaches? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
             }
             2 => {
                 "# Stage 2. High-level implementation verification

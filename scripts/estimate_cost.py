@@ -109,6 +109,12 @@ def cost(tokens, rate):
     return tokens * rate / 1_000_000
 
 
+def session_cost(r, input_rate, cache_read_rate, cache_write_rate, output_rate):
+    uncached = r["total_input"] - r["cached"]
+    return (cost(uncached, input_rate) + cost(r["cached"], cache_read_rate)
+            + cost(r["cache_writes"], cache_write_rate) + cost(r["completion"], output_rate))
+
+
 def fmt_tokens(n):
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
@@ -167,12 +173,15 @@ def main():
         print()
         return
 
+    rates = (args.input_rate, args.cache_read_rate, args.cache_write_rate, args.output_rate)
+
     # Table header
-    print(f"{'session':<8} {'turns':>5} {'total in':>10} {'cached':>10} {'writes':>10} {'output':>10} {'1st cached':>10}")
-    print("-" * 75)
+    print(f"{'session':<8} {'turns':>5} {'total in':>10} {'cached':>10} {'writes':>10} {'output':>10} {'1st cached':>10} {'cost':>8}")
+    print("-" * 83)
 
     for sid in sorted(results):
         r = results[sid]
+        sc = session_cost(r, *rates)
         print(
             f"{sid:<8} {r['turns']:>5} "
             f"{fmt_tokens(r['total_input']):>10} "
@@ -180,15 +189,18 @@ def main():
             f"{fmt_tokens(r['cache_writes']):>10} "
             f"{fmt_tokens(r['completion']):>10} "
             f"{fmt_tokens(r['first_cached']):>10}"
+            f" ${sc:>7.2f}"
         )
 
-    print("-" * 75)
+    print("-" * 83)
     print(
         f"{'TOTAL':<8} {sum(r['turns'] for r in results.values()):>5} "
         f"{fmt_tokens(grand['total_input']):>10} "
         f"{fmt_tokens(grand['cached']):>10} "
         f"{fmt_tokens(grand['cache_writes']):>10} "
         f"{fmt_tokens(grand['completion']):>10}"
+        f" {'':>10}"
+        f" ${total:>7.2f}"
     )
 
     print()

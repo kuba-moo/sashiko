@@ -104,6 +104,154 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub budget: TokenBudget,
+}
+
+/// Tracks token usage and emits warning messages when thresholds are crossed.
+///
+/// Two classes (stage / review) x two types (input / output) x two levels (warn / severe).
+/// After severe warning the model gets one implicit tool-call round, then the stage is forced to conclude.
+/// Review thresholds = stage thresholds * multiplier.
+#[derive(Clone)]
+pub struct TokenBudget {
+    stage_input: usize,
+    stage_output: usize,
+    review_input: usize,
+    review_output: usize,
+    warn_pct: f32,
+    severe_pct: f32,
+    review_input_used: usize,
+    review_output_used: usize,
+    fired: u8,
+    severe_grace: bool,
+}
+
+pub enum BudgetAction {
+    Warn(String),
+    ForceConclude,
+}
+
+const BUDGET_STAGE_INPUT_WARN: u8 = 1 << 0;
+const BUDGET_STAGE_INPUT_SEVERE: u8 = 1 << 1;
+const BUDGET_STAGE_OUTPUT_WARN: u8 = 1 << 2;
+const BUDGET_STAGE_OUTPUT_SEVERE: u8 = 1 << 3;
+const BUDGET_REVIEW_INPUT_WARN: u8 = 1 << 4;
+const BUDGET_REVIEW_INPUT_SEVERE: u8 = 1 << 5;
+const BUDGET_REVIEW_OUTPUT_WARN: u8 = 1 << 6;
+const BUDGET_REVIEW_OUTPUT_SEVERE: u8 = 1 << 7;
+
+impl TokenBudget {
+    pub fn new(
+        stage_input: usize,
+        stage_output: usize,
+        warn_pct: f32,
+        severe_pct: f32,
+        review_multiplier: f32,
+    ) -> Self {
+        Self {
+            stage_input,
+            stage_output,
+            review_input: (stage_input as f32 * review_multiplier) as usize,
+            review_output: (stage_output as f32 * review_multiplier) as usize,
+            warn_pct,
+            severe_pct,
+            review_input_used: 0,
+            review_output_used: 0,
+            fired: 0,
+            severe_grace: false,
+        }
+    }
+
+    pub fn accumulate_review(&mut self, input: usize, output: usize) {
+        self.review_input_used += input;
+        self.review_output_used += output;
+    }
+
+    /// Check budgets after a tool-call round.
+    /// Returns `ForceConclude` when the grace round after severe has been used.
+    pub fn check(&mut self, stage_in: usize, stage_out: usize) -> Option<BudgetAction> {
+        if self.severe_grace {
+            return Some(BudgetAction::ForceConclude);
+        }
+
+        let mut hit_warn = false;
+        let mut hit_severe = false;
+
+        let pairs: [(usize, usize, u8, u8); 4] = [
+            (
+                stage_in,
+                self.stage_input,
+                BUDGET_STAGE_INPUT_WARN,
+                BUDGET_STAGE_INPUT_SEVERE,
+            ),
+            (
+                stage_out,
+                self.stage_output,
+                BUDGET_STAGE_OUTPUT_WARN,
+                BUDGET_STAGE_OUTPUT_SEVERE,
+            ),
+            (
+                self.review_input_used,
+                self.review_input,
+                BUDGET_REVIEW_INPUT_WARN,
+                BUDGET_REVIEW_INPUT_SEVERE,
+            ),
+            (
+                self.review_output_used,
+                self.review_output,
+                BUDGET_REVIEW_OUTPUT_WARN,
+                BUDGET_REVIEW_OUTPUT_SEVERE,
+            ),
+        ];
+
+        for (used, budget, warn_bit, severe_bit) in pairs {
+            if budget == 0 {
+                continue;
+            }
+            let severe_thresh = (budget as f32 * self.severe_pct) as usize;
+            let warn_thresh = (budget as f32 * self.warn_pct) as usize;
+
+            if severe_thresh > 0 && used >= severe_thresh && self.fired & severe_bit == 0 {
+                self.fired |= severe_bit | warn_bit;
+                hit_severe = true;
+            } else if warn_thresh > 0 && used >= warn_thresh && self.fired & warn_bit == 0 {
+                self.fired |= warn_bit;
+                hit_warn = true;
+            }
+        }
+
+        if hit_severe {
+            self.severe_grace = true;
+            Some(BudgetAction::Warn(
+                "SEVERE: You are approaching your token budget limit. \
+                 You MUST conclude your analysis NOW with the information \
+                 you already have. Do not make any further tool calls."
+                    .to_string(),
+            ))
+        } else if hit_warn {
+            Some(BudgetAction::Warn(
+                "WARNING: You have used a significant portion of your token budget. \
+                 Be selective with remaining tool calls — only investigate critical issues."
+                    .to_string(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Reset per-stage state (keep review-level bits, counters, and
+    /// severe_grace if a review-level severe was the trigger).
+    pub fn reset_stage(&mut self) {
+        let review_severe_fired =
+            self.fired & (BUDGET_REVIEW_INPUT_SEVERE | BUDGET_REVIEW_OUTPUT_SEVERE) != 0;
+        self.fired &= BUDGET_REVIEW_INPUT_WARN
+            | BUDGET_REVIEW_INPUT_SEVERE
+            | BUDGET_REVIEW_OUTPUT_WARN
+            | BUDGET_REVIEW_OUTPUT_SEVERE;
+        if !review_severe_fired {
+            self.severe_grace = false;
+        }
+    }
 }
 
 pub struct WorkerResult {
@@ -405,6 +553,7 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    budget: TokenBudget,
 }
 
 impl Worker {
@@ -424,6 +573,7 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            budget: config.budget,
         }
     }
 
@@ -516,9 +666,13 @@ impl Worker {
                                 .map(|_| ())
                         })
                         .await;
+                    let phase0_in = tokens.0 - total_tokens_in;
+                    let phase0_out = tokens.1 - total_tokens_out;
                     total_tokens_in = tokens.0;
                     total_tokens_out = tokens.1;
                     total_tokens_cached = tokens.2;
+                    self.budget
+                        .accumulate_review(phase0_in as usize, phase0_out as usize);
                     val.and_then(|val| {
                         let arr = val.get("selected_prompts")?.as_array()?;
                         let prompts: Vec<String> = arr
@@ -660,9 +814,13 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                         .map(|_| ())
                 })
                 .await;
+            let plan_in = tokens.0 - total_tokens_in;
+            let plan_out = tokens.1 - total_tokens_out;
             total_tokens_in = tokens.0;
             total_tokens_out = tokens.1;
             total_tokens_cached = tokens.2;
+            self.budget
+                .accumulate_review(plan_in as usize, plan_out as usize);
             if let Some(val) = val {
                 let arr = val["relevant_stages"].as_array().unwrap();
                 let mut stages = vec![1, 2, 3];
@@ -1173,6 +1331,8 @@ Example:
         let mut t_in = 0;
         let mut t_out = 0;
         let mut t_cached = 0;
+        let mut force_conclude = false;
+        self.budget.reset_stage();
 
         loop {
             turns += 1;
@@ -1199,6 +1359,8 @@ Example:
                 t_in += usage.prompt_tokens as u32;
                 t_out += usage.completion_tokens as u32;
                 t_cached += usage.cached_tokens.unwrap_or(0) as u32;
+                self.budget
+                    .accumulate_review(usage.prompt_tokens, usage.completion_tokens);
             }
 
             let assistant_msg = AiMessage {
@@ -1213,6 +1375,16 @@ Example:
             self.global_history.push(assistant_msg);
 
             if let Some(tool_calls) = resp.tool_calls {
+                if force_conclude {
+                    warn!(
+                        "Budget force-conclude at stage {} turn {}: \
+                         model made tool calls despite budget exhaustion, \
+                         taking text content and ending stage",
+                        _stage, turns
+                    );
+                    return Ok((resp.content.unwrap_or_default(), t_in, t_out, t_cached));
+                }
+
                 let mut tool_responses = Vec::new();
                 for call in tool_calls {
                     let result = match self
@@ -1234,6 +1406,49 @@ Example:
                 }
                 local_history.extend(tool_responses.clone());
                 self.global_history.extend(tool_responses);
+
+                match self.budget.check(t_in as usize, t_out as usize) {
+                    Some(BudgetAction::ForceConclude) => {
+                        warn!(
+                            "Budget exceeded at stage {} turn {} — \
+                             forcing conclusion next turn",
+                            _stage, turns
+                        );
+                        force_conclude = true;
+                        let budget_msg = AiMessage {
+                            role: AiRole::User,
+                            content: Some(
+                                "[SYSTEM — TOKEN BUDGET]\n\
+                                 Your token budget is exhausted. You MUST provide your \
+                                 final answer NOW. Do not call any more tools."
+                                    .to_string(),
+                            ),
+                            thought: None,
+                            thought_signature: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        };
+                        local_history.push(budget_msg.clone());
+                        self.global_history.push(budget_msg);
+                    }
+                    Some(BudgetAction::Warn(warning)) => {
+                        info!(
+                            "Budget warning at stage {} turn {}: {}",
+                            _stage, turns, warning
+                        );
+                        let budget_msg = AiMessage {
+                            role: AiRole::User,
+                            content: Some(format!("[SYSTEM — TOKEN BUDGET]\n{}", warning)),
+                            thought: None,
+                            thought_signature: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        };
+                        local_history.push(budget_msg.clone());
+                        self.global_history.push(budget_msg);
+                    }
+                    None => {}
+                }
             } else if resp.content.is_some() || resp.thought.is_some() {
                 return Ok((resp.content.unwrap_or_default(), t_in, t_out, t_cached));
             } else {
@@ -1572,6 +1787,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            budget: TokenBudget::new(0, 0, 0.0, 0.0, 0.0),
         };
         let mut worker = Worker::new(provider, tools, prompts, config);
 

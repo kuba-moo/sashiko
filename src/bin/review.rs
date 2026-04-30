@@ -18,8 +18,8 @@ use sashiko::{
     git_ops::GitWorktree,
     settings::Settings,
     worker::{
-        PatchInput, Worker, WorkerConfig, calculate_series_range, prompts::PromptRegistry,
-        tools::ToolBox,
+        PatchInput, TokenBudget, Worker, WorkerConfig, calculate_series_range,
+        prompts::PromptRegistry, tools::ToolBox,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -399,6 +399,13 @@ async fn main() -> Result<()> {
                                 custom_prompt: args.custom_prompt.clone(),
                                 series_range,
                                 stages: args.stages.clone(),
+                                budget: TokenBudget::new(
+                                    settings.ai.stage_input_budget,
+                                    settings.ai.stage_output_budget,
+                                    settings.ai.budget_warn_pct,
+                                    settings.ai.budget_severe_pct,
+                                    settings.ai.review_budget_multiplier,
+                                ),
                             },
                         );
 

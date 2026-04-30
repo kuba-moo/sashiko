@@ -183,6 +183,22 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    /// Per-stage input token budget. 0 = disabled.
+    #[serde(default)]
+    pub stage_input_budget: usize,
+    /// Per-stage output token budget. 0 = disabled.
+    #[serde(default)]
+    pub stage_output_budget: usize,
+    /// Fraction of budget at which early warning is injected (e.g. 0.7).
+    #[serde(default)]
+    pub budget_warn_pct: f32,
+    /// Fraction of budget at which severe warning is injected (e.g. 0.9).
+    /// After severe + one more tool-call round, the stage is forcefully concluded.
+    #[serde(default)]
+    pub budget_severe_pct: f32,
+    /// Multiplier applied to per-stage budgets to get review-wide budgets. 0 = disabled.
+    #[serde(default)]
+    pub review_budget_multiplier: f32,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,

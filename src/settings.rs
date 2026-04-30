@@ -395,7 +395,7 @@ pub struct ReviewSettings {
     /// (e.g. in tests or via environment).
     #[serde(skip)]
     pub review_tool_override: Option<std::path::PathBuf>,
-    #[serde(skip)]
+    #[serde(default)]
     pub stages: Option<Vec<u8>>,
 }
 

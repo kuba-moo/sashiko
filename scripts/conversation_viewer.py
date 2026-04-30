@@ -70,7 +70,7 @@ def load_dump_dir(dump_dir: Path) -> dict[str, dict[int, dict[str, Any]]]:
     return data
 
 
-def format_tool_call(tc: dict) -> str:
+def format_tool_call(tc: dict, truncate: bool = True) -> str:
     """Format a tool call for display."""
     name = tc.get("function_name", tc.get("name", "unknown"))
     args = tc.get("arguments", "{}")
@@ -86,7 +86,7 @@ def format_tool_call(tc: dict) -> str:
     if isinstance(args, dict):
         for k, v in args.items():
             val_str = json.dumps(v) if not isinstance(v, str) else v
-            if len(val_str) > 120:
+            if truncate and len(val_str) > 120:
                 val_str = val_str[:117] + "..."
             lines.append(f"│  {k}: {val_str}")
     else:
@@ -109,7 +109,7 @@ def format_usage(usage: dict) -> str:
     return " │ ".join(parts)
 
 
-def format_message(msg: dict) -> str:
+def format_message(msg: dict, truncate: bool = True) -> str:
     """Format a single message for display."""
     role = msg.get("role", "unknown")
     content = msg.get("content", "")
@@ -128,7 +128,7 @@ def format_message(msg: dict) -> str:
                 if part.get("type") == "text":
                     lines.append(part.get("text", ""))
                 elif part.get("type") == "tool_use":
-                    lines.append(format_tool_call(part))
+                    lines.append(format_tool_call(part, truncate))
                 elif part.get("type") == "tool_result":
                     lines.append(f"[Tool Result: {part.get('tool_use_id', '')}]")
                     lines.append(str(part.get("content", ""))[:2000])
@@ -136,7 +136,7 @@ def format_message(msg: dict) -> str:
     if "tool_calls" in msg and msg["tool_calls"]:
         lines.append("")
         for tc in msg["tool_calls"]:
-            lines.append(format_tool_call(tc))
+            lines.append(format_tool_call(tc, truncate))
 
     if "tool_call_id" in msg:
         lines.append(f"[Response to tool_call: {msg['tool_call_id']}]")
@@ -207,7 +207,7 @@ def build_turn_text(
                 lines.append(f"│ MESSAGES ({len(req['messages'])})")
                 lines.append(f"└{'─' * 68}┘")
                 for msg in req["messages"]:
-                    lines.append(format_message(msg))
+                    lines.append(format_message(msg, truncate_tool_results))
                 lines.append("")
 
         elif isinstance(req, list):
@@ -216,7 +216,7 @@ def build_turn_text(
             lines.append(f"│ INCREMENTAL MESSAGES ({len(req)} new)")
             lines.append(f"└{'─' * 68}┘")
             for msg in req:
-                lines.append(format_message(msg))
+                lines.append(format_message(msg, truncate_tool_results))
             lines.append("")
 
     if resp:
@@ -233,7 +233,7 @@ def build_turn_text(
             lines.append("")
             lines.append(f"Tool Calls ({len(resp['tool_calls'])}):")
             for tc in resp["tool_calls"]:
-                lines.append(format_tool_call(tc))
+                lines.append(format_tool_call(tc, truncate_tool_results))
 
         if "usage" in resp:
             lines.append("")
@@ -322,6 +322,15 @@ class ToolResultScreen(ModalScreen):
 
     def on_mount(self) -> None:
         self.query_one("#tool-result-area", TextArea).load_text(self.content)
+
+
+class ReadOnlyTextArea(TextArea):
+    """TextArea that doesn't consume single-key presses when read-only."""
+
+    def _on_key(self, event) -> None:
+        if self.read_only and len(event.character or "") == 1:
+            return
+        super()._on_key(event)
 
 
 class StageTree(Tree):
@@ -452,7 +461,7 @@ class ConversationViewer(App):
                 yield tree
             with Vertical(id="content"):
                 yield Static("", id="stage-summary")
-                yield TextArea(id="content-area", read_only=True, show_line_numbers=True)
+                yield ReadOnlyTextArea(id="content-area", read_only=True, show_line_numbers=True)
                 yield Input(placeholder="Search (regex)...", id="search-bar")
         yield Static("", id="status-bar")
         yield Footer()
@@ -514,7 +523,7 @@ class ConversationViewer(App):
             truncate_tool_results=self.truncate_tool_results,
         )
 
-        content_area = self.query_one("#content-area", TextArea)
+        content_area = self.query_one("#content-area", ReadOnlyTextArea)
         content_area.load_text(text)
 
         # Status
@@ -571,7 +580,7 @@ class ConversationViewer(App):
         self._update_display()
 
     def action_open_tool_result(self) -> None:
-        content_area = self.query_one("#content-area", TextArea)
+        content_area = self.query_one("#content-area", ReadOnlyTextArea)
         if not self.focused or self.focused.id != "content-area":
             return
         cursor_row = content_area.cursor_location[0]
@@ -600,7 +609,7 @@ class ConversationViewer(App):
         search_bar.remove_class("visible")
         self.search_matches = []
         self.search_match_idx = -1
-        self.query_one("#content-area", TextArea).focus()
+        self.query_one("#content-area", ReadOnlyTextArea).focus()
 
     @on(Input.Submitted, "#search-bar")
     def on_search_submitted(self, event: Input.Submitted) -> None:

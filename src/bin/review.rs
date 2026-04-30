@@ -449,6 +449,11 @@ async fn main() -> Result<()> {
                                 custom_prompt: args.custom_prompt.clone(),
                                 series_range,
                                 stages: args.stages.clone(),
+                                dump_conversation: settings
+                                    .ai
+                                    .dump_conversation
+                                    .as_ref()
+                                    .map(PathBuf::from),
                                 budget: TokenBudget::new(
                                     settings.ai.stage_input_budget,
                                     settings.ai.stage_output_budget,

@@ -183,6 +183,9 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    /// Directory to dump full conversation JSON for each AI turn.
+    #[serde(default)]
+    pub dump_conversation: Option<String>,
     /// Per-stage input token budget. 0 = disabled.
     #[serde(default)]
     pub stage_input_budget: usize,

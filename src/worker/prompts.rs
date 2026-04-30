@@ -104,6 +104,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub dump_conversation: Option<PathBuf>,
     pub budget: TokenBudget,
 }
 
@@ -572,6 +573,7 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    dump_conversation: Option<PathBuf>,
     budget: TokenBudget,
 }
 
@@ -592,6 +594,7 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            dump_conversation: config.dump_conversation,
             budget: config.budget,
         }
     }
@@ -1372,6 +1375,8 @@ Example:
         let mut t_in = 0;
         let mut t_out = 0;
         let mut t_cached = 0;
+        let mut prev_msg_count = local_history.len();
+        let stage_label = format!("s{}", _stage);
         let mut force_conclude = false;
         self.budget.reset_stage();
 
@@ -1394,7 +1399,16 @@ Example:
                     .map(|prefix| format!("{} s:{}] ", &prefix[..prefix.len() - 2], _stage)),
             };
 
+            if turns == 1 {
+                self.dump_json(&stage_label, turns, "req", &request);
+            } else {
+                let new_msgs = &local_history[prev_msg_count..];
+                self.dump_json(&stage_label, turns, "req", &new_msgs);
+            }
+            prev_msg_count = local_history.len();
+
             let resp = self.provider.generate_content(request).await?;
+            self.dump_json(&stage_label, turns, "resp", &resp);
 
             if let Some(usage) = &resp.usage {
                 t_in += usage.prompt_tokens as u32;
@@ -1530,6 +1544,7 @@ Example:
         }
 
         let retry_base = req.clone();
+        self.dump_json(label, 1, "req", &retry_base);
         let resp = match self.provider.generate_content(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1537,6 +1552,7 @@ Example:
                 return None;
             }
         };
+        self.dump_json(label, 1, "resp", &resp);
         if let Some(usage) = &resp.usage {
             accumulate(tokens, usage);
         }
@@ -1565,8 +1581,10 @@ Example:
                     tool_calls: None,
                     tool_call_id: None,
                 });
+                self.dump_json(label, 2, "req", &retry_req);
                 match self.provider.generate_content(retry_req).await {
                     Ok(resp2) => {
+                        self.dump_json(label, 2, "resp", &resp2);
                         if let Some(usage) = &resp2.usage {
                             accumulate(tokens, usage);
                         }
@@ -1588,6 +1606,31 @@ Example:
             }
         }
         None
+    }
+
+    fn dump_json(
+        &self,
+        stage_label: &str,
+        turn: usize,
+        suffix: &str,
+        data: &impl serde::Serialize,
+    ) {
+        let Some(dir) = &self.dump_conversation else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("Failed to create dump dir {:?}: {}", dir, e);
+            return;
+        }
+        let path = dir.join(format!("{}_{:03}_{}.json", stage_label, turn, suffix));
+        match serde_json::to_string_pretty(data) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!("Failed to write dump {:?}: {}", path, e);
+                }
+            }
+            Err(e) => warn!("Failed to serialize dump: {}", e),
+        }
     }
 }
 
@@ -1828,6 +1871,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            dump_conversation: None,
             budget: TokenBudget::new(0, 0, 0.0, 0.0, 0.0),
         };
         let mut worker = Worker::new(provider, tools, prompts, config);

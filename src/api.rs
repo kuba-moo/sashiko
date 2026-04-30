@@ -18,17 +18,19 @@ use crate::fetcher::FetchRequest;
 use crate::settings::ServerSettings;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, FromRequestParts, Query, State},
+    http::{StatusCode, request::Parts},
     routing::{get, get_service, post},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -129,6 +131,7 @@ pub struct AppState {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    pub embargo_bypass_tokens: Vec<String>,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
@@ -136,6 +139,68 @@ pub struct AppState {
     patchsets_count_cache: AsyncCache<usize>,
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
     messages_homepage_cache: AsyncCache<Vec<crate::db::MessageRow>>,
+}
+
+/// Extracts an embargo-bypass decision from the request.
+///
+/// A client can present a token via `Authorization: Bearer <token>` or the
+/// `?token=<token>` query string. If any presented token matches an entry in
+/// `AppState::embargo_bypass_tokens` (constant-time comparison), the request
+/// is allowed to see embargoed content. No match silently falls back to the
+/// default (embargoed view) — we do not surface a 401, because unauthenticated
+/// clients are legitimate readers of non-embargoed data.
+pub struct BypassEmbargo(pub bool);
+
+impl<S> FromRequestParts<S> for BypassEmbargo
+where
+    S: Send + Sync,
+    Arc<AppState>: axum::extract::FromRef<S>,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        use axum::extract::FromRef;
+        let app: Arc<AppState> = Arc::<AppState>::from_ref(state);
+        if app.embargo_bypass_tokens.is_empty() {
+            return Ok(BypassEmbargo(false));
+        }
+
+        let bearer = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
+
+        let query_token = parts.uri.query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                (k == "token").then(|| v.to_string())
+            })
+        });
+
+        let presented = bearer.or(query_token);
+        let Some(token) = presented else {
+            return Ok(BypassEmbargo(false));
+        };
+
+        let token_bytes = token.as_bytes();
+        let matched = app
+            .embargo_bypass_tokens
+            .iter()
+            .any(|configured| configured.as_bytes().ct_eq(token_bytes).into());
+        if matched {
+            let mut hasher = Sha256::new();
+            hasher.update(token_bytes);
+            let hash = hasher.finalize();
+            let hash_prefix = hash
+                .iter()
+                .take(4)
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
+            info!("embargo bypass granted (token_hash={}…)", hash_prefix);
+        }
+        Ok(BypassEmbargo(matched))
+    }
 }
 
 #[derive(Deserialize)]
@@ -235,6 +300,14 @@ pub async fn run_server(
     smtp_enabled: bool,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !settings.embargo_bypass_tokens.is_empty() {
+        warn!(
+            "{} embargo bypass token(s) configured — only serve the API over HTTPS \
+             (via a reverse proxy) to avoid leaking tokens in transit.",
+            settings.embargo_bypass_tokens.len()
+        );
+    }
+
     let state = Arc::new(AppState {
         db,
         sender,
@@ -243,6 +316,7 @@ pub async fn run_server(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        embargo_bypass_tokens: settings.embargo_bypass_tokens.clone(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -508,23 +582,29 @@ async fn list_mailing_lists(
 
 async fn list_patchsets(
     State(state): State<Arc<AppState>>,
+    BypassEmbargo(bypass): BypassEmbargo,
     Query(pagination): Query<Pagination>,
 ) -> Result<Json<PatchsetsResponse>, StatusCode> {
     let page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(50).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    let items = if pagination.q.is_none()
+    // The homepage cache is shared across all users. A cached response built
+    // for an authenticated request would leak embargoed fields to anonymous
+    // clients, so bypass callers always go straight to the DB.
+    let use_cache = !bypass
+        && pagination.q.is_none()
         && pagination.mailing_list.is_none()
         && page == 1
-        && per_page == 50
-    {
+        && per_page == 50;
+
+    let items = if use_cache {
         state
             .patchsets_homepage_cache
             .get_or_fetch(|| async {
                 state
                     .db
-                    .get_patchsets(per_page, offset, None, None)
+                    .get_patchsets(per_page, offset, None, None, false)
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
             })
@@ -537,6 +617,7 @@ async fn list_patchsets(
                 offset,
                 pagination.q.clone(),
                 pagination.mailing_list.clone(),
+                bypass,
             )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -632,19 +713,20 @@ async fn list_messages(
 
 async fn get_patchset(
     State(state): State<Arc<AppState>>,
+    BypassEmbargo(bypass): BypassEmbargo,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
         info!("Fetching details for patchset id: {}", id_val);
         state
             .db
-            .get_patchset_details(id_val, query.page, query.per_page)
+            .get_patchset_details(id_val, query.page, query.per_page, bypass)
             .await
     } else {
         info!("Fetching details for patchset msgid: {}", query.id);
         state
             .db
-            .get_patchset_details_by_msgid(&query.id, query.page, query.per_page)
+            .get_patchset_details_by_msgid(&query.id, query.page, query.per_page, bypass)
             .await
     };
 
@@ -675,14 +757,15 @@ async fn get_patchset(
 
 async fn get_review(
     State(state): State<Arc<AppState>>,
+    BypassEmbargo(bypass): BypassEmbargo,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
         info!("Fetching latest review for patchset id: {}", ps_id);
-        state.db.get_latest_review_for_patchset(ps_id).await
+        state.db.get_latest_review_for_patchset(ps_id, bypass).await
     } else if let Some(id) = query.id {
         info!("Fetching details for review id: {}", id);
-        state.db.get_review_details(id).await
+        state.db.get_review_details(id, bypass).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -702,19 +785,20 @@ async fn get_review(
 
 async fn get_patchset_summary(
     State(state): State<Arc<AppState>>,
+    BypassEmbargo(bypass): BypassEmbargo,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
         info!("Fetching summary for patchset id: {}", id_val);
         state
             .db
-            .get_patchset_summary(id_val, query.page, query.per_page)
+            .get_patchset_summary(id_val, query.page, query.per_page, bypass)
             .await
     } else {
         info!("Fetching summary for patchset msgid: {}", query.id);
         state
             .db
-            .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page)
+            .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page, bypass)
             .await
     };
 
@@ -745,14 +829,15 @@ async fn get_patchset_summary(
 
 async fn get_review_log(
     State(state): State<Arc<AppState>>,
+    BypassEmbargo(bypass): BypassEmbargo,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let result = if let Some(ps_id) = query.patchset_id {
         info!("Fetching latest review log for patchset id: {}", ps_id);
-        state.db.get_latest_review_for_patchset(ps_id).await
+        state.db.get_latest_review_for_patchset(ps_id, bypass).await
     } else if let Some(id) = query.id {
         info!("Fetching details for review id: {}", id);
-        state.db.get_review_details(id).await
+        state.db.get_review_details(id, bypass).await
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };

@@ -296,6 +296,7 @@ impl Database {
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
+        bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         // 1. Try to find a patchset where this is the cover letter
         let mut rows = self
@@ -307,7 +308,9 @@ impl Database {
             .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+            return self
+                .get_patchset_details(id, page, limit, bypass_embargo)
+                .await;
         }
 
         // 2. Fallback: Find a patchset that contains this message as a patch
@@ -320,7 +323,9 @@ impl Database {
             .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+            return self
+                .get_patchset_details(id, page, limit, bypass_embargo)
+                .await;
         }
 
         Ok(None)
@@ -2243,6 +2248,7 @@ impl Database {
         offset: usize,
         query: Option<String>,
         mailing_list: Option<String>,
+        bypass_embargo: bool,
     ) -> Result<Vec<PatchsetRow>> {
         let (where_clause, params) = self.build_search(query, mailing_list, "patchset");
         // We use p.* alias implicitely by using unqualified names in WHERE which is fine given no collisions.
@@ -2310,11 +2316,8 @@ impl Database {
                     };
 
                     let embargo_until: Option<i64> = row.get(19).ok();
-                    let is_embargoed = if let Some(until) = embargo_until {
-                        until > now
-                    } else {
-                        false
-                    };
+                    let is_embargoed =
+                        !bypass_embargo && embargo_until.map(|u| u > now).unwrap_or(false);
 
                     let (low, medium, high, critical) = if is_embargoed {
                         (0, 0, 0, 0)
@@ -2493,6 +2496,7 @@ impl Database {
         id: i64,
         page: Option<u32>,
         limit: Option<u32>,
+        bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -2585,11 +2589,7 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
 
-            let is_embargoed = if let Some(until) = embargo_until {
-                until > now
-            } else {
-                false
-            };
+            let is_embargoed = !bypass_embargo && embargo_until.map(|u| u > now).unwrap_or(false);
 
             // Fetch patches with subject and msg_db_id
             let mut patches = Vec::new();
@@ -2735,6 +2735,7 @@ impl Database {
         id: i64,
         page: Option<u32>,
         limit: Option<u32>,
+        bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -2824,11 +2825,7 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
 
-            let is_embargoed = if let Some(until) = embargo_until {
-                until > now
-            } else {
-                false
-            };
+            let is_embargoed = !bypass_embargo && embargo_until.map(|u| u > now).unwrap_or(false);
 
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
@@ -2971,6 +2968,7 @@ impl Database {
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
+        bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -2981,7 +2979,9 @@ impl Database {
             .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+            return self
+                .get_patchset_summary(id, page, limit, bypass_embargo)
+                .await;
         }
 
         let mut rows = self
@@ -2993,29 +2993,49 @@ impl Database {
             .await?;
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+            return self
+                .get_patchset_summary(id, page, limit, bypass_embargo)
+                .await;
         }
 
         Ok(None)
     }
 
-    pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
+    pub async fn get_review_details(
+        &self,
+        id: i64,
+        bypass_embargo: bool,
+    ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw,
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_git_hash, r.result_description,
-                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached, r.budget_flags
+                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached, r.budget_flags,
+                        p.embargo_until
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
+             LEFT JOIN patchsets p ON r.patchset_id = p.id
              WHERE r.id = ?",
                 libsql::params![id],
             )
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
+            let embargo_until: Option<i64> = r.get(20).ok();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            let is_embargoed = !bypass_embargo && embargo_until.map(|u| u > now).unwrap_or(false);
+            if is_embargoed {
+                return Ok(Some(serde_json::json!({
+                    "id": r.get::<i64>(0)?,
+                    "status": "Embargoed",
+                    "embargo_until": embargo_until,
+                })));
+            }
             Ok(Some(serde_json::json!({
                 "id": r.get::<i64>(0)?,
                 "model": r.get::<Option<String>>(1).ok(),
@@ -3048,6 +3068,7 @@ impl Database {
     pub async fn get_latest_review_for_patchset(
         &self,
         patchset_id: i64,
+        bypass_embargo: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -3059,7 +3080,7 @@ impl Database {
 
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
-            self.get_review_details(id).await
+            self.get_review_details(id, bypass_embargo).await
         } else {
             Ok(None)
         }
@@ -3700,7 +3721,7 @@ mod tests {
             .unwrap();
         assert_eq!(ps1, ps1_update);
 
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(list[0].subject.as_deref(), Some("Cover Letter"));
 
         // 3. Add Patch 2 (index 2)
@@ -3731,7 +3752,7 @@ mod tests {
         .await
         .unwrap();
 
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(list[0].subject.as_deref(), Some("Cover Letter"));
 
         // 4. Create NEW patchset in same thread (Author B, Time 1000 - same time but diff author)
@@ -3990,7 +4011,7 @@ mod tests {
         }
 
         // Verify the final subject is the cover letter (index 0)
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(
             list[0].subject.as_deref(),
             Some("[PATCH 0/5] Feature part 0")
@@ -4033,7 +4054,7 @@ mod tests {
             .unwrap();
 
         // Check initial status
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(list[0].status.as_deref(), Some("Incomplete"));
 
         // 2. Add Patch 1. received=1. Total=2. Status should be Incomplete.
@@ -4043,7 +4064,7 @@ mod tests {
         .await
         .unwrap();
         db.create_patch(ps_id, "msg_1", 1, "diff").await.unwrap();
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(list[0].status.as_deref(), Some("Incomplete"));
 
         // 3. Add Patch 2. received=2. Total=2. Status should transition to Pending.
@@ -4053,7 +4074,7 @@ mod tests {
         .await
         .unwrap();
         db.create_patch(ps_id, "msg_2", 2, "diff").await.unwrap();
-        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None, false).await.unwrap();
         assert_eq!(list[0].status.as_deref(), Some("Pending"));
     }
 
@@ -4128,10 +4149,10 @@ mod tests {
             .await
             .unwrap();
 
-        let patchsets = db.get_patchsets(10, 0, None, None).await.unwrap();
+        let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
         assert_eq!(patchsets[0].status.as_deref(), Some("Embargoed"));
         let details = db
-            .get_patchset_details(ps_id, None, None)
+            .get_patchset_details(ps_id, None, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -4148,10 +4169,10 @@ mod tests {
             .await
             .unwrap();
 
-        let patchsets = db.get_patchsets(10, 0, None, None).await.unwrap();
+        let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
         assert_eq!(patchsets[0].status.as_deref(), Some("Reviewed"));
         let details = db
-            .get_patchset_details(ps_id, None, None)
+            .get_patchset_details(ps_id, None, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -5145,13 +5166,13 @@ mod tests {
         db.create_patch(ps2, "msg2", 2, "").await.unwrap();
 
         let details1 = db
-            .get_patchset_details(ps1, None, None)
+            .get_patchset_details(ps1, None, None, false)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(details1["received_parts"], 1);
         let details2 = db
-            .get_patchset_details(ps2, None, None)
+            .get_patchset_details(ps2, None, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -5209,7 +5230,7 @@ mod tests {
         db.create_patch(ps1, msg_id, 1, "diff").await.unwrap();
 
         let details = db
-            .get_patchset_details(ps1, None, None)
+            .get_patchset_details(ps1, None, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -5439,14 +5460,14 @@ mod tests {
         // ps_a only has a cover letter in list-a.
         // The UNION query should find it.
         let psets_a = db
-            .get_patchsets(10, 0, None, Some("list-a".to_string()))
+            .get_patchsets(10, 0, None, Some("list-a".to_string()), false)
             .await
             .unwrap();
         assert_eq!(psets_a.len(), 1);
         assert_eq!(psets_a[0].id, ps_a);
 
         let psets_b = db
-            .get_patchsets(10, 0, None, Some("list-a".to_string()))
+            .get_patchsets(10, 0, None, Some("list-a".to_string()), false)
             .await
             .unwrap();
         let found_b = psets_b.iter().any(|p| p.id == ps_b);

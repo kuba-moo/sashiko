@@ -1103,6 +1103,15 @@
 <body>
     <div id="app"></div>
 
+    <div id="bypassBadge" title="Embargo bypass token active. Click to forget." style="
+        display:none; position:fixed; top:10px; right:12px; z-index:200;
+        background:var(--status-embargoed, #6f42c1); color:#fff;
+        font: 500 12px/1 system-ui, sans-serif;
+        padding:6px 10px; border-radius:999px; cursor:pointer;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.25); user-select:none;">
+        🔓 embargo bypass
+    </div>
+
     <div class="kbd-hint">
         <kbd>/</kbd> search
         <kbd>j</kbd><kbd>k</kbd> nav
@@ -1216,6 +1225,83 @@
     </div>
 
     <script>
+        // =====================================================================
+        // EMBARGO BYPASS TOKEN
+        // =====================================================================
+        // On load, parse ?token=: "-1" clears the stored token, any other
+        // value replaces it. Either way the URL is scrubbed so the token
+        // doesn't stay visible in the address bar / history / referrers.
+        // All /api/* calls should go through apiFetch(), which injects the
+        // Authorization header when a token is present.
+        const BYPASS_TOKEN_KEY = 'sashiko_bypass_token';
+        (function initBypassToken() {
+            // The router uses hash-based routes like #/patchset/<msgid>?token=…,
+            // so the token can live in either the real query string or inside
+            // the hash's query portion. Handle both, then scrub whichever one
+            // carried it.
+            let searchParams = new URLSearchParams(window.location.search);
+            let hash = window.location.hash;
+            let hashPath = hash;
+            let hashParams = new URLSearchParams();
+            const hashQueryIdx = hash.indexOf('?');
+            if (hashQueryIdx >= 0) {
+                hashPath = hash.slice(0, hashQueryIdx);
+                hashParams = new URLSearchParams(hash.slice(hashQueryIdx + 1));
+            }
+
+            const token = searchParams.get('token') ?? hashParams.get('token');
+            if (token === null) return;
+
+            if (token === '-1') {
+                localStorage.removeItem(BYPASS_TOKEN_KEY);
+            } else if (token) {
+                localStorage.setItem(BYPASS_TOKEN_KEY, token);
+            }
+
+            searchParams.delete('token');
+            hashParams.delete('token');
+            const searchStr = searchParams.toString();
+            const hashQs = hashParams.toString();
+            const newHash = hashPath + (hashQs ? '?' + hashQs : '');
+            const newUrl = window.location.pathname +
+                (searchStr ? '?' + searchStr : '') +
+                newHash;
+            window.history.replaceState(null, '', newUrl);
+        })();
+
+        function getBypassToken() {
+            return localStorage.getItem(BYPASS_TOKEN_KEY);
+        }
+
+        function apiFetch(input, init) {
+            const token = getBypassToken();
+            if (!token) return fetch(input, init);
+            const merged = Object.assign({}, init || {});
+            const headers = new Headers(merged.headers || {});
+            headers.set('Authorization', 'Bearer ' + token);
+            merged.headers = headers;
+            return fetch(input, merged);
+        }
+
+        function updateBypassBadge() {
+            const el = document.getElementById('bypassBadge');
+            if (!el) return;
+            el.style.display = getBypassToken() ? 'block' : 'none';
+        }
+        window.addEventListener('DOMContentLoaded', () => {
+            const el = document.getElementById('bypassBadge');
+            if (el) {
+                el.addEventListener('click', () => {
+                    if (!confirm('Forget the embargo bypass token on this device?')) return;
+                    localStorage.removeItem(BYPASS_TOKEN_KEY);
+                    updateBypassBadge();
+                    // Re-load so views refresh without the token.
+                    window.location.reload();
+                });
+            }
+            updateBypassBadge();
+        });
+
         // =====================================================================
         // STATE
         // =====================================================================
@@ -1463,7 +1549,7 @@
         // =====================================================================
         async function fetchMailingLists() {
             try {
-                const res = await fetch('api/lists');
+                const res = await apiFetch('api/lists');
                 if (res.ok) {
                     const lists = await res.json();
                     lists.sort((a, b) => a.name.localeCompare(b.name));
@@ -1925,7 +2011,7 @@
                 url += `&mailing_list=${encodeURIComponent(state.selectedList)}`;
             }
 
-            const res = await fetch(url);
+            const res = await apiFetch(url);
             const data = await res.json();
 
             const items = data.items || [];
@@ -2038,7 +2124,7 @@
 
         async function fetchStats() {
             try {
-                const res = await fetch('api/stats');
+                const res = await apiFetch('api/stats');
                 const data = await res.json();
                 state.stats = data;
 
@@ -2116,7 +2202,7 @@
         async function renderPatchsetView(id, query = {}) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
-            const res = await fetch(`api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
+            const res = await apiFetch(`api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
             
@@ -2513,7 +2599,7 @@
         // BASELINE LOG VIEW
         // =====================================================================
         async function renderBaselineLogView(id, idx) {
-            const res = await fetch(`api/patchset?id=${encodeURIComponent(id)}`);
+            const res = await apiFetch(`api/patchset?id=${encodeURIComponent(id)}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
 
@@ -2754,7 +2840,7 @@
         // MESSAGE VIEW
         // =====================================================================
         async function renderMessageView(id) {
-            const res = await fetch(`api/message?id=${encodeURIComponent(id)}`);
+            const res = await apiFetch(`api/message?id=${encodeURIComponent(id)}`);
             if (!res.ok) throw new Error('Message not found');
             const data = await res.json();
 
@@ -2833,7 +2919,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // LOG VIEW
         // =====================================================================
         async function renderLogView(id) {
-            const res = await fetch(`api/review?id=${id}`);
+            const res = await apiFetch(`api/review?id=${id}`);
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
@@ -3169,9 +3255,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             try {
                 if (!state.statsData) {
                     const [timeline, reviewsData, tools] = await Promise.all([
-                        fetch('api/stats/timeline').then(r => r.json()),
-                        fetch('api/stats/reviews').then(r => r.json()),
-                        fetch('api/stats/tools').then(r => r.json())
+                        apiFetch('api/stats/timeline').then(r => r.json()),
+                        apiFetch('api/stats/reviews').then(r => r.json()),
+                        apiFetch('api/stats/tools').then(r => r.json())
                     ]);
                     state.statsData = { timeline, reviewsData, tools };
                 }

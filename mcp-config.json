@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "semcode": {
+      "args": [
+        "--database",
+        "/home/kicinski/devel/linux/.semcode.db",
+        "--git-repo",
+        "/home/kicinski/devel/linux"
+      ],
+      "command": "/home/kicinski/devel/semcode/target/release/semcode-mcp"
+    }
+  }
+}

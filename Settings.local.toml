@@ -1,0 +1,12 @@
+[ai]
+provider = "claude-cli"
+model = "claude-opus-4-7"
+max_input_tokens = 180000
+max_interactions = 150
+
+[git]
+repository_path = "/home/kicinski/devel/linux"
+
+[semcode]
+binary = "/home/kicinski/devel/semcode/target/release/semcode-mcp"
+index_binary = "/home/kicinski/devel/semcode/target/release/semcode-index"

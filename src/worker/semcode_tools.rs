@@ -123,24 +123,17 @@ impl SemcodeToolBox {
     pub fn get_declarations(&self) -> Vec<AiTool> {
         vec![
             AiTool {
-                name: "sc_find_function".to_string(),
-                description: "Find a function or macro by exact name. Returns the full definition body, file location, parameters, return type, and caller/callee counts.".to_string(),
+                name: "sc_find_definition".to_string(),
+                description: "Find a definition by exact name — a function, macro, type, struct, union, or typedef. Returns the full definition body with file location, and for functions also parameters, return type, and caller/callee counts. Use `kind` when you already know which category you want; the default searches both and is the right choice when unsure.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "The exact name of the function or macro to find." },
-                        "git_sha": { "type": "string", "description": "Git commit SHA to search at (defaults to current HEAD)." }
-                    },
-                    "required": ["name"]
-                }),
-            },
-            AiTool {
-                name: "sc_find_type".to_string(),
-                description: "Find a type, struct, union, or typedef by exact name. Returns the full definition with fields/members.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string", "description": "Type name without struct/enum/typedef prefix (e.g. 'task_struct')." },
+                        "name": { "type": "string", "description": "The exact name of the symbol to find, without struct/enum/typedef prefix (e.g. 'task_struct', not 'struct task_struct')." },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["function", "type", "any"],
+                            "description": "Which category to search. 'function' covers functions and macros. 'type' covers struct/union/typedef. 'any' (default) tries function first, then type if nothing is found."
+                        },
                         "git_sha": { "type": "string", "description": "Git commit SHA to search at (defaults to current HEAD)." }
                     },
                     "required": ["name"]
@@ -204,9 +197,11 @@ impl SemcodeToolBox {
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
+        if name == "sc_find_definition" {
+            return self.call_find_definition(args).await;
+        }
+
         let mcp_tool_name = match name {
-            "sc_find_function" => "find_function",
-            "sc_find_type" => "find_type",
             "sc_find_callers" => "find_callers",
             "sc_find_calls" => "find_calls",
             "sc_find_callchain" => "find_callchain",
@@ -214,31 +209,79 @@ impl SemcodeToolBox {
             _ => return Err(anyhow!("Unknown semcode tool: {}", name)),
         };
 
-        let result = self
-            .send_request(
-                "tools/call",
-                json!({
-                    "name": mcp_tool_name,
-                    "arguments": args,
-                }),
-            )
-            .await?;
+        let result = self.call_mcp(mcp_tool_name, &args).await?;
+        Ok(Self::format_mcp_result(result))
+    }
 
+    /// Route sc_find_definition to find_function / find_type based on `kind`.
+    async fn call_find_definition(&self, args: Value) -> Result<Value> {
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("any");
+
+        // Strip `kind` before forwarding — the MCP side doesn't know it.
+        let mut forwarded = args.clone();
+        if let Some(obj) = forwarded.as_object_mut() {
+            obj.remove("kind");
+        }
+
+        let (first, fallback) = match kind {
+            "function" => ("find_function", None),
+            "type" => ("find_type", None),
+            _ => ("find_function", Some("find_type")),
+        };
+
+        let first_result = self.call_mcp(first, &forwarded).await?;
+        if let Some(fb) = fallback
+            && Self::mcp_result_is_miss(&first_result)
+        {
+            let fb_result = self.call_mcp(fb, &forwarded).await?;
+            return Ok(Self::format_mcp_result(fb_result));
+        }
+        Ok(Self::format_mcp_result(first_result))
+    }
+
+    async fn call_mcp(&self, tool: &str, arguments: &Value) -> Result<Value> {
+        self.send_request(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+        )
+        .await
+    }
+
+    /// semcode-mcp signals a logical miss with a single text segment like
+    /// "Function 'X' not found at git SHA …" or "Type or typedef 'X' not
+    /// found …". Match those exact sentinel shapes so we don't mistake a
+    /// real function body containing the words "not found" for a miss.
+    fn mcp_result_is_miss(result: &Value) -> bool {
+        let Some(content) = result.get("content").and_then(|c| c.as_array()) else {
+            return false;
+        };
+        if content.len() != 1 {
+            return false;
+        }
+        let Some(text) = content[0].get("text").and_then(|t| t.as_str()) else {
+            return false;
+        };
+        let trimmed = text.trim();
+        (trimmed.starts_with("Function '") || trimmed.starts_with("Type or typedef '"))
+            && trimmed.contains("' not found")
+    }
+
+    fn format_mcp_result(result: Value) -> Value {
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
             let text: Vec<&str> = content
                 .iter()
                 .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
                 .collect();
             if !text.is_empty() {
-                return Ok(json!({"result": text.join("\n")}));
+                return json!({"result": text.join("\n")});
             }
         }
 
         if let Some(err) = result.get("error") {
-            return Ok(json!({"error": err}));
+            return json!({"error": err.clone()});
         }
 
-        Ok(json!({"result": result.to_string()}))
+        json!({"result": result.to_string()})
     }
 
     pub async fn shutdown(&self) {

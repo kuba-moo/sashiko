@@ -23,3 +23,8 @@ ignored_emails = []
 # If true, Sashiko will send a reply indicating that the review was positive.
 send_positive_review = false
 
+# How many hours to hold findings private after a review completes. During
+# this window the UI reports the patchset status as "Embargoed" and hides
+# findings counts; clients with a configured embargo_bypass_token see the
+# real data immediately.
+embargo_hours = 24

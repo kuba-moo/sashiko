@@ -1041,7 +1041,7 @@
         // =====================================================================
         async function fetchMailingLists() {
             try {
-                const res = await fetch('/api/lists');
+                const res = await fetch('api/lists');
                 if (res.ok) {
                     const lists = await res.json();
                     lists.sort((a, b) => a.name.localeCompare(b.name));
@@ -1424,7 +1424,7 @@
         }
 
         async function fetchListData() {
-            const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : '/api/messages';
+            const endpoint = state.listMode === 'patchsets' ? 'api/patchsets' : 'api/messages';
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
             if (state.searchQuery) {
                 url += `&q=${encodeURIComponent(state.searchQuery)}`;
@@ -1546,7 +1546,7 @@
 
         async function fetchStats() {
             try {
-                const res = await fetch('/api/stats');
+                const res = await fetch('api/stats');
                 const data = await res.json();
                 state.stats = data;
 
@@ -1622,7 +1622,7 @@
         async function renderPatchsetView(id, query = {}) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
-            const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
+            const res = await fetch(`api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
             
@@ -2009,7 +2009,7 @@
         // BASELINE LOG VIEW
         // =====================================================================
         async function renderBaselineLogView(id, idx) {
-            const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}`);
+            const res = await fetch(`api/patchset?id=${encodeURIComponent(id)}`);
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             const data = await res.json();
 
@@ -2217,7 +2217,7 @@
         // MESSAGE VIEW
         // =====================================================================
         async function renderMessageView(id) {
-            const res = await fetch(`/api/message?id=${encodeURIComponent(id)}`);
+            const res = await fetch(`api/message?id=${encodeURIComponent(id)}`);
             if (!res.ok) throw new Error('Message not found');
             const data = await res.json();
 
@@ -2296,7 +2296,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // LOG VIEW
         // =====================================================================
         async function renderLogView(id) {
-            const res = await fetch(`/api/review?id=${id}`);
+            const res = await fetch(`api/review?id=${id}`);
             if (!res.ok) throw new Error('Review not found');
             const data = await res.json();
 
@@ -2627,9 +2627,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 const [timeline, reviews, tools] = await Promise.all([
-                    fetch('/api/stats/timeline').then(r => r.json()),
-                    fetch('/api/stats/reviews').then(r => r.json()),
-                    fetch('/api/stats/tools').then(r => r.json())
+                    fetch('api/stats/timeline').then(r => r.json()),
+                    fetch('api/stats/reviews').then(r => r.json()),
+                    fetch('api/stats/tools').then(r => r.json())
                 ]);
 
                 // Colors

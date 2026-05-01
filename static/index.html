@@ -1622,11 +1622,11 @@
                             critical: p.findings_critical || 0
                         };
                         findingsHtml = renderFindingsBadges(counts, statusLabel);
-                        if (p.findings_multi_stage != null && p.findings_multi_stage > 0) {
+                        if (p.findings_multi_stage != null) {
                             const totalFindings = counts.low + counts.medium + counts.high + counts.critical;
                             if (totalFindings > 0) {
                                 const uniquePct = Math.ceil((totalFindings - p.findings_multi_stage) * 100 / totalFindings);
-                                findingsHtml += ` <span style="color:var(--text-dim); font-size:0.85em;" title="${p.findings_multi_stage} of ${totalFindings} findings flagged by multiple review stages">${uniquePct}% unique</span>`;
+                                findingsHtml += `<div style="color:var(--text-dim); font-size:0.85em; margin-top:2px;" title="${p.findings_multi_stage} of ${totalFindings} findings flagged by multiple review stages">${uniquePct}% unique</div>`;
                             }
                         }
                     }

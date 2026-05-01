@@ -106,6 +106,11 @@ pub struct WorkerConfig {
     pub stages: Option<Vec<u8>>,
     pub dump_conversation: Option<PathBuf>,
     pub budget: TokenBudget,
+    /// Optional alternate provider to switch to mid-review if the review
+    /// budget crosses `budget_warn_pct`. Typically built with a higher
+    /// reasoning-effort setting so the remaining stages can make more of
+    /// each turn once the tool-use budget is constrained.
+    pub retry_provider: Option<Arc<dyn AiProvider>>,
 }
 
 /// Tracks token usage and emits warning messages when thresholds are crossed.
@@ -242,6 +247,24 @@ impl TokenBudget {
 
     pub fn flags(&self) -> u8 {
         self.fired
+    }
+
+    /// Non-mutating: has review-level input or output usage already crossed
+    /// `warn_pct` of its configured budget? Used to decide whether to swap
+    /// to a higher-effort retry provider at the start of a stage.
+    pub fn review_past_warn(&self) -> bool {
+        if self.warn_pct <= 0.0 {
+            return false;
+        }
+        let past = |used: usize, budget: usize| -> bool {
+            if budget == 0 {
+                return false;
+            }
+            let thresh = (budget as f32 * self.warn_pct) as usize;
+            thresh > 0 && used >= thresh
+        };
+        past(self.review_input_used, self.review_input)
+            || past(self.review_output_used, self.review_output)
     }
 
     /// Reset per-stage state (keep review-level bits, counters, and
@@ -575,6 +598,7 @@ pub struct Worker {
     stages: Option<Vec<u8>>,
     dump_conversation: Option<PathBuf>,
     budget: TokenBudget,
+    retry_provider: Option<Arc<dyn AiProvider>>,
 }
 
 impl Worker {
@@ -596,7 +620,24 @@ impl Worker {
             stages: config.stages,
             dump_conversation: config.dump_conversation,
             budget: config.budget,
+            retry_provider: config.retry_provider,
         }
+    }
+
+    /// If the review is already past `budget_warn_pct` and a retry provider
+    /// was configured, promote it to the active provider. `take()` makes
+    /// this naturally idempotent.
+    fn maybe_promote_retry_provider(&mut self, stage: u8) {
+        if !self.budget.review_past_warn() {
+            return;
+        }
+        let Some(retry) = self.retry_provider.take() else {
+            return;
+        };
+        info!(
+            "Review budget past warn threshold before stage {stage}; switching to retry provider"
+        );
+        self.provider = retry;
     }
 
     pub async fn run(&mut self, patchset: Value) -> Result<WorkerResult> {
@@ -1405,6 +1446,7 @@ Example:
         let stage_label = format!("s{}", _stage);
         let mut force_conclude = false;
         self.budget.reset_stage();
+        self.maybe_promote_retry_provider(_stage);
 
         loop {
             turns += 1;
@@ -1905,6 +1947,7 @@ mod tests {
             stages: None,
             dump_conversation: None,
             budget: TokenBudget::new(0, 0, 0.0, 0.0, 0.0),
+            retry_provider: None,
         };
         let mut worker = Worker::new(provider, tools, prompts, config);
 
@@ -1961,5 +2004,32 @@ mod tests {
             err.downcast_ref::<ReviewError>().is_some(),
             "FormatRejection must downcast to ReviewError"
         );
+    }
+
+    #[test]
+    fn test_review_past_warn() {
+        // stage budgets 1000/1000, review multiplier 2.0 => review 2000/2000,
+        // warn_pct 0.5 => 1000 token trigger on each of input/output.
+        let mut b = TokenBudget::new(1000, 1000, 0.5, 0.9, 2.0);
+        assert!(!b.review_past_warn());
+        b.accumulate_review(500, 0);
+        assert!(!b.review_past_warn());
+        b.accumulate_review(500, 0);
+        assert!(b.review_past_warn());
+
+        // Output side alone is enough to trip.
+        let mut b = TokenBudget::new(1000, 1000, 0.5, 0.9, 2.0);
+        b.accumulate_review(0, 1200);
+        assert!(b.review_past_warn());
+
+        // Warn pct 0 disables the check.
+        let mut b = TokenBudget::new(1000, 1000, 0.0, 0.0, 2.0);
+        b.accumulate_review(5000, 5000);
+        assert!(!b.review_past_warn());
+
+        // Zero-budget axis is ignored.
+        let mut b = TokenBudget::new(0, 1000, 0.5, 0.9, 2.0);
+        b.accumulate_review(10_000, 0);
+        assert!(!b.review_past_warn());
     }
 }

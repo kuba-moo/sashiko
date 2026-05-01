@@ -421,6 +421,8 @@ async fn main() -> Result<()> {
                         // Use stdio-gemini for the binary as it expects to communicate with parent
                         let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
 
+                        let retry_provider = build_retry_provider(&settings);
+
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));
@@ -474,6 +476,7 @@ async fn main() -> Result<()> {
                                     settings.ai.budget_severe_pct,
                                     settings.ai.review_budget_multiplier,
                                 ),
+                                retry_provider,
                             },
                         );
 
@@ -581,6 +584,44 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&error_json)?);
     }
     Ok(())
+}
+
+/// Build the optional provider the worker switches to when review token
+/// usage crosses `budget_warn_pct`. Currently only bedrock has a
+/// `retry_effort` knob; other providers get `None`.
+#[cfg(feature = "bedrock")]
+fn build_retry_provider(
+    settings: &Settings,
+) -> Option<std::sync::Arc<dyn sashiko::ai::AiProvider>> {
+    let bedrock = settings.ai.bedrock.as_ref()?;
+    let retry_effort = bedrock.retry_effort.as_deref()?;
+    if bedrock.effort.as_deref() == Some(retry_effort) {
+        return None;
+    }
+    let mut alt = settings.clone();
+    if let Some(alt_b) = alt.ai.bedrock.as_mut() {
+        alt_b.effort = Some(retry_effort.to_string());
+    }
+    match sashiko::ai::create_provider(&alt) {
+        Ok(p) => {
+            info!(
+                "Retry provider ready (effort {:?}); will activate if review passes budget_warn_pct",
+                retry_effort
+            );
+            Some(p)
+        }
+        Err(e) => {
+            warn!("Failed to build retry provider: {}", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "bedrock"))]
+fn build_retry_provider(
+    _settings: &Settings,
+) -> Option<std::sync::Arc<dyn sashiko::ai::AiProvider>> {
+    None
 }
 
 async fn apply_single_patch(

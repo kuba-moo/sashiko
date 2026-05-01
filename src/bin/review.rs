@@ -405,6 +405,19 @@ async fn main() -> Result<()> {
                             info!("Restarting AI review (attempt {}/3)...", attempt);
                         }
 
+                        #[cfg(feature = "bedrock")]
+                        if attempt > 1
+                            && let Some(bedrock) = settings.ai.bedrock.as_mut()
+                            && let Some(retry_effort) = bedrock.retry_effort.as_deref()
+                            && bedrock.effort.as_deref() != Some(retry_effort)
+                        {
+                            info!(
+                                "Switching bedrock effort from {:?} to {:?} for attempt {}",
+                                bedrock.effort, retry_effort, attempt
+                            );
+                            bedrock.effort = Some(retry_effort.to_string());
+                        }
+
                         // Use stdio-gemini for the binary as it expects to communicate with parent
                         let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
 

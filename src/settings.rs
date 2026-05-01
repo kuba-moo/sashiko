@@ -142,6 +142,10 @@ pub struct BedrockSettings {
     /// Leave unset to use the model default. "xhigh" is Opus 4.7-only.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Effort level to use for retry attempts after a review failure.
+    /// Leave unset to keep `effort` unchanged across retries.
+    #[serde(default)]
+    pub retry_effort: Option<String>,
 }
 
 #[cfg(feature = "bedrock")]

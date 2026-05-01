@@ -607,6 +607,7 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             Some(thought_signature)
         },
+        reasoning: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -850,6 +851,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -868,6 +870,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -887,6 +890,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -906,6 +910,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -933,6 +938,7 @@ mod tests {
             content: Some("Hello!".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -963,6 +969,7 @@ mod tests {
             content: Some("Let me check.".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 function_name: "git_log".to_string(),
@@ -1000,6 +1007,7 @@ mod tests {
             content: Some("commit abc123".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
         }]);
@@ -1030,6 +1038,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -1177,6 +1186,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -1200,6 +1210,7 @@ mod tests {
             content: Some("Hello!".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -1229,6 +1240,7 @@ mod tests {
             content: Some("Hello!".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);

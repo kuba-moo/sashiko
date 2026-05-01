@@ -580,6 +580,7 @@ impl Worker {
                             content: Some(phase0_prompt),
                             thought: None,
                             thought_signature: None,
+                            reasoning: None,
                             tool_calls: None,
                             tool_call_id: None,
                         }],
@@ -734,6 +735,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                     content: Some(format!("{}\n\n{}", shared_context, planning_prompt)),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 }],
@@ -807,6 +809,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 content: Some(clean_shared_context.clone()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1464,6 +1467,7 @@ Example Output:
                     content: Some(content.to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -1475,6 +1479,7 @@ Example Output:
                     )),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -2216,6 +2221,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![crate::ai::ToolCall {
                         id: "call_1".to_string(),
                         function_name: "git_log".to_string(),
@@ -2230,6 +2236,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![crate::ai::ToolCall {
                         id: "call_2".to_string(),
                         function_name: "git_log".to_string(),
@@ -2244,6 +2251,7 @@ mod tests {
                     content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     usage: None,
                     truncated: false,
@@ -2277,6 +2285,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![crate::ai::ToolCall {
                         id: "call_1".to_string(),
                         function_name: "git_log".to_string(),
@@ -2291,6 +2300,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![crate::ai::ToolCall {
                         id: "call_2".to_string(),
                         function_name: "git_ls".to_string(),
@@ -2305,6 +2315,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![crate::ai::ToolCall {
                         id: "call_3".to_string(),
                         function_name: "git_log".to_string(),
@@ -2319,6 +2330,7 @@ mod tests {
                     content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     usage: None,
                     truncated: false,
@@ -2425,6 +2437,7 @@ mod tests {
                         content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
                         thought: None,
                         thought_signature: None,
+                        reasoning: None,
                         tool_calls: None,
                         usage: None,
                         truncated: false,

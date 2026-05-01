@@ -36,6 +36,30 @@ pub enum AiRole {
     Tool,
 }
 
+/// A provider-agnostic reasoning / "extended thinking" content block.
+///
+/// Some providers (notably Anthropic Claude via the Bedrock Converse API)
+/// return the model's internal reasoning as a sequence of blocks, each with
+/// its own cryptographic `signature` over the block's text. The full
+/// sequence — with per-block signatures intact and in the original order —
+/// must be echoed back on the next request or the API errors / silently
+/// degrades (see Anthropic extended-thinking docs). Concatenating `text`
+/// and `signature` across blocks invalidates the signatures, so we model
+/// each block individually.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningBlock {
+    /// Plain reasoning text with an optional provider-issued signature.
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Provider-redacted reasoning; opaque bytes that must be echoed back
+    /// verbatim.
+    Redacted { data: Vec<u8> },
+}
+
 /// A single message in an AI conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiMessage {
@@ -49,6 +73,12 @@ pub struct AiMessage {
     /// Optional thoughts signature of the AI model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// Optional ordered list of reasoning content blocks from providers
+    /// that return multiple signed blocks per response (e.g. Anthropic
+    /// extended thinking via Bedrock Converse). Must be echoed back on
+    /// the next request to satisfy the provider's signature contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Vec<ReasoningBlock>>,
     /// Optional tool calls requested by the AI (usually only for Assistant role).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -168,6 +198,10 @@ pub struct AiResponse {
     /// Optional thought signature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// Optional ordered list of reasoning content blocks. See
+    /// [`ReasoningBlock`] for why these must round-trip per-block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Vec<ReasoningBlock>>,
     /// Tool calls requested by the AI, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -599,19 +633,24 @@ pub mod truncator;
 pub mod vertex;
 pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
 
-/// Recursively removes `thought_signature` and `thoughtSignature` fields from a JSON value.
-pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
+/// Recursively removes AI-provider signatures and opaque reasoning blocks
+/// from a JSON value before the history is persisted or logged. Strips
+/// `thought_signature` / `thoughtSignature` (scalar signatures) and the
+/// full `reasoning` array (per-block reasoning text + signatures, which
+/// are both bulky and contain signature material).
+pub fn scrub_ai_signatures(val: &mut serde_json::Value) {
     match val {
         serde_json::Value::Object(map) => {
             map.remove("thought_signature");
             map.remove("thoughtSignature");
+            map.remove("reasoning");
             for (_, v) in map.iter_mut() {
-                scrub_thought_signatures(v);
+                scrub_ai_signatures(v);
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr.iter_mut() {
-                scrub_thought_signatures(v);
+                scrub_ai_signatures(v);
             }
         }
         _ => {}
@@ -806,6 +845,7 @@ mod tests {
                 content: Some("Hello".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],

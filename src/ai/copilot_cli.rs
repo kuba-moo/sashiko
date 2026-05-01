@@ -202,6 +202,7 @@ pub fn parse_jsonl_events(raw: &str) -> Result<AiResponse> {
         content: None,
         thought: None,
         thought_signature: None,
+        reasoning: None,
         tool_calls: None,
         usage,
         truncated: false,

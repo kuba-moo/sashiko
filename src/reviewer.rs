@@ -1217,7 +1217,7 @@ impl Reviewer {
                     let history = json_output.get("history");
                     let logs_str = if let Some(h) = history {
                         let mut scrubbed = h.clone();
-                        crate::ai::scrub_thought_signatures(&mut scrubbed);
+                        crate::ai::scrub_ai_signatures(&mut scrubbed);
                         serde_json::to_string_pretty(&scrubbed).ok()
                     } else {
                         None
@@ -2482,6 +2482,7 @@ mod tests {
                 content: Some("<final_verdict>Mocked AI response</final_verdict>".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 usage: None,
                 truncated: false,
@@ -2536,6 +2537,7 @@ mod tests {
                 content: Some("Recovered after rate limit".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 usage: None,
                 truncated: false,
@@ -3064,6 +3066,7 @@ fi
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 usage: Some(crate::ai::AiUsage {
                     prompt_tokens: self.prompt_tokens,

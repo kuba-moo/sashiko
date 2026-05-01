@@ -14,7 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
+    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ReasoningBlock,
+    ToolCall,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -22,10 +23,11 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, InferenceConfiguration,
-    Message, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-    ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    Message, ReasoningContentBlock, ReasoningTextBlock, SystemContentBlock, Tool,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
+    ToolUseBlock,
 };
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number};
 use std::collections::HashMap;
 use tracing::info;
 
@@ -267,6 +269,29 @@ fn translate_request(
             AiRole::Assistant => {
                 flush_tool_results(&mut pending_tool_results, &mut messages)?;
                 let mut builder = Message::builder().role(ConversationRole::Assistant);
+                // Reasoning blocks MUST be emitted before any tool_use so
+                // that the per-block signatures continue to match what the
+                // model returned on the previous turn. See
+                // `ReasoningBlock` docs in ai/mod.rs.
+                if let Some(blocks) = &msg.reasoning {
+                    for b in blocks {
+                        let rc = match b {
+                            ReasoningBlock::Text { text, signature } => {
+                                let mut tb = ReasoningTextBlock::builder().text(text);
+                                if let Some(sig) = signature {
+                                    tb = tb.signature(sig);
+                                }
+                                ReasoningContentBlock::ReasoningText(
+                                    tb.build().context("Failed to build reasoning text block")?,
+                                )
+                            }
+                            ReasoningBlock::Redacted { data } => {
+                                ReasoningContentBlock::RedactedContent(Blob::new(data.clone()))
+                            }
+                        };
+                        builder = builder.content(ContentBlock::ReasoningContent(rc));
+                    }
+                }
                 if let Some(text) = &msg.content {
                     builder = builder.content(ContentBlock::Text(text.clone()));
                 }
@@ -384,6 +409,7 @@ fn translate_response(
 ) -> Result<AiResponse> {
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut reasoning: Vec<ReasoningBlock> = Vec::new();
 
     if let Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(ref msg)) = output.output {
         for block in msg.content() {
@@ -398,6 +424,27 @@ fn translate_response(
                         thought_signature: None,
                     });
                 }
+                ContentBlock::ReasoningContent(rc) => match rc {
+                    ReasoningContentBlock::ReasoningText(rt) => {
+                        reasoning.push(ReasoningBlock::Text {
+                            text: rt.text.clone(),
+                            signature: rt.signature.clone(),
+                        });
+                    }
+                    ReasoningContentBlock::RedactedContent(blob) => {
+                        reasoning.push(ReasoningBlock::Redacted {
+                            data: blob.clone().into_inner(),
+                        });
+                    }
+                    // Dropping an unknown reasoning variant would break the
+                    // per-block signature contract on the next turn — the
+                    // model would see a modified assistant message and
+                    // either error or silently degrade.
+                    _ => tracing::warn!(
+                        "Bedrock returned an unknown ReasoningContentBlock variant; \
+                         the AWS SDK is likely out of date"
+                    ),
+                },
                 _ => {}
             }
         }
@@ -434,6 +481,11 @@ fn translate_response(
         },
         thought: None,
         thought_signature: None,
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -599,6 +651,7 @@ mod tests {
                 content: Some("System 2.".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -607,6 +660,7 @@ mod tests {
                 content: Some("Hello!".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -638,6 +692,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -661,6 +716,7 @@ mod tests {
             content: Some("Let me check.".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 function_name: "git_log".to_string(),
@@ -698,6 +754,7 @@ mod tests {
             content: Some("commit abc123".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
         }]);
@@ -722,6 +779,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -755,6 +813,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -791,6 +850,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -807,6 +867,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -826,6 +887,7 @@ mod tests {
             content: Some("Hello!".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -848,6 +910,7 @@ mod tests {
                 content: Some("first".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -856,6 +919,7 @@ mod tests {
                 content: Some("second".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -884,6 +948,7 @@ mod tests {
                 content: Some("result A".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: Some("call_a".to_string()),
             },
@@ -892,6 +957,7 @@ mod tests {
                 content: Some("result B".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: Some("call_b".to_string()),
             },
@@ -914,6 +980,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -932,6 +999,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -959,6 +1027,7 @@ mod tests {
             content: Some("hi".to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }]);
@@ -972,6 +1041,107 @@ mod tests {
         let tools = params.tool_config.unwrap().tools().to_vec();
         assert_eq!(tools.len(), 1);
         assert!(matches!(&tools[0], Tool::ToolSpec(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_preserves_reasoning() -> Result<()> {
+        use aws_sdk_bedrockruntime::operation::converse::ConverseOutput;
+        use aws_sdk_bedrockruntime::types::{
+            ConverseOutput as ConverseOutputPayload, StopReason, TokenUsage,
+        };
+
+        let reasoning_block = ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
+            ReasoningTextBlock::builder()
+                .text("chain of thought")
+                .signature("sig-a")
+                .build()?,
+        ));
+        let tool_use = ContentBlock::ToolUse(
+            ToolUseBlock::builder()
+                .tool_use_id("call_1")
+                .name("read_file")
+                .input(json_to_document(&json!({"path": "a"})))
+                .build()?,
+        );
+        let msg = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(reasoning_block)
+            .content(tool_use)
+            .build()?;
+        let usage = TokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(20)
+            .total_tokens(30)
+            .build()?;
+        let out = ConverseOutput::builder()
+            .output(ConverseOutputPayload::Message(msg))
+            .usage(usage)
+            .stop_reason(StopReason::ToolUse)
+            .build()?;
+
+        let resp = translate_response(&out)?;
+        let blocks = resp.reasoning.expect("reasoning should be populated");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ReasoningBlock::Text { text, signature } => {
+                assert_eq!(text, "chain of thought");
+                assert_eq!(signature.as_deref(), Some("sig-a"));
+            }
+            other => panic!("expected ReasoningBlock::Text, got {:?}", other),
+        }
+        assert_eq!(resp.tool_calls.unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_request_emits_reasoning_before_tool_use() -> Result<()> {
+        let req = make_request(vec![AiMessage {
+            role: AiRole::Assistant,
+            content: Some("ok".to_string()),
+            thought: None,
+            thought_signature: None,
+            reasoning: Some(vec![
+                ReasoningBlock::Text {
+                    text: "first thought".to_string(),
+                    signature: Some("sig-1".to_string()),
+                },
+                ReasoningBlock::Redacted {
+                    data: vec![0xde, 0xad, 0xbe, 0xef],
+                },
+            ]),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                function_name: "read_file".to_string(),
+                arguments: json!({"path": "a"}),
+                thought_signature: None,
+            }]),
+            tool_call_id: None,
+        }]);
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        let blocks = params.messages[0].content();
+        assert_eq!(
+            blocks.len(),
+            4,
+            "expected reasoning + reasoning + text + tool_use"
+        );
+
+        match &blocks[0] {
+            ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(rt)) => {
+                assert_eq!(rt.text, "first thought");
+                assert_eq!(rt.signature.as_deref(), Some("sig-1"));
+            }
+            other => panic!("block[0] expected ReasoningText, got {:?}", other),
+        }
+        match &blocks[1] {
+            ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(blob)) => {
+                assert_eq!(blob.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+            }
+            other => panic!("block[1] expected RedactedContent, got {:?}", other),
+        }
+        assert!(matches!(blocks[2], ContentBlock::Text(_)));
+        assert!(matches!(blocks[3], ContentBlock::ToolUse(_)));
         Ok(())
     }
 }

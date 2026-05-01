@@ -197,6 +197,7 @@ impl<'a> SessionRunner<'a> {
             content: Some(session.initial_user_prompt()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -206,6 +207,7 @@ impl<'a> SessionRunner<'a> {
             content: Some(session.log_user_prompt()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         }];
@@ -276,6 +278,7 @@ impl<'a> SessionRunner<'a> {
                                     content: Some(feedback.clone()),
                                     thought: None,
                                     thought_signature: None,
+                                    reasoning: None,
                                     tool_calls: None,
                                     tool_call_id: None,
                                 };
@@ -305,6 +308,7 @@ impl<'a> SessionRunner<'a> {
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
                 thought_signature: resp.thought_signature.clone(),
+                reasoning: resp.reasoning.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
@@ -320,6 +324,7 @@ impl<'a> SessionRunner<'a> {
                         content: Some(result.to_string()),
                         thought: None,
                         thought_signature: None,
+                        reasoning: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id),
                     };
@@ -360,6 +365,7 @@ impl<'a> SessionRunner<'a> {
                         content: Some(feedback),
                         thought: None,
                         thought_signature: None,
+                        reasoning: None,
                         tool_calls: None,
                         tool_call_id: None,
                     };

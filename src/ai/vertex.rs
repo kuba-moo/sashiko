@@ -392,6 +392,7 @@ mod tests {
                 content: Some("Hello".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],

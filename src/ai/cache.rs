@@ -103,7 +103,7 @@ impl CachingAiProvider {
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("context_tag");
         }
-        super::scrub_thought_signatures(&mut val);
+        super::scrub_ai_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
         let hash = Sha256::digest(canonical.as_bytes());
         hash.iter().map(|b| format!("{:02x}", b)).collect()

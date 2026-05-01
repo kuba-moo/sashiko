@@ -1629,6 +1629,19 @@
                                 findingsHtml += `<div style="color:var(--text-dim); font-size:0.85em; margin-top:2px;" title="${p.findings_multi_stage} of ${totalFindings} findings flagged by multiple review stages">${uniquePct}% unique</div>`;
                             }
                         }
+                        const bf = p.budget_flags_or || 0;
+                        if (bf) {
+                            const severe = bf & 0xAA;
+                            const parts = [];
+                            if (bf & 0x03) parts.push(`stage input${(bf & 0x02) ? ' (severe)' : ''}`);
+                            if (bf & 0x0C) parts.push(`stage output${(bf & 0x08) ? ' (severe)' : ''}`);
+                            if (bf & 0x30) parts.push(`review input${(bf & 0x20) ? ' (severe)' : ''}`);
+                            if (bf & 0xC0) parts.push(`review output${(bf & 0x80) ? ' (severe)' : ''}`);
+                            const color = severe ? 'var(--error-text)' : 'var(--warn-text)';
+                            const weight = severe ? 'bold' : 'normal';
+                            const label = severe ? 'budget: severe' : 'budget: warn';
+                            findingsHtml += `<div style="color:${color}; font-weight:${weight}; font-size:0.85em; margin-top:2px;" title="Token budget hit on ${parts.join(', ')}">⚠ ${label}</div>`;
+                        }
                     }
 
                     row.innerHTML = `

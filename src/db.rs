@@ -59,6 +59,7 @@ pub struct PatchsetRow {
     pub concerns_total: Option<i64>,
     pub concerns_unique: Option<i64>,
     pub findings_multi_stage: Option<i64>,
+    pub budget_flags_or: Option<i64>,
     #[serde(skip)]
     pub embargo_until: Option<i64>,
 }
@@ -2269,7 +2270,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, d.concerns_total, d.concerns_unique, d.findings_multi_stage
+             p.embargo_until, d.concerns_total, d.concerns_unique, d.findings_multi_stage, b.budget_flags_or
              FROM patchsets p
              LEFT JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
              LEFT JOIN subsystems s ON ps.subsystem_id = s.id
@@ -2293,6 +2294,20 @@ impl Database {
                 WHERE r.status = 'Reviewed' AND r.concerns_total IS NOT NULL
                 GROUP BY r.patchset_id
              ) d ON p.id = d.patchset_id
+             LEFT JOIN (
+                SELECT r.patchset_id,
+                    MAX(r.budget_flags & 1)
+                        | MAX(r.budget_flags & 2)
+                        | MAX(r.budget_flags & 4)
+                        | MAX(r.budget_flags & 8)
+                        | MAX(r.budget_flags & 16)
+                        | MAX(r.budget_flags & 32)
+                        | MAX(r.budget_flags & 64)
+                        | MAX(r.budget_flags & 128) as budget_flags_or
+                FROM reviews r
+                WHERE r.status = 'Reviewed' AND r.budget_flags IS NOT NULL AND r.budget_flags > 0
+                GROUP BY r.patchset_id
+             ) b ON p.id = b.patchset_id
              {}
              GROUP BY p.id
              ORDER BY p.date DESC LIMIT ? OFFSET ?",
@@ -2373,6 +2388,7 @@ impl Database {
                         concerns_total: row.get(20).ok(),
                         concerns_unique: row.get(21).ok(),
                         findings_multi_stage: row.get(22).ok(),
+                        budget_flags_or: row.get::<Option<i64>>(23).ok().flatten(),
                         embargo_until: row.get(19).ok(),
                     });
                 }
@@ -3163,6 +3179,7 @@ impl Database {
                 concerns_total: None,
                 concerns_unique: None,
                 findings_multi_stage: None,
+                budget_flags_or: None,
                 embargo_until: row.get(14).ok(),
             });
         }
@@ -3218,6 +3235,7 @@ impl Database {
                         concerns_total: None,
                         concerns_unique: None,
                         findings_multi_stage: None,
+                        budget_flags_or: None,
                         embargo_until: row.get(14).ok(),
                     });
                 }

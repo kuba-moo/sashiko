@@ -1117,7 +1117,7 @@ impl Reviewer {
                     let history = json_output.get("history");
                     let logs_str = if let Some(h) = history {
                         let mut scrubbed = h.clone();
-                        crate::ai::scrub_thought_signatures(&mut scrubbed);
+                        crate::ai::scrub_ai_signatures(&mut scrubbed);
                         serde_json::to_string_pretty(&scrubbed).ok()
                     } else {
                         None
@@ -2121,6 +2121,7 @@ mod tests {
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 usage: None,
             })
@@ -2452,6 +2453,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
                 content: Some("Mocked AI response".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 usage: Some(crate::ai::AiUsage {
                     prompt_tokens: self.prompt_tokens,

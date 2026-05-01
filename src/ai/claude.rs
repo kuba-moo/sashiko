@@ -509,6 +509,7 @@ fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         } else {
             Some(thought_signature)
         },
+        reasoning: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {

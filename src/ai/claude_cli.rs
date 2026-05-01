@@ -282,6 +282,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             content: None,
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: Some(merged_tool_calls),
             usage,
         });
@@ -294,6 +295,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
             content: Some(text.to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             usage,
         });
@@ -305,6 +307,7 @@ pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResp
         content: Some(text.to_string()),
         thought: None,
         thought_signature: None,
+        reasoning: None,
         tool_calls: None,
         usage,
     })
@@ -332,6 +335,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
                 content: None,
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: Some(tool_calls),
                 usage,
             });
@@ -344,6 +348,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
             content: Some(content.to_string()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             usage,
         });
@@ -354,6 +359,7 @@ fn parse_single_json(v: &Value, json_str: &str, usage: Option<AiUsage>) -> Resul
         content: Some(json_str.to_string()),
         thought: None,
         thought_signature: None,
+        reasoning: None,
         tool_calls: None,
         usage,
     })

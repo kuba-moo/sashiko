@@ -686,6 +686,7 @@ impl Worker {
                             content: Some(phase0_prompt),
                             thought: None,
                             thought_signature: None,
+                            reasoning: None,
                             tool_calls: None,
                             tool_call_id: None,
                         }],
@@ -833,6 +834,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                     content: Some(format!("{}\n\n{}", shared_context, planning_prompt)),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 }],
@@ -1365,6 +1367,7 @@ Example:
             content: Some(user_prompt.clone()),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         };
@@ -1379,6 +1382,7 @@ Example:
                 content: Some(clean_system_prompt.clone()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1388,6 +1392,7 @@ Example:
             content: Some(clean_user_prompt),
             thought: None,
             thought_signature: None,
+            reasoning: None,
             tool_calls: None,
             tool_call_id: None,
         });
@@ -1444,6 +1449,7 @@ Example:
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
                 thought_signature: resp.thought_signature.clone(),
+                reasoning: resp.reasoning.clone(),
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
@@ -1476,6 +1482,7 @@ Example:
                         content: Some(result),
                         thought: None,
                         thought_signature: None,
+                        reasoning: None,
                         tool_calls: None,
                         tool_call_id: Some(call.id.clone()),
                     });
@@ -1501,6 +1508,7 @@ Example:
                             ),
                             thought: None,
                             thought_signature: None,
+                            reasoning: None,
                             tool_calls: None,
                             tool_call_id: None,
                         };
@@ -1517,6 +1525,7 @@ Example:
                             content: Some(format!("[SYSTEM — TOKEN BUDGET]\n{}", warning)),
                             thought: None,
                             thought_signature: None,
+                            reasoning: None,
                             tool_calls: None,
                             tool_call_id: None,
                         };
@@ -1588,6 +1597,7 @@ Example:
                     content: Some(content.to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });
@@ -1599,6 +1609,7 @@ Example:
                     )),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 });

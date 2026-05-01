@@ -721,6 +721,7 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
             Some(thought)
         },
         thought_signature: None,
+        reasoning: None,
         tool_calls: if tool_calls.is_empty() {
             None
         } else {
@@ -789,6 +790,7 @@ mod tests {
                     content: Some("You are a helpful assistant.".to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -797,6 +799,7 @@ mod tests {
                     content: Some("Hello!".to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -840,6 +843,7 @@ mod tests {
                 content: Some("I will use a tool.".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_123".to_string(),
                     function_name: "test_tool".to_string(),
@@ -930,6 +934,7 @@ mod tests {
                 content: Some(json!({"result": "success"}).to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: Some("call_123".to_string()),
             }],
@@ -968,6 +973,7 @@ mod tests {
                 content: Some("Score this.".to_string()),
                 thought: None,
                 thought_signature: None,
+                reasoning: None,
                 tool_calls: None,
                 tool_call_id: None,
             }],
@@ -1001,6 +1007,7 @@ mod tests {
                     content: Some("Use tool".to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -1009,6 +1016,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "t1".to_string(),
@@ -1022,6 +1030,7 @@ mod tests {
                     content: Some("{\"ok\":true}".to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
                 },
@@ -1072,6 +1081,7 @@ mod tests {
                     content: Some("Short message".to_string()),
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -1080,6 +1090,7 @@ mod tests {
                     content: None,
                     thought: None,
                     thought_signature: None,
+                    reasoning: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "c1".to_string(),
                         function_name: "my_function".to_string(),

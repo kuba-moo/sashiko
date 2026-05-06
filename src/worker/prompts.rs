@@ -97,6 +97,85 @@ fn validate_inline_format(content: &str) -> std::result::Result<(), String> {
     }
     Ok(())
 }
+
+/// Canonicalize an AI-produced severity string to the TitleCase form
+/// (`Low` / `Medium` / `High` / `Critical`) the prompt asks for. Returns
+/// `None` if the token is not one of those four.
+fn canonical_severity(raw: &str) -> Option<&'static str> {
+    match raw.trim() {
+        "Low" => Some("Low"),
+        "Medium" => Some("Medium"),
+        "High" => Some("High"),
+        "Critical" => Some("Critical"),
+        _ => None,
+    }
+}
+
+/// Parse the inline review text and extract severities from any line whose
+/// trimmed content is a bracketed tag of the form `[Sev]` or
+/// `[Sev, Sev, ...]`. Both singletons and multi-tags contribute to the
+/// returned flat list of severity tokens. Lines where the tag is not the
+/// only non-whitespace content (e.g. `foo [High]`) are ignored.
+pub(crate) fn extract_inline_severity_tags(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() < 3 || !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+            continue;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+            continue;
+        }
+        let canonical: Option<Vec<&'static str>> =
+            parts.iter().map(|p| canonical_severity(p)).collect();
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        for c in canonical {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// Compare the severity tags observed in the inline review against the
+/// severities expected from the findings JSON. The rule is:
+///   * no unexpected severity may appear (every observed token must match a
+///     severity present in the findings list);
+///   * each expected severity must appear at least as many times as it
+///     occurs in the findings list.
+/// Returns `true` when both conditions hold.
+pub(crate) fn validate_severity_annotations(inline: &str, findings: &Value) -> bool {
+    use std::collections::HashMap;
+    let mut expected: HashMap<String, usize> = HashMap::new();
+    let Some(arr) = findings.as_array() else {
+        return false;
+    };
+    for f in arr {
+        let raw = f.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(canon) = canonical_severity(raw) else {
+            // A finding with an unrecognised severity means we cannot
+            // faithfully validate tags — treat as invalid.
+            return false;
+        };
+        *expected.entry(canon.to_string()).or_insert(0) += 1;
+    }
+    let mut observed: HashMap<String, usize> = HashMap::new();
+    for tag in extract_inline_severity_tags(inline) {
+        *observed.entry(tag).or_insert(0) += 1;
+    }
+    if observed.keys().any(|sev| !expected.contains_key(sev)) {
+        return false;
+    }
+    for (sev, need) in &expected {
+        if observed.get(sev).copied().unwrap_or(0) < *need {
+            return false;
+        }
+    }
+    true
+}
 pub struct WorkerConfig {
     pub max_input_tokens: usize,
     pub max_interactions: usize,
@@ -111,6 +190,9 @@ pub struct WorkerConfig {
     /// reasoning-effort setting so the remaining stages can make more of
     /// each turn once the tool-use budget is constrained.
     pub retry_provider: Option<Arc<dyn AiProvider>>,
+    /// When true, stage 9's prompt asks for `[Severity]` tags on their own
+    /// line and the output is post-validated against the findings multiset.
+    pub annotate_severity_inline: bool,
 }
 
 /// Tracks token usage and emits warning messages when thresholds are crossed.
@@ -599,6 +681,7 @@ pub struct Worker {
     dump_conversation: Option<PathBuf>,
     budget: TokenBudget,
     retry_provider: Option<Arc<dyn AiProvider>>,
+    annotate_severity_inline: bool,
 }
 
 impl Worker {
@@ -621,6 +704,7 @@ impl Worker {
             dump_conversation: config.dump_conversation,
             budget: config.budget,
             retry_provider: config.retry_provider,
+            annotate_severity_inline: config.annotate_severity_inline,
         }
     }
 
@@ -1226,13 +1310,27 @@ Example:
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
             let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
+            let severity_directive = if self.annotate_severity_inline {
+                "\n\nAdditionally, prefix each inline comment paragraph with a severity tag on \
+                 its own line: the bracketed TitleCase severity from the matching finding, for \
+                 example [High] or [Low]. The severity values must be exactly one of Low, \
+                 Medium, High, Critical. If a single paragraph discusses text derived from \
+                 multiple findings, list every severity in a single bracketed tag, \
+                 comma-separated and in the same order the findings are addressed, for example \
+                 [High, Medium] or [Medium, Medium, Low]. A tag line must contain only the \
+                 bracketed expression — no other characters besides optional surrounding \
+                 whitespace — and the total number of tagged severities across the report must \
+                 match the findings list exactly (no extra severities, no missing ones)."
+            } else {
+                ""
+            };
             let user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
-                stage_prompt, findings_str
+                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.{}",
+                stage_prompt, findings_str, severity_directive
             );
             let clean_user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
-                clean_stage_prompt, findings_str
+                "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.{}",
+                clean_stage_prompt, findings_str, severity_directive
             );
             let max_retries = 3;
             let mut retries = 0;
@@ -1317,6 +1415,20 @@ Example:
             }
         }
 
+        let inline_annotation_valid = if self.annotate_severity_inline {
+            Some(validate_severity_annotations(
+                &review_inline_text,
+                &findings_json,
+            ))
+        } else {
+            None
+        };
+        if let Some(false) = inline_annotation_valid {
+            warn!(
+                "Stage 9 severity annotations did not match findings multiset; UI will flag the inline review."
+            );
+        }
+
         let fixes_text = String::new();
         /*         // Stage 10
         info!("Running Stage 10");
@@ -1346,13 +1458,16 @@ Example:
             }
         } */
 
-        let final_output = json!({
+        let mut final_output = json!({
             "findings": findings_json,
             "review_inline": review_inline_text,
             "fixes": fixes_text,
             "concerns_count": all_concerns.len(),
             "dedup_stats": dedup_stats
         });
+        if let Some(valid) = inline_annotation_valid {
+            final_output["inline_annotation_valid"] = json!(valid);
+        }
 
         Ok(WorkerResult {
             output: Some(final_output),
@@ -1796,6 +1911,92 @@ fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn findings(pairs: &[(&str, usize)]) -> Value {
+        let mut arr = Vec::new();
+        for (sev, count) in pairs {
+            for _ in 0..*count {
+                arr.push(json!({ "severity": sev, "problem": "p" }));
+            }
+        }
+        Value::Array(arr)
+    }
+
+    #[test]
+    fn severity_validator_accepts_matching_singletons() {
+        let body =
+            "commit abc\nAuthor: X\n> diff\n[High]\nhello\n\n[Low]\nworld\n\n[Low]\nagain\n";
+        let f = findings(&[("High", 1), ("Low", 2)]);
+        assert!(validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_accepts_extra_count_for_same_severity() {
+        // Observed count may exceed expected when one finding is split
+        // across multiple paragraphs — the rule is "at least N", not exactly.
+        let body = "[High]\nfoo\n\n[High]\nbar\n";
+        let f = findings(&[("High", 1)]);
+        assert!(validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_rejects_unexpected_severity() {
+        let body = "[High]\nfoo\n\n[Critical]\nbar\n";
+        let f = findings(&[("High", 1)]);
+        assert!(!validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_rejects_missing_severity() {
+        let body = "[High]\nfoo\n";
+        let f = findings(&[("High", 1), ("Low", 1)]);
+        assert!(!validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_counts_multi_severity_tag() {
+        let body = "[High, Medium]\ncombined paragraph discussing both\n";
+        let f = findings(&[("High", 1), ("Medium", 1)]);
+        assert!(validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_rejects_tag_on_mixed_line() {
+        // A tag that shares its line with other content does not count.
+        let body = "some prose [High] more prose\n";
+        let f = findings(&[("High", 1)]);
+        assert!(!validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_tolerates_surrounding_whitespace() {
+        let body = "   [High]   \n\n\t[Low]\t\n";
+        let f = findings(&[("High", 1), ("Low", 1)]);
+        assert!(validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_is_titlecase_only() {
+        // Prompt specifies TitleCase; lower-case or upper-case tags should
+        // not be counted, so they fail the multiset check.
+        let body = "[high]\nfoo\n";
+        let f = findings(&[("High", 1)]);
+        assert!(!validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn severity_validator_rejects_malformed_bracket() {
+        let body = "[High\nfoo\n[Low]]\nbar\n";
+        let f = findings(&[("High", 1)]);
+        assert!(!validate_severity_annotations(body, &f));
+    }
+
+    #[test]
+    fn extract_tags_handles_multi_and_whitespace() {
+        let body = "[High]\n[Medium, Low ,Low]\n  not a tag [High]\n";
+        let tags = extract_inline_severity_tags(body);
+        assert_eq!(tags, vec!["High", "Medium", "Low", "Low"]);
+    }
+
     #[test]
     fn test_calculate_series_range_single_patch() {
         let p = PatchInput {
@@ -1948,6 +2149,7 @@ mod tests {
             dump_conversation: None,
             budget: TokenBudget::new(0, 0, 0.0, 0.0, 0.0),
             retry_provider: None,
+            annotate_severity_inline: false,
         };
         let mut worker = Worker::new(provider, tools, prompts, config);
 

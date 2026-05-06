@@ -477,6 +477,9 @@ async fn main() -> Result<()> {
                                     settings.ai.review_budget_multiplier,
                                 ),
                                 retry_provider,
+                                annotate_severity_inline: settings
+                                    .review
+                                    .annotate_severity_inline,
                             },
                         );
 

@@ -52,3 +52,7 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+# Ask the final stage to prefix inline comments with [Severity] tags
+# (e.g. [High] or [High, Medium] for paragraphs that cover multiple
+# findings). The UI uses these to color each paragraph's side-bar.
+# annotate_severity_inline = false

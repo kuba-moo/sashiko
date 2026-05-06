@@ -547,6 +547,11 @@
             font-weight: 500;
         }
 
+        .ai-comment.sev-critical { border-left-color: #B71C1C; }
+        .ai-comment.sev-high     { border-left-color: #FF5722; }
+        .ai-comment.sev-medium   { border-left-color: #FF9800; }
+        .ai-comment.sev-low      { border-left-color: #FBC02D; }
+
         /* Thread tree */
         .thread-tree {
             font-size: 0.95em;
@@ -1318,6 +1323,52 @@
                     return { line, type, cls };
                 });
 
+                // Pass 1.5: walk TEXT blocks and assign a severity class based on
+                // any [Severity] tag lines seen so far in the same block. Singleton
+                // tags ([High]) are flagged for stripping; multi-tags ([High, Medium])
+                // are kept in the rendered output and use the first listed severity.
+                const SEV_NAMES = ['Low', 'Medium', 'High', 'Critical'];
+                const tagSeverities = (lineText) => {
+                    const t = lineText.trim();
+                    if (t.length < 3 || t[0] !== '[' || t[t.length - 1] !== ']') return null;
+                    const inner = t.slice(1, -1);
+                    const parts = inner.split(',').map(s => s.trim());
+                    if (parts.length === 0 || parts.some(p => !SEV_NAMES.includes(p))) return null;
+                    return parts;
+                };
+                const sevClassFor = (name) => {
+                    const n = (name || '').toLowerCase();
+                    return (n === 'critical' || n === 'high' || n === 'medium' || n === 'low')
+                        ? 'sev-' + n
+                        : null;
+                };
+                if (renderAiComments) {
+                    let blockSev = null;
+                    let lastNonEmpty = null;
+                    for (let i = 0; i < classified.length; i++) {
+                        const item = classified[i];
+                        if (item.type === 'EMPTY') continue;
+                        if (item.type !== 'TEXT') {
+                            blockSev = null;
+                            lastNonEmpty = item.type;
+                            continue;
+                        }
+                        if (lastNonEmpty !== 'TEXT') blockSev = null;
+                        lastNonEmpty = 'TEXT';
+                        const tags = tagSeverities(item.line);
+                        if (tags && tags.length === 1) {
+                            blockSev = sevClassFor(tags[0]);
+                            item.strip = true;
+                            item.sev = blockSev;
+                        } else if (tags && tags.length > 1) {
+                            blockSev = sevClassFor(tags[0]);
+                            item.sev = blockSev;
+                        } else {
+                            item.sev = blockSev;
+                        }
+                    }
+                }
+
                 // Pass 2: Render with lookahead/buffering
                 let resultHtml = '';
                 let buffer = [];
@@ -1325,27 +1376,45 @@
 
                 for (let i = 0; i < classified.length; i++) {
                     const item = classified[i];
-                    
+
                     if (item.type === 'EMPTY') {
                         buffer.push(item);
-                    } else {
-                        // Flush buffer
+                    } else if (item.strip) {
+                        // Flush buffer first — if it bridges TEXT -> (stripped) TEXT, still
+                        // highlight as part of the block and adopt the tag's severity.
                         if (buffer.length > 0) {
-                            // If bridging TEXT -> TEXT, highlight buffer
-                            const highlightBuffer = (lastType === 'TEXT' && item.type === 'TEXT');
+                            const highlightBuffer = (lastType === 'TEXT');
+                            const sevCls = (highlightBuffer && item.sev) ? ' ' + item.sev : '';
                             buffer.forEach(b => {
                                 let c = b.cls;
-                                if (highlightBuffer && renderAiComments) c += ' ai-comment';
+                                if (highlightBuffer) c += ' ai-comment' + sevCls;
                                 resultHtml += `<div class="${c}">${b.line}</div>`;
                             });
                             buffer = [];
                         }
-                        
+                        // Skip the tag line itself; remain conceptually inside the TEXT block.
+                        lastType = 'TEXT';
+                    } else {
+                        // Flush buffer
+                        if (buffer.length > 0) {
+                            const highlightBuffer = (lastType === 'TEXT' && item.type === 'TEXT');
+                            const sevCls = (highlightBuffer && item.sev) ? ' ' + item.sev : '';
+                            buffer.forEach(b => {
+                                let c = b.cls;
+                                if (highlightBuffer && renderAiComments) c += ' ai-comment' + sevCls;
+                                resultHtml += `<div class="${c}">${b.line}</div>`;
+                            });
+                            buffer = [];
+                        }
+
                         // Output current
                         let c = item.cls;
-                        if (item.type === 'TEXT' && renderAiComments) c += ' ai-comment';
+                        if (item.type === 'TEXT' && renderAiComments) {
+                            c += ' ai-comment';
+                            if (item.sev) c += ' ' + item.sev;
+                        }
                         resultHtml += `<div class="${c}">${item.line}</div>`;
-                        
+
                         lastType = item.type;
                     }
                 }
@@ -2306,11 +2375,16 @@
                 const hasIssues = parsedFindings && !displayResult.includes('No regressions');
                 const isOpen = hasIssues ? 'open' : '';
                 const icon = hasIssues ? '▼' : '▶';
+                const annotationValid = outputJson && outputJson.inline_annotation_valid;
+                const annotationWarning = annotationValid === false
+                    ? `<div style="margin:4px 0 8px; padding:6px 10px; background:var(--warn-bg, #fff3cd); border:1px solid var(--warn-border, #ffe58f); color:var(--warn-text, #8a6d00); border-radius:4px; font-size:0.9em;">&#9888; Inline severity tags don't match the findings list &mdash; paragraph colors below may be unreliable.</div>`
+                    : '';
                 inlineHtml = `
                     <div style="margin-top:8px;">
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
-                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling.innerText)">Copy</button>
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.parentElement.querySelector('.log-inline-block').innerText)">Copy</button>
+                            ${annotationWarning}
                             <div class="log-inline-block">${escapeHtml(r.inline_review, true, true)}</div>
                         </div>
                     </div>

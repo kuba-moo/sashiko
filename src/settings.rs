@@ -280,6 +280,13 @@ pub struct ReviewSettings {
     pub review_tool_override: Option<std::path::PathBuf>,
     #[serde(default)]
     pub stages: Option<Vec<u8>>,
+    /// When enabled, instruct the final stage to prefix each inline comment
+    /// paragraph with a bracketed severity tag (e.g. `[High]` or
+    /// `[High, Medium]`) and validate the emitted tags against the findings
+    /// multiset. The resulting `inline_annotation_valid` flag is surfaced in
+    /// the review output JSON for the UI to consume.
+    #[serde(default)]
+    pub annotate_severity_inline: bool,
 }
 
 fn default_max_total_tokens() -> usize {

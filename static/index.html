@@ -3333,15 +3333,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 if (!state.statsData) {
-                    const [timeline, reviewsData, tools] = await Promise.all([
+                    const [timeline, reviewsData, tools, cost] = await Promise.all([
                         apiFetch('api/stats/timeline').then(r => r.json()),
                         apiFetch('api/stats/reviews').then(r => r.json()),
-                        apiFetch('api/stats/tools').then(r => r.json())
+                        apiFetch('api/stats/tools').then(r => r.json()),
+                        apiFetch('api/stats/cost').then(r => r.json())
                     ]);
-                    state.statsData = { timeline, reviewsData, tools };
+                    state.statsData = { timeline, reviewsData, tools, cost };
                 }
 
-                const { timeline, reviewsData, tools } = state.statsData;
+                const { timeline, reviewsData, tools, cost } = state.statsData;
                 const reviews = reviewsData.reviews;
                 const historicalTotal = reviewsData.total_reviews;
                 const historicalFailed = reviewsData.total_failures;
@@ -3419,7 +3420,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     html += renderStatCard('Est. total cost', '$' + totalEstCost.toFixed(2));
                 }
                 html += '</div>';
-                
+
+                // Cost dashboard — cost last 7/30d and three daily charts.
+                const daily = (cost && cost.daily) ? cost.daily : [];
+                const dayCost = (d) => {
+                    let total = 0;
+                    for (const m of (d.by_model || [])) {
+                        const c = estimateCost(m.model, m.tokens_in || 0, m.tokens_out || 0, m.tokens_cached || 0);
+                        if (c !== null) total += c;
+                    }
+                    return total;
+                };
+                const todayMs = Date.now();
+                const daysAgo = (day) => (todayMs - new Date(day + 'T00:00:00Z').getTime()) / 86400000;
+                const cost7 = daily.filter(d => daysAgo(d.day) < 7).reduce((a, d) => a + dayCost(d), 0);
+                const cost30 = daily.filter(d => daysAgo(d.day) < 30).reduce((a, d) => a + dayCost(d), 0);
+
+                html += '<h2>Cost</h2><div class="stat-card-grid">';
+                html += renderStatCard('Cost last 7 days', '$' + cost7.toFixed(2));
+                html += renderStatCard('Cost last 30 days', '$' + cost30.toFixed(2));
+                html += '</div>';
+                html += '<h3>Daily cost by model</h3><div class="chart-section"><div id="chart-cost-daily" style="width:100%; height:300px;"></div></div>';
+                html += '<h3>Per-patch cost &amp; time (with vs without findings)</h3><div class="chart-section"><div id="chart-cost-perpatch" style="width:100%; height:300px;"></div></div>';
+                html += '<h3>Throughput &amp; signal</h3><div class="chart-section"><div id="chart-throughput" style="width:100%; height:300px;"></div></div>';
+
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
 
                 const container = document.getElementById('stats-content');
@@ -3589,6 +3613,139 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     document.getElementById('chart-findings').innerHTML = '<p class="loading">No findings data available.</p>';
                 }
 
+                // --- 5. Cost charts ---
+                if (daily.length) {
+                    const costDates = daily.map(d => d.day);
+
+                    // 5a. Daily cost stacked by model.
+                    const modelSet = new Set();
+                    daily.forEach(d => (d.by_model || []).forEach(m => modelSet.add(m.model || '(unknown)')));
+                    const models = [...modelSet].sort();
+                    const modelSeries = models.map(model => ({
+                        name: model,
+                        type: 'bar',
+                        stack: 'cost',
+                        emphasis: { focus: 'series' },
+                        data: daily.map(d => {
+                            const m = (d.by_model || []).find(x => (x.model || '(unknown)') === model);
+                            if (!m) return 0;
+                            const c = estimateCost(m.model, m.tokens_in || 0, m.tokens_out || 0, m.tokens_cached || 0);
+                            return c !== null ? Number(c.toFixed(4)) : 0;
+                        })
+                    }));
+                    const costChart = echarts.init(document.getElementById('chart-cost-daily'), isDark ? 'dark' : null);
+                    costChart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: {
+                            trigger: 'axis',
+                            axisPointer: { type: 'shadow' },
+                            valueFormatter: v => '$' + Number(v || 0).toFixed(2)
+                        },
+                        legend: { data: models, bottom: 0 },
+                        grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
+                        xAxis: { type: 'category', data: costDates, axisLine: { lineStyle: { color: themeAxis } } },
+                        yAxis: { type: 'value', axisLabel: { formatter: '${value}' }, splitLine: { lineStyle: { type: 'dashed' } } },
+                        series: modelSeries
+                    });
+                    window.addEventListener('resize', () => costChart.resize());
+
+                    // 5b. Per-patch avg cost and duration, split by with/without findings.
+                    const avg = (sumTokens, count, model) => {
+                        if (!count) return null;
+                        // Fall back to first daily model entry if we don't have per-bucket
+                        // model attribution — this is an approximation; costs are dominated
+                        // by tokens, not model choice, so this is fine for a trend view.
+                        const c = estimateCost(model, sumTokens.tokens_in || 0, sumTokens.tokens_out || 0, sumTokens.tokens_cached || 0);
+                        return c !== null ? c / count : null;
+                    };
+                    const dayDominantModel = (d) => {
+                        const arr = d.by_model || [];
+                        if (!arr.length) return '';
+                        let best = arr[0];
+                        for (const m of arr) {
+                            if ((m.reviews || 0) > (best.reviews || 0)) best = m;
+                        }
+                        return best.model || '';
+                    };
+                    const wfCost = daily.map(d => {
+                        const v = avg(d.with_findings || {}, (d.with_findings || {}).count || 0, dayDominantModel(d));
+                        return v === null ? null : Number(v.toFixed(4));
+                    });
+                    const nfCost = daily.map(d => {
+                        const v = avg(d.without_findings || {}, (d.without_findings || {}).count || 0, dayDominantModel(d));
+                        return v === null ? null : Number(v.toFixed(4));
+                    });
+                    const wfDur = daily.map(d => {
+                        const w = d.with_findings || {};
+                        if (!(w.duration_count > 0)) return null;
+                        return Math.round(w.duration_sum_sec / w.duration_count);
+                    });
+                    const nfDur = daily.map(d => {
+                        const w = d.without_findings || {};
+                        if (!(w.duration_count > 0)) return null;
+                        return Math.round(w.duration_sum_sec / w.duration_count);
+                    });
+                    const perChart = echarts.init(document.getElementById('chart-cost-perpatch'), isDark ? 'dark' : null);
+                    perChart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: {
+                            trigger: 'axis',
+                            valueFormatter: (v, idx) => {
+                                if (v === null || v === undefined) return '-';
+                                return idx < 2 ? '$' + Number(v).toFixed(3) : Number(v) + 's';
+                            }
+                        },
+                        legend: {
+                            data: ['Cost/patch (with findings)', 'Cost/patch (no findings)',
+                                   'Time/patch (with findings)', 'Time/patch (no findings)'],
+                            bottom: 0
+                        },
+                        grid: { left: '3%', right: '4%', bottom: '18%', top: '10%', containLabel: true },
+                        xAxis: { type: 'category', data: costDates, axisLine: { lineStyle: { color: themeAxis } } },
+                        yAxis: [
+                            { type: 'value', name: '$ / patch', position: 'left', axisLabel: { formatter: '${value}' }, splitLine: { lineStyle: { type: 'dashed' } } },
+                            { type: 'value', name: 'sec / patch', position: 'right', axisLabel: { formatter: '{value}s' }, splitLine: { show: false } }
+                        ],
+                        series: [
+                            { name: 'Cost/patch (with findings)', type: 'line', smooth: true, showSymbol: false, yAxisIndex: 0, connectNulls: true, itemStyle: { color: '#ee6666' }, data: wfCost },
+                            { name: 'Cost/patch (no findings)',   type: 'line', smooth: true, showSymbol: false, yAxisIndex: 0, connectNulls: true, itemStyle: { color: '#91cc75' }, data: nfCost },
+                            { name: 'Time/patch (with findings)', type: 'line', smooth: true, showSymbol: false, yAxisIndex: 1, connectNulls: true, lineStyle: { type: 'dashed' }, itemStyle: { color: '#fac858' }, data: wfDur },
+                            { name: 'Time/patch (no findings)',   type: 'line', smooth: true, showSymbol: false, yAxisIndex: 1, connectNulls: true, lineStyle: { type: 'dashed' }, itemStyle: { color: '#5470c6' }, data: nfDur }
+                        ]
+                    });
+                    window.addEventListener('resize', () => perChart.resize());
+
+                    // 5c. Throughput & signal — patches, reviews, errors, budget warn/severe.
+                    const tChart = echarts.init(document.getElementById('chart-throughput'), isDark ? 'dark' : null);
+                    tChart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: { trigger: 'axis' },
+                        legend: {
+                            data: ['Patches reviewed', 'Reviews total', 'Errors', 'Budget warn', 'Budget severe'],
+                            bottom: 0
+                        },
+                        grid: { left: '3%', right: '4%', bottom: '18%', top: '10%', containLabel: true },
+                        xAxis: { type: 'category', data: costDates, axisLine: { lineStyle: { color: themeAxis } } },
+                        yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
+                        series: [
+                            { name: 'Patches reviewed', type: 'line', smooth: true, showSymbol: false, itemStyle: { color: '#5ab1ef' },
+                              data: daily.map(d => d.patches_reviewed || 0) },
+                            { name: 'Reviews total',    type: 'line', smooth: true, showSymbol: false, itemStyle: { color: '#5470c6' },
+                              data: daily.map(d => d.reviews_total || 0) },
+                            { name: 'Errors',           type: 'line', smooth: true, showSymbol: false, itemStyle: { color: '#ee6666' },
+                              data: daily.map(d => d.errors || 0) },
+                            { name: 'Budget warn',      type: 'line', smooth: true, showSymbol: false, itemStyle: { color: '#fac858' },
+                              data: daily.map(d => d.budget_warn || 0) },
+                            { name: 'Budget severe',    type: 'line', smooth: true, showSymbol: false, itemStyle: { color: '#B71C1C' },
+                              data: daily.map(d => d.budget_severe || 0) }
+                        ]
+                    });
+                    window.addEventListener('resize', () => tChart.resize());
+                } else {
+                    document.getElementById('chart-cost-daily').innerHTML = '<p class="loading">No cost data available.</p>';
+                    document.getElementById('chart-cost-perpatch').innerHTML = '<p class="loading">No cost data available.</p>';
+                    document.getElementById('chart-throughput').innerHTML = '<p class="loading">No cost data available.</p>';
+                }
 
             } catch (e) {
                 console.error(e);

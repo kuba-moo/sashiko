@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     summary TEXT,
     result_description TEXT,
     created_at INTEGER,
+    completed_at INTEGER,
     interaction_id TEXT,
     status TEXT DEFAULT 'Pending', -- Pending, In Review, Cancelled, Reviewed, Failed
     logs TEXT,

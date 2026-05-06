@@ -582,6 +582,9 @@ impl Database {
             )
             .await;
         let _ = self
+            .try_add_column("reviews", "completed_at", "INTEGER")
+            .await;
+        let _ = self
             .try_create_index(
                 "idx_patchsets_status_embargo_until",
                 "patchsets",
@@ -887,10 +890,13 @@ impl Database {
         logs: Option<&str>,
         budget_flags: Option<u8>,
     ) -> Result<()> {
+        let completed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, review_id],
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ?, completed_at = ? WHERE id = ?",
+                libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, completed_at, review_id],
             )
             .await?;
         Ok(())
@@ -1180,6 +1186,191 @@ impl Database {
             "reviews": reviews_data,
             "findings": findings_data
         }))
+    }
+
+    /// Per-day aggregates used by the cost dashboard: tokens (by model), review
+    /// throughput, errors, and budget-pressure counts, plus a with/without
+    /// findings split that carries tokens and duration so the UI can compute
+    /// average cost and wall-clock per patch.
+    ///
+    /// Budget bit layout (keep in sync with worker::prompts constants):
+    ///   warn bits   = 0x01 | 0x04 | 0x10 | 0x40 = 0x55
+    ///   severe bits = 0x02 | 0x08 | 0x20 | 0x80 = 0xAA
+    /// A review that triggered any severe bit is counted as `budget_severe`
+    /// and deliberately not also counted as `budget_warn` — severe subsumes
+    /// warn.
+    pub async fn get_cost_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
+        use std::collections::BTreeMap;
+
+        let subsystem_join = if subsystem_id.is_some() {
+            "JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id"
+        } else {
+            ""
+        };
+        let subsystem_filter = if subsystem_id.is_some() {
+            "WHERE ps.subsystem_id = ?"
+        } else {
+            ""
+        };
+
+        // Query A: per-day aggregates across the whole reviews table.
+        let sql_a = format!(
+            "SELECT
+                strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
+                SUM(CASE WHEN r.status = 'Reviewed' THEN 1 ELSE 0 END) AS reviews_total,
+                COUNT(DISTINCT CASE WHEN r.status = 'Reviewed' THEN r.patch_id END) AS patches_reviewed,
+                SUM(CASE WHEN r.status IN ('Failed','Failed To Apply') THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN (COALESCE(r.budget_flags,0) & 0x55) != 0
+                              AND (COALESCE(r.budget_flags,0) & 0xAA) = 0
+                         THEN 1 ELSE 0 END) AS budget_warn,
+                SUM(CASE WHEN (COALESCE(r.budget_flags,0) & 0xAA) != 0 THEN 1 ELSE 0 END) AS budget_severe,
+
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN 1 ELSE 0 END) AS wf_count,
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_in,0) ELSE 0 END) AS wf_tokens_in,
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_out,0) ELSE 0 END) AS wf_tokens_out,
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_cached,0) ELSE 0 END) AS wf_tokens_cached,
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) AND r.completed_at IS NOT NULL THEN (r.completed_at - r.created_at) ELSE 0 END) AS wf_duration_sum_sec,
+                SUM(CASE WHEN r.status = 'Reviewed' AND EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) AND r.completed_at IS NOT NULL THEN 1 ELSE 0 END) AS wf_duration_count,
+
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN 1 ELSE 0 END) AS nf_count,
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_in,0) ELSE 0 END) AS nf_tokens_in,
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_out,0) ELSE 0 END) AS nf_tokens_out,
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) THEN COALESCE(ai.tokens_cached,0) ELSE 0 END) AS nf_tokens_cached,
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) AND r.completed_at IS NOT NULL THEN (r.completed_at - r.created_at) ELSE 0 END) AS nf_duration_sum_sec,
+                SUM(CASE WHEN r.status = 'Reviewed' AND NOT EXISTS(SELECT 1 FROM findings f WHERE f.review_id = r.id) AND r.completed_at IS NOT NULL THEN 1 ELSE 0 END) AS nf_duration_count
+            FROM reviews r
+            LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+            {}
+            {}
+            GROUP BY day
+            ORDER BY day",
+            subsystem_join, subsystem_filter
+        );
+
+        let mut daily: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+        let mut rows_a = match subsystem_id {
+            Some(sid) => self.conn.query(&sql_a, libsql::params![sid]).await?,
+            None => self.conn.query(&sql_a, ()).await?,
+        };
+        while let Ok(Some(row)) = rows_a.next().await {
+            let Ok(day) = row.get::<String>(0) else {
+                continue;
+            };
+            let reviews_total: i64 = row.get(1).unwrap_or(0);
+            let patches_reviewed: i64 = row.get(2).unwrap_or(0);
+            let errors: i64 = row.get(3).unwrap_or(0);
+            let budget_warn: i64 = row.get(4).unwrap_or(0);
+            let budget_severe: i64 = row.get(5).unwrap_or(0);
+            let wf_count: i64 = row.get(6).unwrap_or(0);
+            let wf_tokens_in: i64 = row.get(7).unwrap_or(0);
+            let wf_tokens_out: i64 = row.get(8).unwrap_or(0);
+            let wf_tokens_cached: i64 = row.get(9).unwrap_or(0);
+            let wf_duration_sum_sec: i64 = row.get(10).unwrap_or(0);
+            let wf_duration_count: i64 = row.get(11).unwrap_or(0);
+            let nf_count: i64 = row.get(12).unwrap_or(0);
+            let nf_tokens_in: i64 = row.get(13).unwrap_or(0);
+            let nf_tokens_out: i64 = row.get(14).unwrap_or(0);
+            let nf_tokens_cached: i64 = row.get(15).unwrap_or(0);
+            let nf_duration_sum_sec: i64 = row.get(16).unwrap_or(0);
+            let nf_duration_count: i64 = row.get(17).unwrap_or(0);
+
+            daily.insert(
+                day.clone(),
+                json!({
+                    "day": day,
+                    "by_model": Vec::<serde_json::Value>::new(),
+                    "reviews_total": reviews_total,
+                    "patches_reviewed": patches_reviewed,
+                    "errors": errors,
+                    "budget_warn": budget_warn,
+                    "budget_severe": budget_severe,
+                    "with_findings": {
+                        "count": wf_count,
+                        "tokens_in": wf_tokens_in,
+                        "tokens_out": wf_tokens_out,
+                        "tokens_cached": wf_tokens_cached,
+                        "duration_sum_sec": wf_duration_sum_sec,
+                        "duration_count": wf_duration_count,
+                    },
+                    "without_findings": {
+                        "count": nf_count,
+                        "tokens_in": nf_tokens_in,
+                        "tokens_out": nf_tokens_out,
+                        "tokens_cached": nf_tokens_cached,
+                        "duration_sum_sec": nf_duration_sum_sec,
+                        "duration_count": nf_duration_count,
+                    },
+                }),
+            );
+        }
+
+        // Query B: per-day-per-model token sums (for stacked cost-by-model).
+        let sql_b = format!(
+            "SELECT
+                strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
+                COALESCE(r.provider, ''),
+                COALESCE(r.model, ''),
+                SUM(COALESCE(ai.tokens_in, 0)),
+                SUM(COALESCE(ai.tokens_out, 0)),
+                SUM(COALESCE(ai.tokens_cached, 0)),
+                COUNT(*)
+            FROM reviews r
+            LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+            {}
+            {}
+            GROUP BY day, r.provider, r.model
+            ORDER BY day, r.model",
+            subsystem_join, subsystem_filter
+        );
+        let mut rows_b = match subsystem_id {
+            Some(sid) => self.conn.query(&sql_b, libsql::params![sid]).await?,
+            None => self.conn.query(&sql_b, ()).await?,
+        };
+        while let Ok(Some(row)) = rows_b.next().await {
+            let Ok(day) = row.get::<String>(0) else {
+                continue;
+            };
+            let provider: String = row.get(1).unwrap_or_default();
+            let model: String = row.get(2).unwrap_or_default();
+            let tokens_in: i64 = row.get(3).unwrap_or(0);
+            let tokens_out: i64 = row.get(4).unwrap_or(0);
+            let tokens_cached: i64 = row.get(5).unwrap_or(0);
+            let reviews: i64 = row.get(6).unwrap_or(0);
+
+            let entry = daily.entry(day.clone()).or_insert_with(|| {
+                json!({
+                    "day": day,
+                    "by_model": Vec::<serde_json::Value>::new(),
+                    "reviews_total": 0,
+                    "patches_reviewed": 0,
+                    "errors": 0,
+                    "budget_warn": 0,
+                    "budget_severe": 0,
+                    "with_findings": {
+                        "count": 0, "tokens_in": 0, "tokens_out": 0,
+                        "tokens_cached": 0, "duration_sum_sec": 0, "duration_count": 0,
+                    },
+                    "without_findings": {
+                        "count": 0, "tokens_in": 0, "tokens_out": 0,
+                        "tokens_cached": 0, "duration_sum_sec": 0, "duration_count": 0,
+                    },
+                })
+            });
+            if let Some(arr) = entry.get_mut("by_model").and_then(|v| v.as_array_mut()) {
+                arr.push(json!({
+                    "provider": provider,
+                    "model": model,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "tokens_cached": tokens_cached,
+                    "reviews": reviews,
+                }));
+            }
+        }
+
+        let ordered: Vec<serde_json::Value> = daily.into_values().collect();
+        Ok(json!({ "daily": ordered }))
     }
 
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {

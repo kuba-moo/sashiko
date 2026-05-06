@@ -138,6 +138,7 @@ pub struct AppState {
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
+    stats_cost_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     messages_count_cache: AsyncCache<usize>,
     patchsets_count_cache: AsyncCache<usize>,
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
@@ -354,6 +355,7 @@ pub fn build_router(
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+        stats_cost_cache: AsyncMapCache::new(Duration::from_secs(60)),
         messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
@@ -375,6 +377,7 @@ pub fn build_router(
         .route("/api/stats/timeline", get(stats_timeline))
         .route("/api/stats/reviews", get(stats_reviews))
         .route("/api/stats/tools", get(stats_tools))
+        .route("/api/stats/cost", get(stats_cost))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
@@ -1077,6 +1080,26 @@ async fn stats_timeline(
                 .await
                 .map_err(|e| {
                     info!("Error getting timeline stats: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
+        })
+        .await?;
+    Ok(Json(data))
+}
+
+async fn stats_cost(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SubsystemQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let data = state
+        .stats_cost_cache
+        .get_or_fetch(params.subsystem_id, || async {
+            state
+                .db
+                .get_cost_stats(params.subsystem_id)
+                .await
+                .map_err(|e| {
+                    info!("Error getting cost stats: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })
         })

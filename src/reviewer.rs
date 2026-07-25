@@ -1155,6 +1155,7 @@ impl Reviewer {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
 
@@ -1272,6 +1273,7 @@ impl Reviewer {
                                     interaction_id.as_deref(),
                                     None,
                                     logs_str.as_deref(),
+                                    None,
                                 )
                                 .await;
 
@@ -1317,6 +1319,9 @@ impl Reviewer {
                                 let result_desc = "Review completed successfully.";
 
                                 let inline_review = json_output["inline_review"].as_str();
+                                let budget_flags = review_content["budget_flags"]
+                                    .as_u64()
+                                    .map(|value| value as u8);
 
                                 let mut db_success = true;
 
@@ -1330,6 +1335,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         inline_review,
                                         logs_str.as_deref(),
+                                        budget_flags,
                                     )
                                     .await
                                 {
@@ -1407,6 +1413,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         None,
                                         logs_str.as_deref(),
+                                        None,
                                     )
                                     .await;
                                 let _ = ctx.db.update_patch_status(patch_id, "Skipped").await;
@@ -1422,6 +1429,7 @@ impl Reviewer {
                                         interaction_id.as_deref(),
                                         None,
                                         logs_str.as_deref(),
+                                        None,
                                     )
                                     .await;
                                 if retries < max_retries {
@@ -1446,6 +1454,7 @@ impl Reviewer {
                                     interaction_id.as_deref(),
                                     None,
                                     logs_str.as_deref(),
+                                    None,
                                 )
                                 .await;
                             let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
@@ -1466,6 +1475,7 @@ impl Reviewer {
                                 interaction_id.as_deref(),
                                 None,
                                 logs_str.as_deref(),
+                                None,
                             )
                             .await;
                         if retries < max_retries {
@@ -1484,6 +1494,7 @@ impl Reviewer {
                             review_id,
                             ReviewStatus::Failed.as_str(),
                             &format!("Tool error: {}", e),
+                            None,
                             None,
                             None,
                             None,

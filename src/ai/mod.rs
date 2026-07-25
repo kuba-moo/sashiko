@@ -626,6 +626,7 @@ pub mod ollama;
 pub mod openai;
 pub mod proxy;
 pub mod quota;
+pub mod review_budget;
 pub mod session;
 pub mod token_budget;
 pub mod truncator;

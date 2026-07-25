@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::review_budget::{BudgetLevel, ReviewBudget};
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
     AiUsage, ToolCall, classify_ai_error,
@@ -180,6 +181,7 @@ pub struct SessionRunner<'a> {
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
     conversation_dump: Option<(Arc<ConversationDumper>, String)>,
+    budget: Option<ReviewBudget>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -193,6 +195,7 @@ impl<'a> SessionRunner<'a> {
             max_provider_error_retries: 3,
             on_turn: None,
             conversation_dump: None,
+            budget: None,
         }
     }
 
@@ -238,6 +241,11 @@ impl<'a> SessionRunner<'a> {
         self
     }
 
+    pub fn with_budget(mut self, budget: Option<ReviewBudget>) -> Self {
+        self.budget = budget;
+        self
+    }
+
     /// Runs the session to completion. Returns the validated output and conversation history (for logging).
     pub async fn run<S>(&self, session: &mut S) -> Result<SessionResult<S::Output>>
     where
@@ -270,6 +278,8 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut severe_seen = false;
+        let mut force_conclude = false;
 
         loop {
             turns += 1;
@@ -365,10 +375,19 @@ impl<'a> SessionRunner<'a> {
                 anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
             }
 
+            let mut budget_level = None;
             if let Some(usage) = &resp.usage {
                 total_prompt_tokens += usage.prompt_tokens;
                 total_completion_tokens += usage.completion_tokens;
                 total_cached_tokens += usage.cached_tokens.unwrap_or(0);
+                if let Some(budget) = &self.budget {
+                    budget_level = budget.record_and_check(
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                }
             }
 
             let assistant_msg = AiMessage {
@@ -385,6 +404,9 @@ impl<'a> SessionRunner<'a> {
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls {
+                if force_conclude {
+                    anyhow::bail!("Token budget exhausted after final-conclusion warning");
+                }
                 let results = session.call_tools(tool_calls.clone()).await?;
                 for (call_id, result) in results {
                     let tool_msg = AiMessage {
@@ -398,6 +420,39 @@ impl<'a> SessionRunner<'a> {
                     };
                     history.push(tool_msg.clone());
                     log_history.push(tool_msg);
+                }
+
+                let warning = if severe_seen {
+                    force_conclude = true;
+                    Some(
+                        "[SYSTEM - TOKEN BUDGET]\nYour token budget is exhausted. Provide your final answer now and do not call any more tools.",
+                    )
+                } else {
+                    match budget_level {
+                        Some(BudgetLevel::Severe) => {
+                            severe_seen = true;
+                            Some(
+                                "[SYSTEM - TOKEN BUDGET]\nYou are approaching your token budget limit. Conclude now with the information already gathered; do not make further tool calls.",
+                            )
+                        }
+                        Some(BudgetLevel::Warn) => Some(
+                            "[SYSTEM - TOKEN BUDGET]\nA significant portion of the token budget has been used. Be selective and investigate only remaining critical concerns.",
+                        ),
+                        None => None,
+                    }
+                };
+                if let Some(warning) = warning {
+                    let message = AiMessage {
+                        role: AiRole::User,
+                        content: Some(warning.to_string()),
+                        thought: None,
+                        thought_signature: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    history.push(message.clone());
+                    log_history.push(message);
                 }
                 continue; // Loop again to feed tool results back to LLM
             }

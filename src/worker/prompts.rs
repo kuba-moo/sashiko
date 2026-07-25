@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ai::review_budget::ReviewBudget;
 use crate::ai::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
     ClassifyAiError, ConversationDumper, ErrorAction, LlmSession, SessionRunner, ValidationError,
@@ -94,6 +95,8 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
     pub dump_conversation: Option<std::path::PathBuf>,
+    pub budget: Option<ReviewBudget>,
+    pub retry_provider: Option<Arc<dyn AiProvider>>,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +457,8 @@ pub struct Worker {
     stages: Option<Vec<u8>>,
     dump_conversation: Option<std::path::PathBuf>,
     conversation_dumper: Option<Arc<ConversationDumper>>,
+    budget: Option<ReviewBudget>,
+    retry_provider: Option<Arc<dyn AiProvider>>,
 }
 
 impl Worker {
@@ -475,7 +480,21 @@ impl Worker {
             stages: config.stages,
             dump_conversation: config.dump_conversation,
             conversation_dumper: None,
+            budget: config.budget,
+            retry_provider: config.retry_provider,
         }
+    }
+
+    fn provider_for_budget(&self) -> Arc<dyn AiProvider> {
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(ReviewBudget::review_past_warn)
+            && let Some(provider) = &self.retry_provider
+        {
+            return provider.clone();
+        }
+        self.provider.clone()
     }
 
     pub async fn run(
@@ -901,6 +920,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": 0,
+                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": dismissed_concerns_count
             });
             return Ok(WorkerResult {
@@ -1014,8 +1034,10 @@ Preserve the most precise location details from the input. Do not invent line nu
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            let runner = SessionRunner::new(self.provider.as_ref())
+            let provider = self.provider_for_budget();
+            let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
+                .with_budget(self.budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1054,6 +1076,7 @@ Preserve the most precise location details from the input. Do not invent line nu
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
+                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len)
@@ -1173,8 +1196,10 @@ Example Output:
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            let runner = SessionRunner::new(self.provider.as_ref())
+            let provider = self.provider_for_budget();
+            let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
+                .with_budget(self.budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1211,6 +1236,7 @@ Example Output:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
+                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len)
@@ -1292,8 +1318,10 @@ Example Output:
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            let runner = SessionRunner::new(self.provider.as_ref())
+            let provider = self.provider_for_budget();
+            let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
+                .with_budget(self.budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1328,6 +1356,7 @@ Example Output:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
+                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len)
@@ -1375,8 +1404,10 @@ Example Output:
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            let runner = SessionRunner::new(self.provider.as_ref())
+            let provider = self.provider_for_budget();
+            let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
+                .with_budget(self.budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1413,6 +1444,7 @@ Example Output:
             "fixes": fixes_text,
             "concerns_count": all_concerns.len(),
             "dismissed_concerns_count": dismissed_concerns_count
+            ,"budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags)
         });
 
         Ok(WorkerResult {
@@ -1632,8 +1664,10 @@ Example:
             self.context_tag.as_deref(),
         );
 
-        let runner = SessionRunner::new(self.provider.as_ref())
+        let provider = self.provider_for_budget();
+        let runner = SessionRunner::new(provider.as_ref())
             .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage_num))
+            .with_budget(self.budget.clone())
             .with_max_validation_attempts(3)
             .with_max_turns(self.max_interactions)
             .with_turn_callback(move |turn, max_turns| {
@@ -2162,6 +2196,8 @@ mod tests {
             custom_prompt: None,
             stages: None,
             dump_conversation: None,
+            budget: None,
+            retry_provider: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2518,6 +2554,8 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec![1]),
             dump_conversation: None,
+            budget: None,
+            retry_provider: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

@@ -62,6 +62,7 @@ pub struct PatchsetRow {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    pub budget_flags_or: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +520,9 @@ impl Database {
         let _ = self.try_add_column("reviews", "logs", "TEXT").await;
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
+            .try_add_column("reviews", "budget_flags", "INTEGER DEFAULT 0")
+            .await;
+        let _ = self
             .try_create_index("idx_reviews_patch_status", "reviews", "patch_id, status")
             .await;
         let _ = self
@@ -865,11 +869,12 @@ impl Database {
         interaction_id: Option<&str>,
         inline_review: Option<&str>,
         logs: Option<&str>,
+        budget_flags: Option<u8>,
     ) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-                libsql::params![status, result, summary, interaction_id, inline_review, logs, review_id],
+                "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?, budget_flags = ? WHERE id = ?",
+                libsql::params![status, result, summary, interaction_id, inline_review, logs, budget_flags.unwrap_or(0) as i64, review_id],
             )
             .await?;
         Ok(())
@@ -2365,7 +2370,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
+             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug, b.budget_flags_or
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -2385,6 +2390,17 @@ impl Database {
                 WHERE r.status = 'Reviewed'
                 GROUP BY r.patchset_id
              ) f ON p.id = f.patchset_id
+             LEFT JOIN (
+                SELECT r.patchset_id,
+                    MAX(r.budget_flags & 1) | MAX(r.budget_flags & 2)
+                    | MAX(r.budget_flags & 4) | MAX(r.budget_flags & 8)
+                    | MAX(r.budget_flags & 16) | MAX(r.budget_flags & 32)
+                    | MAX(r.budget_flags & 64) | MAX(r.budget_flags & 128)
+                    AS budget_flags_or
+                FROM reviews r
+                WHERE r.status = 'Reviewed' AND r.budget_flags > 0
+                GROUP BY r.patchset_id
+             ) b ON p.id = b.patchset_id
              GROUP BY p.id
              ORDER BY p.date DESC",
             where_clause
@@ -2466,6 +2482,7 @@ impl Database {
                         mr_title: row.get(21).ok(),
                         mr_number: row.get(22).ok(),
                         slug: row.get(23).ok(),
+                        budget_flags_or: row.get::<Option<i64>>(24).ok().flatten(),
                     });
                 }
                 Ok(None) => break,
@@ -2744,7 +2761,7 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -2771,6 +2788,7 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(10).ok(),
                     "id": r.get::<i64>(11).ok(),
                     "tokens_cached": r.get::<Option<u32>>(12).ok(),
+                    "budget_flags": r.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -2982,7 +3000,7 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3008,6 +3026,7 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(8).ok(),
                     "id": r.get::<i64>(9).ok(),
                     "tokens_cached": r.get::<Option<u32>>(10).ok(),
+                    "budget_flags": r.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -3171,7 +3190,7 @@ impl Database {
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_git_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
-                        p.embargo_until
+                        r.budget_flags, p.embargo_until
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -3182,7 +3201,7 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
-            let embargo_until: Option<i64> = r.get(20).ok();
+            let embargo_until: Option<i64> = r.get(21).ok();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
@@ -3216,6 +3235,7 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                "budget_flags": r.get::<Option<i64>>(20).ok().flatten().unwrap_or(0),
             })))
         } else {
             Ok(None)
@@ -3311,6 +3331,7 @@ impl Database {
                 mr_title: None,
                 mr_number: None,
                 slug: row.get(15).ok(),
+                budget_flags_or: None,
             });
         }
         Ok(patchsets)
@@ -3370,6 +3391,7 @@ impl Database {
                         mr_title: None,
                         mr_number: None,
                         slug: None,
+                        budget_flags_or: None,
                     });
                 }
                 Ok(None) => break,
@@ -4785,6 +4807,7 @@ mod tests {
             None,
             Some("No issues found."),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4902,6 +4925,7 @@ mod tests {
             review_id,
             "Skipped",
             "Skipped AI review via --no-ai",
+            None,
             None,
             None,
             None,
@@ -5794,6 +5818,7 @@ mod tests {
             Some("int_id"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -5944,6 +5969,7 @@ mod tests {
             "desc",
             None,
             Some("int_id2"),
+            None,
             None,
             None,
         )

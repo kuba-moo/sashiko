@@ -182,6 +182,9 @@ pub struct BedrockSettings {
     /// Leave unset to use the model default. "xhigh" is Opus 4.7-only.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Effort level used for retries and after the review budget warning.
+    #[serde(default)]
+    pub retry_effort: Option<String>,
 }
 
 #[cfg(feature = "bedrock")]
@@ -307,6 +310,19 @@ pub struct AiSettings {
     /// Directory where complete per-turn request and response JSON is written.
     #[serde(default)]
     pub dump_conversation: Option<String>,
+    /// Per-stage input token budget. Zero disables input budgeting.
+    #[serde(default)]
+    pub stage_input_budget: usize,
+    /// Per-stage output token budget. Zero disables output budgeting.
+    #[serde(default)]
+    pub stage_output_budget: usize,
+    #[serde(default)]
+    pub budget_warn_pct: f32,
+    #[serde(default)]
+    pub budget_severe_pct: f32,
+    /// Multiplier from stage budgets to the shared review-wide budget.
+    #[serde(default)]
+    pub review_budget_multiplier: f32,
     #[serde(default)]
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]

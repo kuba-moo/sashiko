@@ -1438,6 +1438,22 @@
             return ` &middot; ~$${cost.toFixed(2)}`;
         }
 
+        function formatBudgetFlags(flags, compact = false) {
+            if (!flags) return '';
+            const labels = [];
+            if (flags & 0x03) labels.push(`stage input${flags & 0x02 ? ' (severe)' : ''}`);
+            if (flags & 0x0c) labels.push(`stage output${flags & 0x08 ? ' (severe)' : ''}`);
+            if (flags & 0x30) labels.push(`review input${flags & 0x20 ? ' (severe)' : ''}`);
+            if (flags & 0xc0) labels.push(`review output${flags & 0x80 ? ' (severe)' : ''}`);
+            const severe = flags & 0xaa;
+            const text = severe ? 'budget: severe' : 'budget: warn';
+            const style = `color:${severe ? 'var(--error-text)' : 'var(--warn-text)'};font-weight:${severe ? 'bold' : 'normal'};`;
+            if (compact) {
+                return `<div style="${style}font-size:0.85em;margin-top:2px;" title="Token budget hit on ${labels.join(', ')}">${text}</div>`;
+            }
+            return ` &middot; <span style="${style}" title="Token budget hit on ${labels.join(', ')}">${text}</span>`;
+        }
+
         // =====================================================================
         // ROUTER
         // =====================================================================
@@ -2114,6 +2130,7 @@
                             critical: p.findings_critical || 0
                         };
                         findingsHtml = renderFindingsBadges(counts, statusLabel);
+                        findingsHtml += formatBudgetFlags(p.budget_flags_or || 0, true);
                     }
 
                     row.innerHTML = `
@@ -2783,6 +2800,7 @@
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
             const reviewCost = estimateCost(r.model, r.tokens_in || 0, tokensOut, tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
+            const budgetIndicators = formatBudgetFlags(r.budget_flags || 0);
 
             let inlineHtml = '';
             if (r.inline_review) {
@@ -2824,7 +2842,7 @@
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
                         <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">
-                            <strong>Tokens used:</strong> ${tokenStr}
+                            <strong>Tokens used:</strong> ${tokenStr}${budgetIndicators}
                         </div>
                     </div>
                     <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; font-size: 0.9em;">

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{
+    ai::review_budget::{BudgetConfig, ReviewBudget},
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, SemcodeSettings, Settings},
     toolbox::ToolBox,
@@ -442,8 +443,10 @@ async fn review_single_patch(
             );
         }
 
-        let provider =
-            crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
+        let effective_ai = ai_for_attempt(ai, attempt);
+        let provider = crate::ai::create_provider_from_ai(&effective_ai)
+            .context("Failed to create AI provider")?;
+        let retry_provider = build_retry_provider(&effective_ai);
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
         let mut patch_files = Vec::new();
@@ -503,6 +506,14 @@ async fn review_single_patch(
                 series_range,
                 stages: options.stages.clone(),
                 dump_conversation: ai.dump_conversation.as_ref().map(PathBuf::from),
+                budget: Some(ReviewBudget::new(BudgetConfig {
+                    stage_input: ai.stage_input_budget,
+                    stage_output: ai.stage_output_budget,
+                    warn_pct: ai.budget_warn_pct,
+                    severe_pct: ai.budget_severe_pct,
+                    review_multiplier: ai.review_budget_multiplier,
+                })),
+                retry_provider,
             },
         );
 
@@ -625,6 +636,46 @@ async fn review_single_patch(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
+}
+
+#[cfg(feature = "bedrock")]
+fn ai_for_attempt(ai: &AiSettings, attempt: usize) -> AiSettings {
+    let mut effective = ai.clone();
+    if attempt > 1
+        && let Some(bedrock) = effective.bedrock.as_mut()
+        && let Some(retry_effort) = bedrock.retry_effort.clone()
+    {
+        bedrock.effort = Some(retry_effort);
+    }
+    effective
+}
+
+#[cfg(not(feature = "bedrock"))]
+fn ai_for_attempt(ai: &AiSettings, _attempt: usize) -> AiSettings {
+    ai.clone()
+}
+
+#[cfg(feature = "bedrock")]
+fn build_retry_provider(ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai::AiProvider>> {
+    let bedrock = ai.bedrock.as_ref()?;
+    let retry_effort = bedrock.retry_effort.as_ref()?;
+    if bedrock.effort.as_ref() == Some(retry_effort) {
+        return None;
+    }
+    let mut retry_ai = ai.clone();
+    retry_ai.bedrock.as_mut()?.effort = Some(retry_effort.clone());
+    match crate::ai::create_provider_from_ai(&retry_ai) {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            tracing::warn!("Failed to build retry-effort provider: {}", error);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "bedrock"))]
+fn build_retry_provider(_ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai::AiProvider>> {
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -874,6 +925,7 @@ async fn run_worker_in_worktree(
     let mut total_tokens_cached = 0;
     let mut total_concerns_count = 0;
     let mut total_dismissed_concerns_count = 0;
+    let mut budget_flags = 0u64;
 
     for res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
@@ -905,6 +957,10 @@ async fn run_worker_in_worktree(
             {
                 total_dismissed_concerns_count += dcc;
             }
+            budget_flags |= review
+                .get("budget_flags")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
         }
 
         if let Some(inline) = res["inline_review"].as_str()
@@ -941,6 +997,7 @@ async fn run_worker_in_worktree(
         "dismissed_concerns": combined_dismissed_concerns,
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
+        ,"budget_flags": budget_flags
     });
 
     let combined_result = json!({

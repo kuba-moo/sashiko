@@ -992,12 +992,28 @@ async fn run_worker_in_worktree(
         total_tokens_cached += res["tokens_cached"].as_u64().unwrap_or(0);
     }
 
+    let multi_stage_count = combined_findings
+        .iter()
+        .filter(|finding| {
+            finding
+                .get("source_stages")
+                .and_then(Value::as_array)
+                .is_some_and(|stages| stages.len() > 1)
+        })
+        .count();
+    let unique_findings = combined_findings.len();
     let review_output = json!({
         "findings": combined_findings,
         "dismissed_concerns": combined_dismissed_concerns,
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
-        ,"budget_flags": budget_flags
+        ,"budget_flags": budget_flags,
+        "dedup_stats": {
+            "total_concerns": total_concerns_count,
+            "unique_findings": unique_findings,
+            "multi_stage_count": multi_stage_count,
+            "multi_stage_pct": if unique_findings == 0 { 0.0 } else { multi_stage_count as f64 * 100.0 / unique_findings as f64 }
+        }
     });
 
     let combined_result = json!({

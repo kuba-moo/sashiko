@@ -62,6 +62,9 @@ pub struct PatchsetRow {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    pub concerns_total: Option<i64>,
+    pub concerns_unique: Option<i64>,
+    pub findings_multi_stage: Option<i64>,
     pub budget_flags_or: Option<i64>,
 }
 
@@ -187,6 +190,7 @@ pub struct Finding {
     pub problem: String,
     pub preexisting: Option<bool>,
     pub locations: Option<serde_json::Value>,
+    pub source_stages: Option<String>,
 }
 
 pub struct EmailOutboxRow {
@@ -521,6 +525,18 @@ impl Database {
         let _ = self.try_add_column("reviews", "patch_id", "INTEGER").await;
         let _ = self
             .try_add_column("reviews", "budget_flags", "INTEGER DEFAULT 0")
+            .await;
+        let _ = self
+            .try_add_column("findings", "source_stages", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "concerns_total", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "concerns_unique", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "findings_multi_stage", "INTEGER")
             .await;
         let _ = self
             .try_create_index("idx_reviews_patch_status", "reviews", "patch_id, status")
@@ -880,6 +896,22 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_review_dedup_stats(
+        &self,
+        review_id: i64,
+        total: i64,
+        unique: i64,
+        multi_stage: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
+                libsql::params![total, unique, multi_stage, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO ai_interactions (id, parent_interaction_id, workflow_id, provider, model, input_context, output_raw, tokens_in, tokens_out, tokens_cached, created_at)
@@ -948,8 +980,8 @@ impl Database {
             .and_then(|v| serde_json::to_string(v).ok());
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations, source_stages)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
@@ -957,6 +989,7 @@ impl Database {
                     finding.problem,
                     preexisting_val,
                     locations_val,
+                    finding.source_stages,
                 ],
             )
             .await?;
@@ -2370,7 +2403,8 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug, b.budget_flags_or
+             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug,
+             d.concerns_total, d.concerns_unique, d.findings_multi_stage, b.budget_flags_or
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -2390,6 +2424,14 @@ impl Database {
                 WHERE r.status = 'Reviewed'
                 GROUP BY r.patchset_id
              ) f ON p.id = f.patchset_id
+             LEFT JOIN (
+                SELECT r.patchset_id, SUM(r.concerns_total) AS concerns_total,
+                    SUM(r.concerns_unique) AS concerns_unique,
+                    SUM(r.findings_multi_stage) AS findings_multi_stage
+                FROM reviews r
+                WHERE r.status = 'Reviewed' AND r.concerns_total IS NOT NULL
+                GROUP BY r.patchset_id
+             ) d ON p.id = d.patchset_id
              LEFT JOIN (
                 SELECT r.patchset_id,
                     MAX(r.budget_flags & 1) | MAX(r.budget_flags & 2)
@@ -2482,7 +2524,10 @@ impl Database {
                         mr_title: row.get(21).ok(),
                         mr_number: row.get(22).ok(),
                         slug: row.get(23).ok(),
-                        budget_flags_or: row.get::<Option<i64>>(24).ok().flatten(),
+                        concerns_total: row.get(24).ok(),
+                        concerns_unique: row.get(25).ok(),
+                        findings_multi_stage: row.get(26).ok(),
+                        budget_flags_or: row.get::<Option<i64>>(27).ok().flatten(),
                     });
                 }
                 Ok(None) => break,
@@ -3332,6 +3377,9 @@ impl Database {
                 mr_number: None,
                 slug: row.get(15).ok(),
                 budget_flags_or: None,
+                concerns_total: None,
+                concerns_unique: None,
+                findings_multi_stage: None,
             });
         }
         Ok(patchsets)
@@ -3392,6 +3440,9 @@ impl Database {
                         mr_number: None,
                         slug: None,
                         budget_flags_or: None,
+                        concerns_total: None,
+                        concerns_unique: None,
+                        findings_multi_stage: None,
                     });
                 }
                 Ok(None) => break,
@@ -4854,6 +4905,7 @@ mod tests {
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
             locations: None,
+            source_stages: None,
         })
         .await
         .unwrap();

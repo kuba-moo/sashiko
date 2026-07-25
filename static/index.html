@@ -2693,12 +2693,12 @@
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
             let displayResult = '';
+            let outputJson = null;
             
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
             try {
                 if (r.output) {
-                    let outputJson = null;
                     if (typeof r.output === 'string') {
                         outputJson = JSON.parse(r.output);
                     } else if (typeof r.output === 'object') {
@@ -2802,6 +2802,19 @@
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
             const budgetIndicators = formatBudgetFlags(r.budget_flags || 0);
 
+            let findingsDetailHtml = '';
+            if (parsedFindings && outputJson && Array.isArray(outputJson.findings) &&
+                outputJson.findings.some(f => Array.isArray(f.source_stages) && f.source_stages.length > 1)) {
+                const rows = outputJson.findings.map(f => {
+                    const severity = (f.severity || 'Low').toLowerCase();
+                    const stages = Array.isArray(f.source_stages) && f.source_stages.length > 1
+                        ? `stages ${f.source_stages.join(', ')}` : '';
+                    const problem = escapeHtml((f.problem || '').substring(0, 120));
+                    return `<tr><td style="color:var(--sev-${severity});font-weight:bold;">${escapeHtml(f.severity || 'Low')}</td><td>${problem}</td><td>${stages}</td></tr>`;
+                });
+                findingsDetailHtml = `<div style="margin-top:8px;"><button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button><div id="findings-${uniqueId}" class="collapsible"><table style="width:100%;font-size:0.9em;"><thead><tr><th>Severity</th><th>Problem</th><th>Stages</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
+            }
+
             let inlineHtml = '';
             if (r.inline_review) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
@@ -2839,6 +2852,7 @@
                     </div>
                     ${showDetails ? `
                     ${inlineHtml}
+                    ${findingsDetailHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
                         <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">

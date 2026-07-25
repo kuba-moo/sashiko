@@ -79,7 +79,6 @@ CREATE TABLE IF NOT EXISTS patchsets (
     only_filters TEXT,
     target_review_count INTEGER DEFAULT 1,
     provider TEXT,
-    budget_flags INTEGER DEFAULT 0,
     embargo_until INTEGER,
     embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
@@ -116,6 +115,10 @@ CREATE TABLE IF NOT EXISTS reviews (
     model TEXT,
     prompts_hash TEXT,
     provider TEXT,
+    budget_flags INTEGER DEFAULT 0,
+    concerns_total INTEGER,
+    concerns_unique INTEGER,
+    findings_multi_stage INTEGER,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(patch_id) REFERENCES patches(id),
     FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id),
@@ -131,6 +134,7 @@ CREATE TABLE IF NOT EXISTS findings (
     suggestion TEXT,
     preexisting INTEGER, -- 0 = false, 1 = true
     locations TEXT,
+    source_stages TEXT,
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_review_id ON findings(review_id);

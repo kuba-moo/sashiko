@@ -1300,6 +1300,10 @@ impl Reviewer {
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
+                                        let source_stages = f
+                                            .get("source_stages")
+                                            .filter(|value| value.is_array())
+                                            .map(ToString::to_string);
 
                                         ctx.db
                                             .create_finding(Finding {
@@ -1309,6 +1313,7 @@ impl Reviewer {
                                                 problem,
                                                 preexisting,
                                                 locations,
+                                                source_stages,
                                             })
                                             .await?;
                                     }
@@ -1322,6 +1327,17 @@ impl Reviewer {
                                 let budget_flags = review_content["budget_flags"]
                                     .as_u64()
                                     .map(|value| value as u8);
+                                if let Some(stats) = review_content.get("dedup_stats") {
+                                    let _ = ctx
+                                        .db
+                                        .update_review_dedup_stats(
+                                            review_id,
+                                            stats["total_concerns"].as_i64().unwrap_or(0),
+                                            stats["unique_findings"].as_i64().unwrap_or(0),
+                                            stats["multi_stage_count"].as_i64().unwrap_or(0),
+                                        )
+                                        .await;
+                                }
 
                                 let mut db_success = true;
 

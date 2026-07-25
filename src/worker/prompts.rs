@@ -131,6 +131,32 @@ pub struct WorkerResult {
     pub tokens_cached: u32,
 }
 
+fn dedup_stats(total_concerns: usize, findings: &Value) -> Value {
+    let unique_findings = findings.as_array().map_or(0, Vec::len);
+    let multi_stage_count = findings.as_array().map_or(0, |items| {
+        items
+            .iter()
+            .filter(|finding| {
+                finding
+                    .get("source_stages")
+                    .and_then(Value::as_array)
+                    .is_some_and(|stages| stages.len() > 1)
+            })
+            .count()
+    });
+    let multi_stage_pct = if unique_findings == 0 {
+        0.0
+    } else {
+        multi_stage_count as f64 * 100.0 / unique_findings as f64
+    };
+    json!({
+        "total_concerns": total_concerns,
+        "unique_findings": unique_findings,
+        "multi_stage_count": multi_stage_count,
+        "multi_stage_pct": multi_stage_pct,
+    })
+}
+
 pub struct PromptRegistry {
     base_dir: PathBuf,
 }
@@ -295,7 +321,8 @@ Your task is to deduplicate identical or overlapping items in both lists.
 6. Preserve the `preexisting` flag for concerns. If you merge a pre-existing concern with a newly introduced one, flag it based on the root cause (if the root cause is new, it's not pre-existing).
 7. SPECIFICITY REQUIREMENT: When merging concerns or dismissed_concerns, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and triggering conditions. Never generalize a specific finding into a vague category.
 8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
-9. dismissed_concerns do not need a `preexisting` flag."
+9. For every concern, emit `source_stages` as the sorted, unique array of all input `source_stage` values merged into it. Preserve `source_stages` on unmerged concerns.
+10. dismissed_concerns do not need a `preexisting` flag."
             }
             9 => {
                 "# Stage 9. Concern/dismissed-concern conflict resolution
@@ -308,7 +335,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
 4. If there is no direct conflict for a concern, keep it unchanged.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
+6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, `locations`, and `source_stages` fields.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."
             }
             10 => {
@@ -322,7 +349,8 @@ You are the lead reviewer validating consolidated concerns. You will be given a 
 5. Assign a severity (low, medium, high, critical) to each remaining valid finding, following the calibration guidance in the severity definitions: reason through consequence, triggering path, and reachability, and state that reasoning at the start of the finding's `severity_explanation` so the label is auditable. Raise the level for a bug reachable by untrusted or remote input, and do not lower it because you believe the code is unreachable. A finding you can only state speculatively is capped at medium but still reported, never dropped. Be rigorous in filtering out verifiable noise, but accurately report real logic flaws and edge cases.
 6. If the problem did exist in the code before the patch was applied, say it explicitly: 'This problem wasn't introduced by this patch, but...'. Discard low- and medium-severity pre-existing problems, report only high- and critical severity issues.
 7. SPECIFICITY REQUIREMENT: Every finding MUST cite the exact function name(s), file path(s), line number(s) when known, and triggering conditions where the bug manifests. Vague descriptions like 'potential overflow in ring buffer calculations' are insufficient. State precisely which variable overflows, in which function, and under what input conditions. Do not invent line numbers; use `line: null` when the exact line is not known.
-8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations you verified."
+8. Carry forward the `locations` from the validated concern into each finding. If you gather better evidence, replace vague locations with the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations you verified.
+9. Carry forward the concern's `source_stages` array unchanged into the finding."
             }
             11 => {
                 "# Stage 11. LKML-friendly report generation
@@ -934,6 +962,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 "concerns_count": 0,
                 "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": dismissed_concerns_count
+                ,"dedup_stats": dedup_stats(0, &json!([]))
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1091,7 +1120,8 @@ Preserve the most precise location details from the input. Do not invent line nu
                 "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
-                    .map_or(0, Vec::len)
+                    .map_or(0, Vec::len),
+                "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1251,7 +1281,8 @@ Example Output:
                 "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
-                    .map_or(0, Vec::len)
+                    .map_or(0, Vec::len),
+                "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1371,7 +1402,8 @@ Example Output:
                 "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
-                    .map_or(0, Vec::len)
+                    .map_or(0, Vec::len),
+                "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1456,7 +1488,8 @@ Example Output:
             "fixes": fixes_text,
             "concerns_count": all_concerns.len(),
             "dismissed_concerns_count": dismissed_concerns_count
-            ,"budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags)
+            ,"budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
+            "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
         });
 
         Ok(WorkerResult {

@@ -15,24 +15,23 @@ A standalone CLI tool that interfaces with the existing `sashiko` database and t
 
 ### 2. Core Components
 
-#### A. `Worker` (`src/worker.rs`)
-The central orchestrator.
-- **Responsibility**: Manages the conversation loop with the LLM.
-- **State**: Holds conversation history (Messages), available Tools, and the DB connection.
-- **Logic**:
-    1.  Initializes with a System Prompt (Persona: Linux Kernel Maintainer).
-    2.  Ingests the Patchset (Cover letter + Patches).
-    3.  Sends request to Gemini.
-    4.  If Gemini requests a tool (e.g., `git_blame`), executes it and feeds the result back.
-    5.  Repeats until a final text response is received.
-    6.  Parses the response into a structured Review object.
+#### A. Review orchestration (`src/local_review.rs`, `src/worker/`)
+The review is a staged pipeline rather than one provider-specific conversation.
+`local_review` prepares the repository, providers, shared tools, token budget,
+and conversation dump sink. Stage implementations build scoped prompts and use
+the provider-neutral `SessionRunner` for the model/tool loop and validation.
 
-#### B. `GeminiClient` (`src/ai/gemini.rs`)
-A specialized client for the Google Generative AI API.
-- **Contrast to existing `AiProvider`**: The current trait is too simple (single turn, no tools). This client will support:
-    -   Multi-turn chat (`contents`).
-    -   Function Calling (`tools`, `function_declarations`).
-    -   Streaming (optional, but good for long reviews).
+Stages 1-7 investigate distinct classes of defects and run with deliberately
+limited scopes. Later stages merge concerns, discard unsupported candidates,
+and produce the findings and review text. Shared review-token totals remain
+correct when investigation stages execute concurrently.
+
+#### B. AI providers and sessions (`src/ai/`)
+Providers translate the common request, response, tool-call, usage, and
+reasoning-block representations to their native APIs. `SessionRunner` owns the
+multi-turn loop, tool dispatch, validation feedback, optional transcript dumps,
+and optional budget steering. This keeps worker stages independent of Gemini,
+Bedrock, Claude, or other provider protocols.
 
 #### C. `ToolBox` (`src/worker/tools.rs`)
 Provides a safe, read-only interface to the system.
@@ -51,6 +50,14 @@ Provides a safe, read-only interface to the system.
 #### E. State Management
 - **Conversation History**: Full history of turns, tool calls, and results.
 - **Worktree**: A dedicated `git worktree` where the patch is applied for analysis.
+- **Budget State**: Per-stage counters plus atomic totals shared by the review.
+- **Provenance**: Every initial concern records its source stage. Merge and
+  filtering stages preserve the sorted, unique `source_stages` set through to
+  each finding.
+- **Deduplication Metrics**: The application computes total concerns, unique
+  findings, and multi-stage findings from the pipeline data. These values are
+  not trusted from model-authored summary fields; they are persisted with the
+  review and surfaced by the API and UI.
 
 
 #### D. `PromptRegistry` (`src/worker/prompts.rs`)
@@ -69,13 +76,13 @@ Provides a safe, read-only interface to the system.
     -   Fetch `Patchset(123)` from DB.
     -   Fetch associated `Patches` and `Messages`.
     -   Identify the base git repo/commit (using `baselines` table).
-3.  **Analysis Loop**:
-    -   Worker constructs prompt: "Review patchset: [Subject]..."
-    -   **Gemini**: "I need to see `net/core/dev.c` lines 100-150 to check locking."
-    -   **Worker**: Runs `read_files` -> Returns content.
-    -   **Gemini**: "Checks out. But who touched this last? `git blame` please."
-    -   **Worker**: Runs `git blame` -> Returns result.
-    -   **Gemini**: "Sashiko has reviewed this patch and found no issues. It looks great!"
+3.  **Analysis Pipeline**:
+    -   Pre-screen and planning establish the relevant scope.
+    -   Investigation stages use the shared toolbox to gather evidence and emit
+        concerns tagged with their source stage.
+    -   Consolidation merges duplicate concerns while unioning provenance.
+    -   Validation stages retain supported concerns and produce findings.
+    -   The application derives deduplication statistics and budget flags.
 4.  **Storage**:
     -   Save output to `reviews` table.
     -   Save token usage to `ai_interactions` table.

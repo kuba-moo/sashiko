@@ -156,6 +156,28 @@ pub trait LlmSession {
 
 Orchestrates the execution of a `LlmSession`. It handles the loops, history management, and retries.
 
+The runner is also the common boundary for controls and observability that
+must apply to every LLM turn, rather than only to a particular review stage:
+
+* **Conversation dumps:** an optional shared dump sink records each complete
+  request and response. A single per-review sink is passed to every stage so
+  parallel sessions allocate unique sequence numbers and write into the same
+  review directory. Keeping this in `SessionRunner` also covers pre-screening,
+  planning, and benchmark sessions without duplicating dump logic.
+* **Token budgets:** an optional `ReviewBudget` tracks per-stage usage while
+  sharing atomic review totals across concurrent stages. Crossing configured
+  warning or severe thresholds injects steering feedback into the conversation;
+  the severe path limits additional turns so a session cannot continue spending
+  indefinitely. The accumulated threshold bitmask is returned with the review
+  for persistence and UI diagnostics.
+* **Provider changes:** review orchestration may select a separately configured
+  retry provider after the shared review budget crosses its warning threshold.
+  Provider construction and stage selection remain outside `SessionRunner`;
+  the runner continues to execute against the provider it was given.
+
+These facilities are optional. Callers that do not configure them retain the
+basic validation and tool-execution behavior described below.
+
 ```rust
 use crate::ai::{AiProvider, AiRequest, AiMessage, AiRole};
 
@@ -338,4 +360,6 @@ Use `SessionRunner` in `benchmark.rs` to run this evaluation, removing the manua
 
 *   **Behavioral Equivalence**: The validation prompts and error feedback strings injected into the LLM context must remain identical or equivalent to the existing logic to ensure LLM behavior is not altered.
 *   **Stage History**: The `SessionRunner` will return the conversation history, which is appended to `Worker::global_history` just like before. We must ensure the structure of `global_history` remains exactly the same.
+*   **Parallel Accounting**: Per-review token totals and dump sequence numbers must be shared across parallel stages; per-stage warning state must remain local to its session.
+*   **Complete Transcripts**: Dumps must be emitted at the runner boundary so every provider exchange, including pre-screening and planning, is available to offline analysis.
 *   **Clippy & Formatting**: Run `make check-pr` before any commit to ensure style guide compliance.

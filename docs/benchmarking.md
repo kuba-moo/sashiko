@@ -9,7 +9,8 @@ descriptions.
 
 - A running sashiko daemon with a configured LLM provider
 - A clean database (move or remove any existing `sashiko.db`)
-- A benchmark JSON file (several are provided in `benchmarks/`)
+- A benchmark JSON file (several are provided in `benchmarks/`) or a corpus
+  directory
 
 ## Quick start
 
@@ -19,6 +20,12 @@ mv sashiko.db sashiko.db.bak
 
 # Run the benchmark
 cargo run --bin benchmark -- --file benchmarks/benchmark_small.json
+```
+
+For an annotated patch corpus:
+
+```bash
+cargo run --bin benchmark -- --corpus /path/to/corpus
 ```
 
 ## Benchmark files
@@ -35,6 +42,20 @@ Each file contains entries with a commit hash, a `Fixed-by` reference,
 and a `problem_description` that the AI judge uses to evaluate whether
 sashiko detected the issue.
 
+## Corpus directory mode
+
+Corpus mode evaluates patch-based cases with one or more ground-truth
+annotations. The corpus directory contains one subdirectory per case. Each case
+provides an mbox, JSON metadata identifying the patch file and optional base
+commit, and annotation files describing the expected issues. The metadata's
+`test_patch` selects the message to evaluate when the mbox contains a series.
+
+The benchmark submits each mbox through the Inject API with deterministic
+Message-ID headers. Its structured LLM judge evaluates in both directions:
+each annotation is classified as `DETECTED`, `PARTIALLY_DETECTED`, or `MISSED`,
+and findings that match no annotation are reported as false positives. Results
+are written to `corpus_results.json`.
+
 ## Command-line options
 
 ```
@@ -43,10 +64,13 @@ cargo run --bin benchmark -- [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `-f, --file <PATH>` | Path to the benchmark JSON file (required). |
+| `-f, --file <PATH>` | Path to a legacy benchmark JSON file. |
+| `-c, --corpus <PATH>` | Path to an annotated corpus directory. |
 | `-p, --port <PORT>` | Override the daemon port (defaults to Settings.toml value). |
-| `-r, --repo <URL>` | Override the kernel repository URL. |
+| `-r, --repo <URL>` | Override the kernel repository URL (`--file` only). |
 | `--analyze-only` | Skip ingestion; only evaluate existing results in the database. |
+
+Exactly one of `--file` and `--corpus` is required.
 
 ## Output
 
@@ -57,8 +81,8 @@ The tool prints a summary to the console:
   average time per review
 - **Counts**: Total concerns and findings
 
-Detailed results are written to `benchmark_results.json` in the current
-directory, including the AI judge's explanation for each finding.
+Detailed results are written to `benchmark_results.json` for legacy mode or
+`corpus_results.json` for corpus mode, including the AI judge's explanations.
 
 ## Re-evaluating existing results
 

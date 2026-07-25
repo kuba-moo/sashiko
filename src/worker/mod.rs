@@ -16,6 +16,7 @@ pub mod email;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;
+pub mod semcode_tools;
 pub mod stage;
 pub mod sync;
 

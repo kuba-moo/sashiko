@@ -498,6 +498,8 @@ pub struct LocalReviewReviewSettings {
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
     pub review: Option<LocalReviewReviewSettings>,
+    #[serde(default)]
+    pub semcode: Option<SemcodeSettings>,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {

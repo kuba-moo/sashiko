@@ -14,7 +14,7 @@
 
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
-    settings::{AiSettings, Settings},
+    settings::{AiSettings, SemcodeSettings, Settings},
     toolbox::ToolBox,
     worker::{PatchInput, ReviewInput, Worker, WorkerConfig, prompts::PromptRegistry},
 };
@@ -272,30 +272,32 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
-        let local_settings = Settings::local_review_from_file(path)
-            .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else if repo_override.is_some() {
-        let local_settings =
-            Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else {
-        let settings = Settings::new().context("Failed to load settings")?;
-        (
-            settings.ai,
-            Some(PathBuf::from(settings.git.repository_path)),
-            settings.review.concurrency,
-        )
-    };
+    let (mut ai, configured_repo_path, concurrency, semcode) =
+        if let Some(path) = &options.settings_path {
+            let local_settings = Settings::local_review_from_file(path)
+                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (local_settings.ai, None, concurrency, local_settings.semcode)
+        } else if repo_override.is_some() {
+            let local_settings = Settings::local_review_settings()
+                .context("Failed to load local review settings")?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (local_settings.ai, None, concurrency, local_settings.semcode)
+        } else {
+            let settings = Settings::new().context("Failed to load settings")?;
+            (
+                settings.ai,
+                Some(PathBuf::from(settings.git.repository_path)),
+                settings.review.concurrency,
+                settings.semcode,
+            )
+        };
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -393,6 +395,7 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        semcode.as_ref(),
         progress,
     )
     .await;
@@ -419,6 +422,7 @@ async fn review_single_patch(
     options: &WorkerOptions,
     baseline_sha: &str,
     progress: Option<&ProgressCallback<'_>>,
+    semcode: Option<&SemcodeSettings>,
 ) -> Result<Value> {
     let mut last_error = None;
     for attempt in 1..=3 {
@@ -467,6 +471,14 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        if let Some(settings) = semcode.filter(|settings| settings.enabled) {
+            match crate::worker::semcode_tools::SemcodeToolBox::start(settings, &worktree.path)
+                .await
+            {
+                Ok(semcode) => tools = tools.with_semcode(semcode),
+                Err(error) => tracing::warn!("Failed to start semcode tools: {}", error),
+            }
+        }
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -625,6 +637,7 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    semcode: Option<&SemcodeSettings>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -773,6 +786,27 @@ async fn run_worker_in_worktree(
         },
     );
 
+    if let Some(settings) = semcode.filter(|settings| settings.enabled) {
+        let setup = async {
+            crate::worker::semcode_tools::copy_semcode_db(&worktree.repo_path, &worktree.path)
+                .await?;
+            let target = patch_shas
+                .iter()
+                .max_by_key(|(index, _)| *index)
+                .map(|(_, sha)| sha.as_str())
+                .unwrap_or("HEAD");
+            crate::worker::semcode_tools::run_semcode_index(
+                settings,
+                &worktree.path,
+                &format!("{}..{}", baseline_sha, target),
+            )
+            .await
+        };
+        if let Err(error) = setup.await {
+            tracing::warn!("Semcode setup failed; continuing without it: {}", error);
+        }
+    }
+
     let rich_patches: Vec<Value> = patches_to_review
         .iter()
         .map(|p| {
@@ -816,6 +850,7 @@ async fn run_worker_in_worktree(
                 options,
                 baseline_sha,
                 progress,
+                semcode,
             )
             .await
         }

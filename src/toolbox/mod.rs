@@ -67,6 +67,7 @@ pub struct ToolBox {
     /// Thread-safe cache of tool invocation results.
     /// Shared with the execution context so that tools can access it internally.
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
+    semcode: Option<Arc<crate::worker::semcode_tools::SemcodeToolBox>>,
 }
 
 impl ToolBox {
@@ -100,7 +101,13 @@ impl ToolBox {
             context,
             registry,
             cache,
+            semcode: None,
         }
+    }
+
+    pub fn with_semcode(mut self, semcode: crate::worker::semcode_tools::SemcodeToolBox) -> Self {
+        self.semcode = Some(Arc::new(semcode));
+        self
     }
 
     /// Sets the virtual head commit SHA for the current review session.
@@ -127,7 +134,8 @@ impl ToolBox {
 
     /// Generates LLM-facing declarations for all registered tools.
     pub fn get_declarations_generic(&self) -> Vec<AiTool> {
-        self.registry
+        let mut declarations: Vec<_> = self
+            .registry
             .declarations()
             .into_iter()
             .map(|decl| AiTool {
@@ -135,7 +143,11 @@ impl ToolBox {
                 description: decl["description"].as_str().unwrap().to_string(),
                 parameters: decl["parameters"].clone(),
             })
-            .collect()
+            .collect();
+        if let Some(semcode) = &self.semcode {
+            declarations.extend(semcode.get_declarations());
+        }
+        declarations
     }
 
     /// Invokes a tool by name with the given JSON arguments.
@@ -144,6 +156,12 @@ impl ToolBox {
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
         let name_normalized = name.trim().to_lowercase();
+        if name_normalized.starts_with("sc_") {
+            return match &self.semcode {
+                Some(semcode) => semcode.call(&name_normalized, args).await,
+                None => anyhow::bail!("Semcode tool requested but semcode is not enabled"),
+            };
+        }
         let should_cache = name_normalized != "todowrite";
 
         let normalized_args = self.registry.normalize_tool_args(&name_normalized, &args);

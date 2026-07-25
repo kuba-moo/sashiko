@@ -304,6 +304,9 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    /// Directory where complete per-turn request and response JSON is written.
+    #[serde(default)]
+    pub dump_conversation: Option<String>,
     #[serde(default)]
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]

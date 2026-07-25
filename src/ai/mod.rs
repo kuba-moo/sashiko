@@ -631,7 +631,7 @@ pub mod token_budget;
 pub mod truncator;
 #[cfg(feature = "vertex")]
 pub mod vertex;
-pub use session::{ErrorAction, LlmSession, SessionRunner, ValidationError};
+pub use session::{ConversationDumper, ErrorAction, LlmSession, SessionRunner, ValidationError};
 
 /// Recursively removes AI-provider signatures and opaque reasoning blocks
 /// from a JSON value before the history is persisted or logged. Strips

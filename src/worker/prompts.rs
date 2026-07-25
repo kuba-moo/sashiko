@@ -14,7 +14,7 @@
 
 use crate::ai::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    ClassifyAiError, ErrorAction, LlmSession, SessionRunner, ValidationError,
+    ClassifyAiError, ConversationDumper, ErrorAction, LlmSession, SessionRunner, ValidationError,
 };
 use crate::toolbox::ToolBox;
 use crate::worker::stage::{ReviewStage, create_stage};
@@ -93,6 +93,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub dump_conversation: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +452,8 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    dump_conversation: Option<std::path::PathBuf>,
+    conversation_dumper: Option<Arc<ConversationDumper>>,
 }
 
 impl Worker {
@@ -470,6 +473,8 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            dump_conversation: config.dump_conversation,
+            conversation_dumper: None,
         }
     }
 
@@ -491,6 +496,13 @@ impl Worker {
             .map(|id| id.to_string())
             .unwrap_or_else(|| "multi".to_string());
         self.context_tag = Some(format!("[ps:{} p:{}] ", ps_id, p_id));
+
+        if let Some(base) = &self.dump_conversation {
+            match ConversationDumper::new(base).await {
+                Ok(dumper) => self.conversation_dumper = Some(Arc::new(dumper)),
+                Err(error) => warn!("Failed to initialize conversation dump: {}", error),
+            }
+        }
 
         let mut baseline_sha = "unknown".to_string();
         if let Some(ref range) = self.series_range {
@@ -1003,6 +1015,7 @@ Preserve the most precise location details from the input. Do not invent line nu
                 self.context_tag.as_deref(),
             );
             let runner = SessionRunner::new(self.provider.as_ref())
+                .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1161,6 +1174,7 @@ Example Output:
                 self.context_tag.as_deref(),
             );
             let runner = SessionRunner::new(self.provider.as_ref())
+                .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1279,6 +1293,7 @@ Example Output:
                 self.context_tag.as_deref(),
             );
             let runner = SessionRunner::new(self.provider.as_ref())
+                .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1361,6 +1376,7 @@ Example Output:
                 self.context_tag.as_deref(),
             );
             let runner = SessionRunner::new(self.provider.as_ref())
+                .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1442,6 +1458,11 @@ Example Output:
         }
 
         let retry_base = req.clone();
+        if let Some(dump) = &self.conversation_dumper
+            && let Err(error) = dump.write(label, 1, "req", &req).await
+        {
+            warn!("Failed to dump {} request: {}", label, error);
+        }
         let resp = match self.provider.generate_content(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1449,6 +1470,11 @@ Example Output:
                 return None;
             }
         };
+        if let Some(dump) = &self.conversation_dumper
+            && let Err(error) = dump.write(label, 1, "resp", &resp).await
+        {
+            warn!("Failed to dump {} response: {}", label, error);
+        }
         if resp.truncated {
             warn!("{} completion truncated by provider limit", label);
             return None;
@@ -1483,8 +1509,18 @@ Example Output:
                     tool_calls: None,
                     tool_call_id: None,
                 });
+                if let Some(dump) = &self.conversation_dumper
+                    && let Err(error) = dump.write(label, 2, "req", &retry_req).await
+                {
+                    warn!("Failed to dump {} retry request: {}", label, error);
+                }
                 match self.provider.generate_content(retry_req).await {
                     Ok(resp2) => {
+                        if let Some(dump) = &self.conversation_dumper
+                            && let Err(error) = dump.write(label, 2, "resp", &resp2).await
+                        {
+                            warn!("Failed to dump {} retry response: {}", label, error);
+                        }
                         if resp2.truncated {
                             warn!("{} retry completion truncated by provider limit", label);
                             return None;
@@ -1597,6 +1633,7 @@ Example:
         );
 
         let runner = SessionRunner::new(self.provider.as_ref())
+            .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage_num))
             .with_max_validation_attempts(3)
             .with_max_turns(self.max_interactions)
             .with_turn_callback(move |turn, max_turns| {
@@ -2124,6 +2161,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            dump_conversation: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2479,6 +2517,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: Some(vec![1]),
+            dump_conversation: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

@@ -14,7 +14,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
@@ -29,6 +32,43 @@ pub struct SessionResult<T> {
     pub history: Vec<AiMessage>,
     /// Accumulated token usage statistics.
     pub usage: AiUsage,
+}
+
+pub struct ConversationDumper {
+    directory: PathBuf,
+}
+
+impl ConversationDumper {
+    pub async fn new(base: &Path) -> Result<Self> {
+        let now = chrono::Utc::now();
+        let suffix: String = (0..4)
+            .map(|_| {
+                let index = fastrand::u8(0..36);
+                if index < 10 {
+                    (b'0' + index) as char
+                } else {
+                    (b'a' + index - 10) as char
+                }
+            })
+            .collect();
+        let directory = base.join(format!("{}-{}", now.format("%Y%m%d-%H%M"), suffix));
+        tokio::fs::create_dir_all(&directory).await?;
+        Ok(Self { directory })
+    }
+
+    pub async fn write<T: Serialize>(
+        &self,
+        label: &str,
+        turn: usize,
+        kind: &str,
+        value: &T,
+    ) -> Result<()> {
+        let path = self
+            .directory
+            .join(format!("{}_{:03}_{}.json", label, turn, kind));
+        tokio::fs::write(path, serde_json::to_vec_pretty(value)?).await?;
+        Ok(())
+    }
 }
 
 /// Result of validating a session's final response.
@@ -139,6 +179,7 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    conversation_dump: Option<(Arc<ConversationDumper>, String)>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -151,6 +192,7 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            conversation_dump: None,
         }
     }
 
@@ -184,6 +226,15 @@ impl<'a> SessionRunner<'a> {
         F: Fn(usize, usize) + Send + Sync + 'a,
     {
         self.on_turn = Some(Box::new(cb));
+        self
+    }
+
+    pub fn with_conversation_dump(
+        mut self,
+        dump: Option<Arc<ConversationDumper>>,
+        label: impl Into<String>,
+    ) -> Self {
+        self.conversation_dump = dump.map(|dump| (dump, label.into()));
         self
     }
 
@@ -237,6 +288,12 @@ impl<'a> SessionRunner<'a> {
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
             };
+
+            if let Some((dump, label)) = &self.conversation_dump
+                && let Err(error) = dump.write(label, turns, "req", &request).await
+            {
+                tracing::warn!("Failed to dump {} turn {} request: {}", label, turns, error);
+            }
 
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
@@ -292,6 +349,17 @@ impl<'a> SessionRunner<'a> {
                     }
                 },
             };
+
+            if let Some((dump, label)) = &self.conversation_dump
+                && let Err(error) = dump.write(label, turns, "resp", &resp).await
+            {
+                tracing::warn!(
+                    "Failed to dump {} turn {} response: {}",
+                    label,
+                    turns,
+                    error
+                );
+            }
 
             if resp.truncated {
                 anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");

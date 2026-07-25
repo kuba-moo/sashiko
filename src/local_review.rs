@@ -502,6 +502,7 @@ async fn review_single_patch(
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 stages: options.stages.clone(),
+                dump_conversation: ai.dump_conversation.as_ref().map(PathBuf::from),
             },
         );
 

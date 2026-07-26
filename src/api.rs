@@ -378,6 +378,7 @@ pub fn build_router(
         .route("/api/stats/reviews", get(stats_reviews))
         .route("/api/stats/tools", get(stats_tools))
         .route("/api/stats/cost", get(stats_cost))
+        .route("/api/stats/model-experiments", get(stats_model_experiments))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
@@ -1105,6 +1106,20 @@ async fn stats_cost(
         })
         .await?;
     Ok(Json(data))
+}
+
+async fn stats_model_experiments(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    state
+        .db
+        .get_model_experiment_stats()
+        .await
+        .map(Json)
+        .map_err(|error| {
+            info!("Error getting model experiment stats: {}", error);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn stats_reviews(

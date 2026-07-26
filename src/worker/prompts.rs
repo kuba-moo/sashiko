@@ -88,6 +88,7 @@ pub struct ReviewInput {
 }
 
 pub struct WorkerConfig {
+    pub main_model: String,
     pub max_input_tokens: usize,
     pub max_interactions: usize,
     pub temperature: f32,
@@ -97,6 +98,20 @@ pub struct WorkerConfig {
     pub dump_conversation: Option<std::path::PathBuf>,
     pub budget: Option<ReviewBudget>,
     pub retry_provider: Option<Arc<dyn AiProvider>>,
+    pub additional_models: Vec<AdditionalModelRunner>,
+    pub cohort: crate::ai::model_experiment::ReviewCohort,
+    pub validation_budget: Option<crate::ai::review_budget::BudgetConfig>,
+}
+
+#[derive(Clone)]
+pub struct AdditionalModelRunner {
+    pub name: String,
+    pub provider: Arc<dyn AiProvider>,
+    pub temperature: f32,
+    pub max_interactions: usize,
+    pub model_id: String,
+    pub provider_id: String,
+    pub budget: Option<ReviewBudget>,
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +337,8 @@ Your task is to deduplicate identical or overlapping items in both lists.
 7. SPECIFICITY REQUIREMENT: When merging concerns or dismissed_concerns, preserve and consolidate the most specific details: exact function names, file paths, line numbers when known, and triggering conditions. Never generalize a specific finding into a vague category.
 8. Preserve and merge the `locations` arrays from the input concerns and dismissed_concerns. If multiple items describe the same root cause, keep the most precise file/function_or_symbol/line/code_snippet/why_this_location_matters locations. Do not invent line numbers; keep `line` as null when the exact line is not known.
 9. For every concern, emit `source_stages` as the sorted, unique array of all input `source_stage` values merged into it. Preserve `source_stages` on unmerged concerns.
-10. dismissed_concerns do not need a `preexisting` flag."
+10. For every concern, emit `source_models` and `finding_ids` as sorted, unique arrays containing every value from the merged inputs. Preserve both arrays on unmerged concerns.
+11. dismissed_concerns do not need a `preexisting` flag."
             }
             9 => {
                 "# Stage 9. Concern/dismissed-concern conflict resolution
@@ -335,7 +351,7 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
 4. If there is no direct conflict for a concern, keep it unchanged.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, `locations`, and `source_stages` fields.
+6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, `locations`, `source_stages`, `source_models`, and `finding_ids` fields.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."
             }
             10 => {
@@ -499,6 +515,10 @@ pub struct Worker {
     conversation_dumper: Option<Arc<ConversationDumper>>,
     budget: Option<ReviewBudget>,
     retry_provider: Option<Arc<dyn AiProvider>>,
+    additional_models: Vec<AdditionalModelRunner>,
+    cohort: crate::ai::model_experiment::ReviewCohort,
+    validation_budget: Option<crate::ai::review_budget::BudgetConfig>,
+    main_model: String,
 }
 
 impl Worker {
@@ -522,6 +542,10 @@ impl Worker {
             conversation_dumper: None,
             budget: config.budget,
             retry_provider: config.retry_provider,
+            additional_models: config.additional_models,
+            cohort: config.cohort,
+            validation_budget: config.validation_budget,
+            main_model: config.main_model,
         }
     }
 
@@ -915,10 +939,38 @@ You MUST respond with ONLY a JSON object, no other text. Example:
 
             stage_futures.push(self.execute_stage(
                 stage,
-                system_prompt,
-                clean_system_prompt,
+                system_prompt.clone(),
+                clean_system_prompt.clone(),
                 progress,
+                StageExecutionConfig {
+                    provider: self.provider_for_budget(),
+                    name: "main".to_string(),
+                    temperature: self.temperature,
+                    max_interactions: self.max_interactions,
+                    model_id: self.main_model.clone(),
+                    provider_id: self.cohort.main.provider.clone(),
+                    budget: self.budget.clone(),
+                },
             ));
+
+            for model in &self.additional_models {
+                let variant_stage = create_stage(stage_num);
+                stage_futures.push(self.execute_stage(
+                    variant_stage,
+                    system_prompt.clone(),
+                    clean_system_prompt.clone(),
+                    progress,
+                    StageExecutionConfig {
+                        provider: model.provider.clone(),
+                        name: model.name.clone(),
+                        temperature: model.temperature,
+                        max_interactions: model.max_interactions,
+                        model_id: model.model_id.clone(),
+                        provider_id: model.provider_id.clone(),
+                        budget: model.budget.clone(),
+                    },
+                ));
+            }
         }
 
         // Run planned stages concurrently
@@ -927,17 +979,21 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             stage_futures.len()
         );
         let stage_results = futures::future::try_join_all(stage_futures).await?;
+        let mut experiment_runs = Vec::new();
 
         // Consolidate results in deterministic order (already preserved by try_join_all)
         for res in stage_results {
-            total_tokens_in += res.tokens_in;
-            total_tokens_out += res.tokens_out;
-            total_tokens_cached += res.tokens_cached;
+            if res.model == "main" {
+                total_tokens_in += res.tokens_in;
+                total_tokens_out += res.tokens_out;
+                total_tokens_cached += res.tokens_cached;
+            }
 
             append_stage_items(
                 &mut all_concerns,
                 &res.concerns,
                 res.stage,
+                &res.model,
                 "General",
                 "description",
             );
@@ -945,7 +1001,20 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 &mut all_dismissed_concerns,
                 &res.dismissed_concerns,
                 res.stage,
+                &res.model,
             );
+
+            experiment_runs.push(json!({
+                "model": res.model,
+                "model_id": res.model_id,
+                "provider_id": res.provider_id,
+                "stage": res.stage,
+                "tokens_in": res.tokens_in,
+                "tokens_out": res.tokens_out,
+                "tokens_cached": res.tokens_cached,
+                "status": if res.failed { "failed" } else { "completed" },
+                "error": res.error,
+            }));
 
             // Append history in order
             self.global_history.extend(res.history);
@@ -963,6 +1032,11 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
                 "dismissed_concerns_count": dismissed_concerns_count
                 ,"dedup_stats": dedup_stats(0, &json!([]))
+                ,"model_experiment": {
+                    "cohort": &self.cohort,
+                    "runs": experiment_runs,
+                    "comparisons": []
+                }
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1005,6 +1079,7 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages".
+Each concern MUST also preserve and merge "source_models" and "finding_ids" from all matching input concerns.
 Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations".
 Preserve the most precise location details from the input. Do not invent line numbers; use null when exact values are unknown.
 
@@ -1075,6 +1150,7 @@ Preserve the most precise location details from the input. Do not invent line nu
                 self.temperature,
                 self.context_tag.as_deref(),
             );
+            session.require_provenance(all_concerns.clone(), true, "concerns");
             let provider = self.provider_for_budget();
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
@@ -1105,6 +1181,9 @@ Preserve the most precise location details from the input. Do not invent line nu
             progress_cb(WorkerProgressEvent::StageFinished { stage: 8 });
         }
 
+        let mut comparisons = Vec::new();
+        let mut confirmation_runs = Vec::new();
+
         if let Some(c) = deduplicated_concerns.as_array()
             && c.is_empty()
         {
@@ -1122,6 +1201,12 @@ Preserve the most precise location details from the input. Do not invent line nu
                     .as_array()
                     .map_or(0, Vec::len),
                 "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
+                ,"model_experiment": {
+                    "cohort": &self.cohort,
+                    "runs": experiment_runs,
+                    "comparisons": comparisons,
+                    "confirmation_runs": confirmation_runs
+                }
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1161,7 +1246,7 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages".
+Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages", "source_models", "finding_ids". Preserve source_models and finding_ids unchanged.
 Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
@@ -1198,7 +1283,7 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages".
+Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages", "source_models", "finding_ids". Preserve source_models and finding_ids unchanged.
 Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
@@ -1237,6 +1322,14 @@ Example Output:
                 self.tools.clone(),
                 self.temperature,
                 self.context_tag.as_deref(),
+            );
+            session.require_provenance(
+                deduplicated_concerns
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                false,
+                "concerns",
             );
             let provider = self.provider_for_budget();
             let runner = SessionRunner::new(provider.as_ref())
@@ -1283,6 +1376,12 @@ Example Output:
                     .as_array()
                     .map_or(0, Vec::len),
                 "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
+                ,"model_experiment": {
+                    "cohort": &self.cohort,
+                    "runs": experiment_runs,
+                    "comparisons": comparisons,
+                    "confirmation_runs": confirmation_runs
+                }
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1302,10 +1401,17 @@ Example Output:
             progress_cb(WorkerProgressEvent::StageStarted { stage: 10 });
         }
         info!("Running Stage 10 (Verification)");
-        let findings_json;
+        let mut findings_json;
+        let mut baseline_decisions = std::collections::BTreeMap::new();
         {
             let stage = 10;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
+            let (mut stage_prompt, mut clean_stage_prompt) =
+                self.prompts.get_stage_prompt(stage).await?;
+            if self.cohort.selected_variants().next().is_some() {
+                let guidance = "\n\nMODEL EXPERIMENT: Apply the normal verification rules to every concern and return a top-level baseline_decisions object mapping the first finding_ids value of every input concern to the boolean result. Also retain every concern with requires_validation=true in findings even when its baseline decision is false; a separate validation policy will combine the baseline and independent model decisions. Concerns with requires_validation=false appear in findings only when their baseline decision is true.";
+                stage_prompt.push_str(guidance);
+                clean_stage_prompt.push_str(guidance);
+            }
             let system_prompt = shared_context.clone();
 
             let full_series_context = if let Some(range) = &self.series_range {
@@ -1339,17 +1445,24 @@ Example Output:
                 "Not applicable (single patch or last patch in series).".to_string()
             };
 
+            let severity_input = annotate_validation_candidates(
+                &conflict_resolved_concerns,
+                &self.cohort,
+                &experiment_runs,
+            );
             let conflict_resolved_concerns_json =
-                serde_json::to_string_pretty(&conflict_resolved_concerns).unwrap_or_default();
-            let user_prompt = format!(
+                serde_json::to_string_pretty(&severity_input).unwrap_or_default();
+            let mut user_prompt = format!(
                 "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and \"source_stages\" (the unchanged array from the validated concern). Carry forward the locations and source_stages from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ],\n      \"source_stages\": [3, 4]\n    }}\n  ]\n}}\n```",
                 stage_prompt, full_series_context, conflict_resolved_concerns_json
             );
+            user_prompt.push_str("\n\nPROVENANCE REQUIREMENT: Every finding must also include source_models, finding_ids, and requires_validation copied unchanged from its input concern. These fields are required despite any earlier exact-key list.");
 
-            let clean_user_prompt = format!(
+            let mut clean_user_prompt = format!(
                 "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{{{{series context}}}}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"preexisting\" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and \"source_stages\" (the unchanged array from the validated concern). Carry forward the locations and source_stages from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\\n2. The buffer is allocated but not freed before return.\",\n      \"preexisting\": false,\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ],\n      \"source_stages\": [3, 4]\n    }}\n  ]\n}}\n```",
                 clean_stage_prompt, conflict_resolved_concerns_json
             );
+            clean_user_prompt.push_str("\n\nPROVENANCE REQUIREMENT: Every finding must also include source_models, finding_ids, and requires_validation copied unchanged from its input concern. These fields are required despite any earlier exact-key list.");
 
             let stage_impl = create_stage(stage);
             let mut session = ReviewStageSession::new(
@@ -1360,6 +1473,23 @@ Example Output:
                 self.tools.clone(),
                 self.temperature,
                 self.context_tag.as_deref(),
+            );
+            if self.cohort.selected_variants().next().is_some() {
+                session.require_baseline_decisions(
+                    severity_input
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item["finding_ids"].as_array()?.first()?.as_str())
+                        .map(str::to_string)
+                        .collect(),
+                );
+                session.require_experiment_findings(severity_input.clone());
+            }
+            session.require_provenance(
+                severity_input.as_array().cloned().unwrap_or_default(),
+                false,
+                "findings",
             );
             let provider = self.provider_for_budget();
             let runner = SessionRunner::new(provider.as_ref())
@@ -1384,7 +1514,24 @@ Example Output:
             self.global_history.extend(result.history);
 
             findings_json = result.output.get("findings").unwrap().clone();
+            if self.cohort.selected_variants().next().is_some() {
+                baseline_decisions = validate_baseline_decisions(
+                    &severity_input,
+                    result.output.get("baseline_decisions"),
+                )?;
+            }
         }
+        let (confirmed, completed_comparisons, completed_confirmation_runs) = self
+            .confirm_unique_findings(
+                &shared_context,
+                &findings_json,
+                &experiment_runs,
+                &baseline_decisions,
+            )
+            .await?;
+        findings_json = confirmed;
+        comparisons = completed_comparisons;
+        confirmation_runs = completed_confirmation_runs;
         if let Some(progress_cb) = progress {
             progress_cb(WorkerProgressEvent::StageFinished { stage: 10 });
         }
@@ -1404,6 +1551,12 @@ Example Output:
                     .as_array()
                     .map_or(0, Vec::len),
                 "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
+                ,"model_experiment": {
+                    "cohort": &self.cohort,
+                    "runs": experiment_runs,
+                    "comparisons": comparisons,
+                    "confirmation_runs": confirmation_runs
+                }
             });
             return Ok(WorkerResult {
                 output: Some(final_output),
@@ -1490,6 +1643,12 @@ Example Output:
             "dismissed_concerns_count": dismissed_concerns_count
             ,"budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
             "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
+            ,"model_experiment": {
+                "cohort": &self.cohort,
+                "runs": experiment_runs,
+                "comparisons": comparisons,
+                "confirmation_runs": confirmation_runs
+            }
         });
 
         Ok(WorkerResult {
@@ -1631,6 +1790,7 @@ Example Output:
         system_prompt: String,
         _clean_system_prompt: String,
         progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+        config: StageExecutionConfig,
     ) -> Result<StageExecutionResult> {
         let stage_num = stage.number();
         if let Some(progress_cb) = progress {
@@ -1707,16 +1867,18 @@ Example:
             user_prompt,
             clean_user_prompt,
             self.tools.clone(),
-            self.temperature,
+            config.temperature,
             self.context_tag.as_deref(),
         );
 
-        let provider = self.provider_for_budget();
-        let runner = SessionRunner::new(provider.as_ref())
-            .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage_num))
-            .with_budget(self.budget.clone())
+        let runner = SessionRunner::new(config.provider.as_ref())
+            .with_conversation_dump(
+                self.conversation_dumper.clone(),
+                format!("{}-s{}", config.name, stage_num),
+            )
+            .with_budget(config.budget)
             .with_max_validation_attempts(3)
-            .with_max_turns(self.max_interactions)
+            .with_max_turns(config.max_interactions)
             .with_turn_callback(move |turn, max_turns| {
                 if let Some(progress_cb) = progress {
                     progress_cb(WorkerProgressEvent::StageTurn {
@@ -1727,7 +1889,30 @@ Example:
                 }
             });
 
-        let result = runner.run(&mut session).await?;
+        let result = match runner.run(&mut session).await {
+            Ok(result) => result,
+            Err(error) if config.name != "main" => {
+                warn!(
+                    "Experiment model {} failed stage {}: {}",
+                    config.name, stage_num, error
+                );
+                return Ok(StageExecutionResult {
+                    stage: stage_num,
+                    model: config.name,
+                    model_id: config.model_id,
+                    provider_id: config.provider_id,
+                    concerns: Vec::new(),
+                    dismissed_concerns: Vec::new(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    tokens_cached: 0,
+                    history: Vec::new(),
+                    failed: true,
+                    error: Some(error.to_string()),
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         let mut concerns_out = Vec::new();
         let mut dismissed_concerns_out = Vec::new();
@@ -1749,24 +1934,578 @@ Example:
 
         Ok(StageExecutionResult {
             stage: stage_num,
+            model: config.name,
+            model_id: config.model_id,
+            provider_id: config.provider_id,
             concerns: concerns_out,
             dismissed_concerns: dismissed_concerns_out,
             tokens_in: result.usage.prompt_tokens as u32,
             tokens_out: result.usage.completion_tokens as u32,
             tokens_cached: result.usage.cached_tokens.unwrap_or(0) as u32,
             history: result.history,
+            failed: false,
+            error: None,
         })
     }
+
+    async fn confirm_unique_findings(
+        &self,
+        shared_context: &str,
+        concerns: &Value,
+        experiment_runs: &[Value],
+        baseline_decisions: &std::collections::BTreeMap<String, bool>,
+    ) -> Result<(Value, Vec<Value>, Vec<Value>)> {
+        use std::collections::BTreeMap;
+
+        let Some(items) = concerns.as_array() else {
+            return Ok((concerns.clone(), Vec::new(), Vec::new()));
+        };
+        let mut batches: BTreeMap<String, Vec<ConfirmationTarget>> = BTreeMap::new();
+        let mut comparisons = Vec::new();
+        let model_ids: BTreeMap<&str, &str> = self
+            .additional_models
+            .iter()
+            .map(|model| (model.name.as_str(), model.model_id.as_str()))
+            .collect();
+        let provider_ids: BTreeMap<&str, &str> = self
+            .additional_models
+            .iter()
+            .map(|model| (model.name.as_str(), model.provider_id.as_str()))
+            .collect();
+
+        for (index, concern) in items.iter().enumerate() {
+            let models: Vec<&str> = concern["source_models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let finding_id = concern["finding_ids"]
+                .as_array()
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let severity = concern["severity"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let source_stages: Vec<u64> = concern["source_stages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_u64)
+                .collect();
+            let ran_models: Vec<&str> = experiment_runs
+                .iter()
+                .filter(|run| run["status"].as_str() == Some("completed"))
+                .filter(|run| {
+                    run["stage"]
+                        .as_u64()
+                        .is_some_and(|stage| source_stages.contains(&stage))
+                })
+                .filter_map(|run| run["model"].as_str())
+                .filter(|model| *model != "main")
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if models.len() > 1 {
+                if models.contains(&"main") {
+                    for model in &ran_models {
+                        comparisons.push(json!({
+                            "finding_id": finding_id,
+                            "additional_model": model,
+                            "main_model_id": self.main_model,
+                            "additional_model_id": model_ids.get(model).copied().unwrap_or("unknown"),
+                            "main_provider_id": self.cohort.main.provider,
+                            "additional_provider_id": provider_ids.get(model).copied().unwrap_or("unknown"),
+                            "outcome": if models.contains(model) { "both" } else { "main_only" },
+                            "severity": severity,
+                        }));
+                    }
+                } else {
+                    for model in models {
+                        comparisons.push(json!({
+                            "finding_id": finding_id,
+                            "additional_model": model,
+                            "main_model_id": self.main_model,
+                            "additional_model_id": model_ids.get(model).copied().unwrap_or("unknown"),
+                            "main_provider_id": self.cohort.main.provider,
+                            "additional_provider_id": provider_ids.get(model).copied().unwrap_or("unknown"),
+                            "outcome": "additional_only",
+                            "severity": severity,
+                        }));
+                    }
+                }
+                continue;
+            }
+            let discoverer = models.first().copied().unwrap_or("main");
+            let confirmer = if discoverer == "main" {
+                ran_models.first().copied()
+            } else {
+                Some("main")
+            };
+            if let Some(confirmer) = confirmer {
+                batches
+                    .entry(confirmer.to_string())
+                    .or_default()
+                    .push(ConfirmationTarget {
+                        index,
+                        finding_id,
+                        discoverer: discoverer.to_string(),
+                        compared_models: if discoverer == "main" {
+                            ran_models
+                                .iter()
+                                .map(|model| (*model).to_string())
+                                .collect()
+                        } else {
+                            vec![discoverer.to_string()]
+                        },
+                    });
+            }
+        }
+
+        let mut accepted = vec![true; items.len()];
+        let mut confirmation_runs = Vec::new();
+        for (confirmer, batch) in batches {
+            let (provider, confirmer_model_id, confirmer_provider_id) = if confirmer == "main" {
+                (
+                    Arc::new(crate::ai::model_experiment::RoutedProvider::new(
+                        self.provider.clone(),
+                        "main",
+                    )) as Arc<dyn AiProvider>,
+                    self.main_model.as_str(),
+                    self.cohort.main.provider.as_str(),
+                )
+            } else {
+                let model = self
+                    .additional_models
+                    .iter()
+                    .find(|model| model.name == confirmer)
+                    .ok_or_else(|| anyhow::anyhow!("Missing confirmer provider: {confirmer}"))?;
+                (
+                    model.provider.clone(),
+                    model.model_id.as_str(),
+                    model.provider_id.as_str(),
+                )
+            };
+            let payload: Vec<Value> = batch
+                .iter()
+                .map(|target| {
+                    json!({"finding_id": target.finding_id, "finding": items[target.index]})
+                })
+                .collect();
+            let prompt = format!(
+                "{shared_context}\n\nYou are the false-positive confirmation reviewer. Independently verify every finding below against the patch and supplied code context. Return one boolean for every finding ID: true only when the issue is real and actionable, false when it is unsupported or incorrect.\n\nFindings:\n{}",
+                serde_json::to_string_pretty(&payload)?
+            );
+            let request = AiRequest {
+                system: None,
+                messages: vec![AiMessage {
+                    role: AiRole::User,
+                    content: Some(prompt),
+                    thought: None,
+                    thought_signature: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+                tools: None,
+                temperature: Some(0.0),
+                response_format: Some(AiResponseFormat::Json { schema: None }),
+                context_tag: self.context_tag.clone(),
+            };
+            let expected_ids: Vec<&str> = batch
+                .iter()
+                .map(|target| target.finding_id.as_str())
+                .collect();
+            let validation_budget = self.validation_budget.map(ReviewBudget::new);
+            let (decision_result, (tokens_in, tokens_out, tokens_cached)) = request_confirmation(
+                provider.as_ref(),
+                request,
+                &expected_ids,
+                validation_budget.as_ref(),
+            )
+            .await;
+            let budget_snapshot = validation_budget.as_ref().map(ReviewBudget::snapshot);
+            let decisions = match decision_result {
+                Ok(decisions) => decisions,
+                Err(error) => {
+                    warn!("Confirmation model {} failed: {}", confirmer, error);
+                    for target in &batch {
+                        if target.discoverer == "main" {
+                            accepted[target.index] = baseline_decisions
+                                .get(&target.finding_id)
+                                .copied()
+                                .unwrap_or(true);
+                        } else {
+                            accepted[target.index] = false;
+                        }
+                    }
+                    confirmation_runs.push(json!({
+                        "model": confirmer,
+                        "model_id": confirmer_model_id,
+                        "provider_id": confirmer_provider_id,
+                        "status": "failed",
+                        "error": error.to_string(),
+                        "tokens_in": tokens_in,
+                        "tokens_out": tokens_out,
+                        "tokens_cached": tokens_cached,
+                        "budget_input": budget_snapshot.map(|snapshot| snapshot.input).unwrap_or(0),
+                        "budget_output": budget_snapshot.map(|snapshot| snapshot.output).unwrap_or(0),
+                        "budget_flags": budget_snapshot.map(|snapshot| snapshot.flags).unwrap_or(0),
+                    }));
+                    continue;
+                }
+            };
+            for target in batch {
+                let confirmed = decisions[&target.finding_id].as_bool().unwrap_or(false);
+                accepted[target.index] = confirmed;
+                let outcome = match (target.discoverer.as_str() == "main", confirmed) {
+                    (true, true) => "main_only",
+                    (true, false) => "main_hallucination",
+                    (false, true) => "additional_only",
+                    (false, false) => "additional_hallucination",
+                };
+                for additional_model in target.compared_models {
+                    comparisons.push(json!({
+                        "finding_id": target.finding_id,
+                        "additional_model": additional_model,
+                        "main_model_id": self.main_model,
+                        "additional_model_id": model_ids.get(additional_model.as_str()).copied().unwrap_or("unknown"),
+                        "main_provider_id": self.cohort.main.provider,
+                        "additional_provider_id": provider_ids.get(additional_model.as_str()).copied().unwrap_or("unknown"),
+                        "outcome": outcome,
+                        "confirmed_by": confirmer,
+                        "severity": items[target.index]["severity"].as_str().unwrap_or("unknown"),
+                    }));
+                }
+            }
+            confirmation_runs.push(json!({
+                "model": confirmer,
+                "model_id": confirmer_model_id,
+                "provider_id": confirmer_provider_id,
+                "status": "completed",
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "tokens_cached": tokens_cached,
+                "budget_input": budget_snapshot.map(|snapshot| snapshot.input).unwrap_or(0),
+                "budget_output": budget_snapshot.map(|snapshot| snapshot.output).unwrap_or(0),
+                "budget_flags": budget_snapshot.map(|snapshot| snapshot.flags).unwrap_or(0),
+            }));
+        }
+
+        let filtered: Vec<Value> = items
+            .iter()
+            .zip(accepted)
+            .filter(|(_, accepted)| *accepted)
+            .map(|(item, _)| item.clone())
+            .collect();
+        Ok((json!(filtered), comparisons, confirmation_runs))
+    }
+}
+
+async fn request_confirmation(
+    provider: &dyn AiProvider,
+    request: AiRequest,
+    expected_ids: &[&str],
+    budget: Option<&ReviewBudget>,
+) -> (Result<Value>, (usize, usize, usize)) {
+    let mut last_error = None;
+    let mut tokens = (0, 0, 0);
+    for _ in 0..2 {
+        let estimated_input = provider.estimate_tokens(&request);
+        if budget.is_some_and(|budget| !budget.allows(estimated_input, 0)) {
+            return (
+                Err(anyhow::anyhow!(
+                    "validation input estimate exceeds the confirmation budget"
+                )),
+                tokens,
+            );
+        }
+        match provider.generate_content(request.clone()).await {
+            Ok(response) => {
+                if let Some(usage) = &response.usage {
+                    let within_budget = budget.is_none_or(|budget| {
+                        budget.allows(usage.prompt_tokens, usage.completion_tokens)
+                    });
+                    tokens.0 += usage.prompt_tokens;
+                    tokens.1 += usage.completion_tokens;
+                    tokens.2 += usage.cached_tokens.unwrap_or(0);
+                    if let Some(budget) = budget {
+                        let mut flags = 0;
+                        budget.record_and_check(
+                            &mut flags,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                        );
+                    }
+                    if !within_budget {
+                        return (
+                            Err(anyhow::anyhow!(
+                                "confirmation usage exceeded the validation budget"
+                            )),
+                            tokens,
+                        );
+                    }
+                }
+                let content = response.content.as_deref().unwrap_or("{}");
+                let cleaned = crate::utils::clean_json_string(content);
+                match serde_json::from_str::<Value>(&cleaned) {
+                    Ok(decisions) => {
+                        match validate_confirmation_decisions(&decisions, expected_ids) {
+                            Ok(()) => return (Ok(decisions), tokens),
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    Err(error) => last_error = Some(error.into()),
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    (
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("confirmation request failed"))),
+        tokens,
+    )
+}
+
+fn validate_confirmation_decisions(decisions: &Value, expected_ids: &[&str]) -> Result<()> {
+    let object = decisions
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("confirmation response is not an object"))?;
+    let expected: std::collections::BTreeSet<&str> = expected_ids.iter().copied().collect();
+    let actual: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    if actual != expected || object.values().any(|decision| !decision.is_boolean()) {
+        anyhow::bail!(
+            "confirmation response must contain exactly one boolean for every requested finding"
+        );
+    }
+    Ok(())
+}
+
+fn provenance_map(items: &[Value]) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let mut provenance = std::collections::BTreeMap::new();
+    for item in items {
+        let model_values = item["source_models"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing source_models"))?;
+        let models: Vec<String> = model_values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if models.len() != model_values.len()
+            || models
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != models.len()
+        {
+            return Err(anyhow::anyhow!(
+                "source_models contains duplicate or non-string entries"
+            ));
+        }
+        let ids = item["finding_ids"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing finding_ids"))?;
+        for id in ids.iter().filter_map(Value::as_str) {
+            if provenance.insert(id.to_string(), models.clone()).is_some() {
+                return Err(anyhow::anyhow!("duplicate finding ID: {id}"));
+            }
+        }
+    }
+    Ok(provenance)
+}
+
+fn validate_provenance(inputs: &[Value], outputs: &Value, require_all: bool) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let input = provenance_map(inputs)?;
+    let output_items = outputs
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("provenance output is not an array"))?;
+    let mut seen = BTreeSet::new();
+    for output in output_items {
+        let ids: Vec<&str> = output["finding_ids"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing finding_ids"))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let actual_models: BTreeSet<&str> = output["source_models"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing source_models"))?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        if actual_models.len() != output["source_models"].as_array().map_or(0, Vec::len) {
+            return Err(ReviewError::FormatRejection(
+                "source_models contains duplicate or non-string entries".to_string(),
+            )
+            .into());
+        }
+        let mut expected_models = BTreeSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(ReviewError::FormatRejection(format!(
+                    "finding ID {id} appears more than once"
+                ))
+                .into());
+            }
+            let models = input
+                .get(id)
+                .ok_or_else(|| ReviewError::FormatRejection(format!("unknown finding ID {id}")))?;
+            expected_models.extend(models.iter().map(String::as_str));
+        }
+        if actual_models != expected_models {
+            return Err(ReviewError::FormatRejection(
+                "source_models does not match the finding ID provenance".to_string(),
+            )
+            .into());
+        }
+    }
+    if require_all && seen.len() != input.len() {
+        return Err(ReviewError::FormatRejection(
+            "deduplication dropped one or more finding IDs".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn annotate_validation_candidates(
+    concerns: &Value,
+    cohort: &crate::ai::model_experiment::ReviewCohort,
+    runs: &[Value],
+) -> Value {
+    let mut marked = concerns.clone();
+    for concern in marked.as_array_mut().into_iter().flatten() {
+        let models: Vec<&str> = concern["source_models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let stages: Vec<u64> = concern["source_stages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
+        let variant_ran = runs.iter().any(|run| {
+            run["status"].as_str() == Some("completed")
+                && run["model"]
+                    .as_str()
+                    .is_some_and(|model| cohort.contains(model))
+                && run["stage"]
+                    .as_u64()
+                    .is_some_and(|stage| stages.contains(&stage))
+        });
+        let keep =
+            models.len() > 1 || models.first().is_some_and(|model| *model != "main") || variant_ran;
+        if let Some(object) = concern.as_object_mut() {
+            object.insert("requires_validation".to_string(), json!(keep));
+        }
+    }
+    marked
+}
+
+fn validate_required_experiment_findings(inputs: &Value, outputs: &Value) -> Result<()> {
+    let required: std::collections::BTreeSet<&str> = inputs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["requires_validation"].as_bool() == Some(true))
+        .flat_map(|item| item["finding_ids"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    let present: std::collections::BTreeSet<&str> = outputs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|item| item["finding_ids"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    if !required.is_subset(&present) {
+        return Err(ReviewError::FormatRejection(
+            "severity estimation dropped a required experiment finding".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_baseline_decisions(
+    inputs: &Value,
+    decisions: Option<&Value>,
+) -> Result<std::collections::BTreeMap<String, bool>> {
+    let expected: std::collections::BTreeSet<&str> = inputs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["finding_ids"].as_array()?.first()?.as_str())
+        .collect();
+    let object = decisions
+        .and_then(Value::as_object)
+        .ok_or_else(|| ReviewError::FormatRejection("missing baseline_decisions object".into()))?;
+    let actual: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    if actual != expected {
+        return Err(ReviewError::FormatRejection(
+            "baseline_decisions must contain exactly one entry for every input concern".into(),
+        )
+        .into());
+    }
+    object
+        .iter()
+        .map(|(id, decision)| {
+            decision
+                .as_bool()
+                .map(|decision| (id.clone(), decision))
+                .ok_or_else(|| {
+                    ReviewError::FormatRejection(format!(
+                        "baseline decision for {id} is not a boolean"
+                    ))
+                    .into()
+                })
+        })
+        .collect()
 }
 
 struct StageExecutionResult {
     stage: u8,
+    model: String,
+    model_id: String,
+    provider_id: String,
     concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
     tokens_in: u32,
     tokens_out: u32,
     tokens_cached: u32,
     history: Vec<AiMessage>,
+    failed: bool,
+    error: Option<String>,
+}
+
+struct StageExecutionConfig {
+    provider: Arc<dyn AiProvider>,
+    name: String,
+    temperature: f32,
+    max_interactions: usize,
+    model_id: String,
+    provider_id: String,
+    budget: Option<ReviewBudget>,
+}
+
+struct ConfirmationTarget {
+    index: usize,
+    finding_id: String,
+    discoverer: String,
+    compared_models: Vec<String>,
 }
 
 pub fn calculate_series_range(
@@ -1805,18 +2544,31 @@ fn append_stage_items(
     target: &mut Vec<Value>,
     items: &[Value],
     stage: u8,
+    model: &str,
     default_type: &str,
     default_text_key: &str,
 ) {
     for item in items {
-        if let Some(item) = normalize_stage_item(item, stage, default_type, default_text_key) {
+        if let Some(mut item) = normalize_stage_item(item, stage, default_type, default_text_key) {
+            if let Some(object) = item.as_object_mut() {
+                object.insert("source_models".to_string(), json!([model]));
+                object.insert(
+                    "finding_ids".to_string(),
+                    json!([format!("{}-{}-{}", model, stage, target.len())]),
+                );
+            }
             target.push(item);
         }
     }
 }
 
-fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: u8) {
-    append_stage_items(target, items, stage, "General", "description");
+fn append_stage_dismissed_concerns(
+    target: &mut Vec<Value>,
+    items: &[Value],
+    stage: u8,
+    model: &str,
+) {
+    append_stage_items(target, items, stage, model, "General", "description");
 }
 
 fn normalize_stage_item(
@@ -1850,6 +2602,9 @@ struct ReviewStageSession {
     context_tag: Option<String>,
     last_tool_call: Option<(String, Value)>,
     recitation_retries: usize,
+    required_baseline_ids: Option<std::collections::BTreeSet<String>>,
+    required_provenance: Option<(Vec<Value>, bool, &'static str)>,
+    required_experiment_findings: Option<Value>,
 }
 
 impl ReviewStageSession {
@@ -1880,7 +2635,27 @@ impl ReviewStageSession {
             context_tag,
             last_tool_call: None,
             recitation_retries: 0,
+            required_baseline_ids: None,
+            required_provenance: None,
+            required_experiment_findings: None,
         }
+    }
+
+    fn require_baseline_decisions(&mut self, ids: std::collections::BTreeSet<String>) {
+        self.required_baseline_ids = Some(ids);
+    }
+
+    fn require_provenance(
+        &mut self,
+        inputs: Vec<Value>,
+        require_all: bool,
+        output_key: &'static str,
+    ) {
+        self.required_provenance = Some((inputs, require_all, output_key));
+    }
+
+    fn require_experiment_findings(&mut self, inputs: Value) {
+        self.required_experiment_findings = Some(inputs);
     }
 }
 
@@ -1996,7 +2771,43 @@ impl LlmSession for ReviewStageSession {
     }
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
-        self.stage.validate(response)
+        let output = self.stage.validate(response)?;
+        if let Some(expected) = &self.required_baseline_ids {
+            let decisions = output
+                .get("baseline_decisions")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    ValidationError::FormatViolation(
+                        "missing baseline_decisions object".to_string(),
+                    )
+                })?;
+            let actual: std::collections::BTreeSet<String> = decisions.keys().cloned().collect();
+            if &actual != expected || decisions.values().any(|decision| !decision.is_boolean()) {
+                return Err(ValidationError::FormatViolation(
+                    "baseline_decisions must contain one boolean for every input concern"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some((inputs, require_all, output_key)) = &self.required_provenance {
+            let outputs = output.get(*output_key).ok_or_else(|| {
+                ValidationError::FormatViolation(format!("missing {output_key} output"))
+            })?;
+            validate_provenance(inputs, outputs, *require_all).map_err(|error| {
+                ValidationError::FormatViolation(format!("invalid finding provenance: {error}"))
+            })?;
+        }
+        if let Some(inputs) = &self.required_experiment_findings {
+            let outputs = output.get("findings").ok_or_else(|| {
+                ValidationError::FormatViolation("missing findings output".to_string())
+            })?;
+            validate_required_experiment_findings(inputs, outputs).map_err(|error| {
+                ValidationError::FormatViolation(format!(
+                    "missing required experiment finding: {error}"
+                ))
+            })?;
+        }
+        Ok(output)
     }
 
     fn handle_provider_error(&mut self, error: &anyhow::Error, _attempt: usize) -> ErrorAction {
@@ -2029,6 +2840,366 @@ impl LlmSession for ReviewStageSession {
 mod tests {
     use super::*;
 
+    fn test_cohort() -> crate::ai::model_experiment::ReviewCohort {
+        crate::ai::model_experiment::ReviewCohort {
+            main: crate::ai::model_experiment::SourceIdentity {
+                name: "main".to_string(),
+                provider: "test".to_string(),
+                model: "mock".to_string(),
+            },
+            variants: Vec::new(),
+        }
+    }
+
+    fn test_variant_cohort() -> crate::ai::model_experiment::ReviewCohort {
+        let mut cohort = test_cohort();
+        cohort
+            .variants
+            .push(crate::ai::model_experiment::CohortMember {
+                source: crate::ai::model_experiment::SourceIdentity {
+                    name: "variant".to_string(),
+                    provider: "test".to_string(),
+                    model: "variant-model".to_string(),
+                },
+                selected: true,
+            });
+        cohort
+    }
+
+    struct ConfirmationProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct FailingConfirmationProvider;
+
+    #[async_trait::async_trait]
+    impl AiProvider for FailingConfirmationProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            anyhow::bail!("confirmation unavailable")
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "failing-confirmation".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for ConfirmationProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some(if call == 0 {
+                    json!({"a": true}).to_string()
+                } else {
+                    json!({"a": true, "b": false}).to_string()
+                }),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 1,
+                    total_tokens: 11,
+                    cached_tokens: None,
+                    cache_write_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            10
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "confirmation-mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmation_retries_incomplete_mappings() {
+        let provider = ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = AiRequest {
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+        let (decisions, _) = request_confirmation(&provider, request, &["a", "b"], None).await;
+        let decisions = decisions.unwrap();
+        assert_eq!(decisions["b"], false);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn confirmation_retry_cannot_exceed_its_review_budget() {
+        let provider = ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = AiRequest {
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+        let budget = ReviewBudget::new(crate::ai::review_budget::BudgetConfig {
+            stage_input: 100,
+            stage_output: 100,
+            review_input: 15,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+            enforce_hard_limits: true,
+        });
+
+        let (decisions, tokens) =
+            request_confirmation(&provider, request, &["a", "b"], Some(&budget)).await;
+
+        assert!(decisions.is_err());
+        assert_eq!(tokens.0, 10);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_discoveries_are_not_confirmed_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let variant = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = Worker::new(
+            main.clone(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                retry_provider: None,
+                additional_models: vec![AdditionalModelRunner {
+                    name: "variant".to_string(),
+                    provider: variant.clone(),
+                    temperature: 0.0,
+                    max_interactions: 2,
+                    model_id: "model-b".to_string(),
+                    provider_id: "test".to_string(),
+                    budget: None,
+                }],
+                cohort: crate::ai::model_experiment::ReviewCohort {
+                    main: crate::ai::model_experiment::SourceIdentity {
+                        name: "main".to_string(),
+                        provider: "test".to_string(),
+                        model: "model-a".to_string(),
+                    },
+                    variants: vec![crate::ai::model_experiment::CohortMember {
+                        source: crate::ai::model_experiment::SourceIdentity {
+                            name: "variant".to_string(),
+                            provider: "test".to_string(),
+                            model: "model-b".to_string(),
+                        },
+                        selected: true,
+                    }],
+                },
+                validation_budget: None,
+            },
+        );
+        let findings = json!([{
+            "finding_ids": ["main-3-0", "variant-3-0"],
+            "source_models": ["main", "variant"],
+            "source_stages": [3],
+            "severity": "High"
+        }]);
+        let runs = json!([
+            {"model": "main", "stage": 3, "status": "completed"},
+            {"model": "variant", "stage": 3, "status": "completed"}
+        ]);
+        let (accepted, comparisons, confirmation_runs) = worker
+            .confirm_unique_findings(
+                "context",
+                &findings,
+                runs.as_array().unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.as_array().unwrap().len(), 1);
+        assert_eq!(comparisons[0]["outcome"], "both");
+        assert!(confirmation_runs.is_empty());
+        assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(variant.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_confirmation_uses_the_main_baseline_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = Worker::new(
+            main.clone(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                retry_provider: None,
+                additional_models: vec![AdditionalModelRunner {
+                    name: "variant".to_string(),
+                    provider: Arc::new(FailingConfirmationProvider),
+                    temperature: 0.0,
+                    max_interactions: 2,
+                    model_id: "model-b".to_string(),
+                    provider_id: "test".to_string(),
+                    budget: None,
+                }],
+                cohort: test_variant_cohort(),
+                validation_budget: None,
+            },
+        );
+        let findings = json!([{
+            "finding_ids": ["main-3-0"],
+            "source_models": ["main"],
+            "source_stages": [3],
+            "severity": "High"
+        }]);
+        let runs = json!([
+            {"model": "main", "stage": 3, "status": "completed"},
+            {"model": "variant", "stage": 3, "status": "completed"}
+        ]);
+        let baseline = std::collections::BTreeMap::from([("main-3-0".to_string(), false)]);
+
+        let (accepted, _, confirmation_runs) = worker
+            .confirm_unique_findings("context", &findings, runs.as_array().unwrap(), &baseline)
+            .await
+            .unwrap();
+
+        assert!(accepted.as_array().unwrap().is_empty());
+        assert_eq!(confirmation_runs[0]["status"], "failed");
+        assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn baseline_decisions_require_a_complete_boolean_mapping() {
+        let inputs = json!([
+            {"finding_ids": ["a"]},
+            {"finding_ids": ["b"]}
+        ]);
+        let valid = json!({"a": true, "b": false});
+        assert!(validate_baseline_decisions(&inputs, Some(&valid)).unwrap()["a"]);
+        assert!(validate_baseline_decisions(&inputs, Some(&json!({"a": true}))).is_err());
+        assert!(
+            validate_baseline_decisions(&inputs, Some(&json!({"a": true, "b": "no"}))).is_err()
+        );
+    }
+
+    #[test]
+    fn validation_candidates_require_an_available_variant_for_main_findings() {
+        let concern = json!([{
+            "source_models": ["main"],
+            "source_stages": [3],
+            "finding_ids": ["main-3-0"]
+        }]);
+        let no_sample = json!([]);
+        assert_eq!(
+            annotate_validation_candidates(
+                &concern,
+                &test_variant_cohort(),
+                no_sample.as_array().unwrap(),
+            )[0]["requires_validation"],
+            false
+        );
+
+        let sample = json!([{"model": "variant", "stage": 3, "status": "completed"}]);
+        assert_eq!(
+            annotate_validation_candidates(
+                &concern,
+                &test_variant_cohort(),
+                sample.as_array().unwrap(),
+            )[0]["requires_validation"],
+            true
+        );
+    }
+
+    #[test]
+    fn shared_findings_are_always_retained_for_experiments() {
+        let concern = json!([{
+            "source_models": ["variant-a", "variant-b"],
+            "source_stages": [4],
+            "finding_ids": ["a-4-0", "b-4-0"]
+        }]);
+        assert_eq!(
+            annotate_validation_candidates(&concern, &test_variant_cohort(), &[])[0]["requires_validation"],
+            true
+        );
+    }
+
+    #[test]
+    fn provenance_validation_is_order_independent_and_rejects_corruption() {
+        let inputs = vec![
+            json!({"finding_ids": ["a"], "source_models": ["main"]}),
+            json!({"finding_ids": ["b"], "source_models": ["variant"]}),
+        ];
+        let reordered = json!([
+            {"finding_ids": ["b"], "source_models": ["variant"]},
+            {"finding_ids": ["a"], "source_models": ["main"]}
+        ]);
+        assert!(validate_provenance(&inputs, &reordered, true).is_ok());
+
+        let corrupted = json!([
+            {"finding_ids": ["a"], "source_models": ["variant"]},
+            {"finding_ids": ["b"], "source_models": ["main"]}
+        ]);
+        assert!(validate_provenance(&inputs, &corrupted, true).is_err());
+
+        let duplicated = json!([
+            {"finding_ids": ["a"], "source_models": ["main", "main"]},
+            {"finding_ids": ["b"], "source_models": ["variant"]}
+        ]);
+        assert!(validate_provenance(&inputs, &duplicated, true).is_err());
+    }
+
+    #[test]
+    fn confirmation_decisions_reject_unknown_and_non_boolean_ids() {
+        assert!(validate_confirmation_decisions(&json!({"a": true}), &["a"]).is_ok());
+        assert!(
+            validate_confirmation_decisions(&json!({"a": true, "unknown": false}), &["a"]).is_err()
+        );
+        assert!(validate_confirmation_decisions(&json!({"a": "yes"}), &["a"]).is_err());
+    }
+
     #[test]
     fn test_append_stage_dismissed_concerns_preserves_category_type() {
         let mut items = Vec::new();
@@ -2038,7 +3209,7 @@ mod tests {
             "reasoning": "hugetlb_free_cross_zone_pages() runs before HVO init"
         })];
 
-        append_stage_dismissed_concerns(&mut items, &input, 1);
+        append_stage_dismissed_concerns(&mut items, &input, 1, "main");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["source_stage"], 1);
@@ -2054,7 +3225,7 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("suspected missing cleanup does not apply")];
 
-        append_stage_dismissed_concerns(&mut items, &input, 2);
+        append_stage_dismissed_concerns(&mut items, &input, 2, "main");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["source_stage"], 2);
@@ -2074,7 +3245,7 @@ mod tests {
             "description": "already annotated"
         })];
 
-        append_stage_items(&mut items, &input, 4, "General", "description");
+        append_stage_items(&mut items, &input, 4, "main", "General", "description");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["source_stage"], 4);
@@ -2085,7 +3256,7 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("plain concern")];
 
-        append_stage_items(&mut items, &input, 6, "General", "description");
+        append_stage_items(&mut items, &input, 6, "main", "General", "description");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["source_stage"], 6);
@@ -2236,6 +3407,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            main_model: "mock".to_string(),
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -2245,6 +3417,9 @@ mod tests {
             dump_conversation: None,
             budget: None,
             retry_provider: None,
+            additional_models: Vec::new(),
+            cohort: test_cohort(),
+            validation_budget: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2594,6 +3769,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            main_model: "mock".to_string(),
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -2603,6 +3779,9 @@ mod tests {
             dump_conversation: None,
             budget: None,
             retry_provider: None,
+            additional_models: Vec::new(),
+            cohort: test_cohort(),
+            validation_budget: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

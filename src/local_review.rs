@@ -26,6 +26,7 @@ use std::{
     collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tracing::{error, info};
 
@@ -444,9 +445,110 @@ async fn review_single_patch(
         }
 
         let effective_ai = ai_for_attempt(ai, attempt);
+        let main_provider_id = std::env::var("SASHIKO_EXPERIMENT_MAIN_PROVIDER")
+            .unwrap_or_else(|_| effective_ai.provider.clone());
+        let cohort = crate::ai::model_experiment::ReviewCohort {
+            main: crate::ai::model_experiment::SourceIdentity {
+                name: "main".to_string(),
+                provider: main_provider_id.clone(),
+                model: effective_ai.model.clone(),
+            },
+            variants: effective_ai
+                .additional_models
+                .iter()
+                .map(|model| {
+                    let variant_ai = model.effective_ai(&effective_ai);
+                    crate::ai::model_experiment::CohortMember {
+                        source: crate::ai::model_experiment::SourceIdentity {
+                            name: model.name.clone(),
+                            provider: model
+                                .provider
+                                .clone()
+                                .unwrap_or_else(|| main_provider_id.clone()),
+                            model: variant_ai.model,
+                        },
+                        selected: crate::ai::model_experiment::sampled_for_review(
+                            model.probability,
+                            patchset_id,
+                            p.index,
+                            &model.name,
+                        ),
+                    }
+                })
+                .collect(),
+        };
         let provider = crate::ai::create_provider_from_ai(&effective_ai)
             .context("Failed to create AI provider")?;
         let retry_provider = build_retry_provider(&effective_ai);
+        let additional_models = effective_ai
+            .additional_models
+            .iter()
+            .filter(|model| cohort.contains(&model.name))
+            .map(|model| {
+                let mut variant_ai = model.effective_ai(&effective_ai);
+                let provider_id = model
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| main_provider_id.clone());
+                let is_stdio = effective_ai.provider.starts_with("stdio-");
+                if is_stdio {
+                    variant_ai.provider.clone_from(&effective_ai.provider);
+                }
+                let provider =
+                    crate::ai::create_provider_from_ai(&variant_ai).unwrap_or_else(|error| {
+                        tracing::warn!(
+                            "Model experiment {} provider is unavailable: {}",
+                            model.name,
+                            error
+                        );
+                        Arc::new(crate::ai::model_experiment::UnavailableProvider::new(
+                            error.to_string(),
+                            variant_ai.model.clone(),
+                        ))
+                    });
+                let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if is_stdio {
+                    std::sync::Arc::new(crate::ai::model_experiment::RoutedProvider::new(
+                        provider,
+                        model.name.clone(),
+                    ))
+                } else {
+                    provider
+                };
+                crate::worker::AdditionalModelRunner {
+                    name: model.name.clone(),
+                    provider,
+                    temperature: variant_ai.temperature,
+                    max_interactions: variant_ai.max_interactions,
+                    model_id: variant_ai.model.clone(),
+                    provider_id,
+                    budget: Some(ReviewBudget::new(BudgetConfig {
+                        stage_input: variant_ai
+                            .budget
+                            .stage_input_tokens
+                            .unwrap_or(variant_ai.stage_input_budget),
+                        stage_output: variant_ai
+                            .budget
+                            .stage_output_tokens
+                            .unwrap_or(variant_ai.stage_output_budget),
+                        review_input: variant_ai.budget.review_input_tokens.unwrap_or(0),
+                        review_output: variant_ai.budget.review_output_tokens.unwrap_or(0),
+                        warn_pct: variant_ai
+                            .budget
+                            .warn_pct
+                            .unwrap_or(variant_ai.budget_warn_pct),
+                        severe_pct: variant_ai
+                            .budget
+                            .severe_pct
+                            .unwrap_or(variant_ai.budget_severe_pct),
+                        review_multiplier: variant_ai.review_budget_multiplier,
+                        enforce_hard_limits: variant_ai.budget.stage_input_tokens.is_some()
+                            || variant_ai.budget.stage_output_tokens.is_some()
+                            || variant_ai.budget.review_input_tokens.is_some()
+                            || variant_ai.budget.review_output_tokens.is_some(),
+                    })),
+                }
+            })
+            .collect::<Vec<_>>();
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
         let mut patch_files = Vec::new();
@@ -499,6 +601,7 @@ async fn review_single_patch(
             std::sync::Arc::new(tools),
             prompts,
             WorkerConfig {
+                main_model: effective_ai.model.clone(),
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,
@@ -507,13 +610,48 @@ async fn review_single_patch(
                 stages: options.stages.clone(),
                 dump_conversation: ai.dump_conversation.as_ref().map(PathBuf::from),
                 budget: Some(ReviewBudget::new(BudgetConfig {
-                    stage_input: ai.stage_input_budget,
-                    stage_output: ai.stage_output_budget,
-                    warn_pct: ai.budget_warn_pct,
-                    severe_pct: ai.budget_severe_pct,
+                    stage_input: ai
+                        .budget
+                        .stage_input_tokens
+                        .unwrap_or(ai.stage_input_budget),
+                    stage_output: ai
+                        .budget
+                        .stage_output_tokens
+                        .unwrap_or(ai.stage_output_budget),
+                    review_input: ai.budget.review_input_tokens.unwrap_or(0),
+                    review_output: ai.budget.review_output_tokens.unwrap_or(0),
+                    warn_pct: ai.budget.warn_pct.unwrap_or(ai.budget_warn_pct),
+                    severe_pct: ai.budget.severe_pct.unwrap_or(ai.budget_severe_pct),
                     review_multiplier: ai.review_budget_multiplier,
+                    enforce_hard_limits: ai.budget.stage_input_tokens.is_some()
+                        || ai.budget.stage_output_tokens.is_some()
+                        || ai.budget.review_input_tokens.is_some()
+                        || ai.budget.review_output_tokens.is_some(),
                 })),
                 retry_provider,
+                additional_models,
+                cohort,
+                validation_budget: {
+                    let limits = &effective_ai.model_experiments.validation_budget;
+                    if limits.request_input_tokens == 0
+                        && limits.request_output_tokens == 0
+                        && limits.review_input_tokens == 0
+                        && limits.review_output_tokens == 0
+                    {
+                        None
+                    } else {
+                        Some(BudgetConfig {
+                            stage_input: limits.request_input_tokens,
+                            stage_output: limits.request_output_tokens,
+                            review_input: limits.review_input_tokens,
+                            review_output: limits.review_output_tokens,
+                            warn_pct: effective_ai.budget_warn_pct,
+                            severe_pct: effective_ai.budget_severe_pct,
+                            review_multiplier: 0.0,
+                            enforce_hard_limits: true,
+                        })
+                    }
+                },
             },
         );
 

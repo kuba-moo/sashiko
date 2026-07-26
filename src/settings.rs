@@ -291,6 +291,200 @@ pub struct DevinCliSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
+pub struct AdditionalModelSettings {
+    /// Stable name used in experiment metadata and provider routing.
+    pub name: String,
+    /// Probability that this model runs for an entire patch review.
+    #[serde(deserialize_with = "deserialize_probability")]
+    pub probability: f64,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub max_input_tokens: Option<usize>,
+    #[serde(default)]
+    pub max_interactions: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub api_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub budget: SourceBudgetSettings,
+    #[serde(default)]
+    pub claude: Option<ClaudeSettings>,
+    #[serde(default)]
+    pub gemini: Option<GeminiSettings>,
+    #[cfg(feature = "bedrock")]
+    #[serde(default)]
+    pub bedrock: Option<BedrockSettings>,
+    #[cfg(feature = "vertex")]
+    #[serde(default)]
+    pub vertex: Option<VertexSettings>,
+    #[serde(default)]
+    pub openai_compat: Option<OpenAiCompatSettings>,
+    #[serde(default)]
+    pub ollama: Option<OllamaSettings>,
+    #[serde(default)]
+    pub kiro_cli: Option<KiroCliSettings>,
+    #[serde(default)]
+    pub claude_cli: Option<ClaudeCliSettings>,
+    #[serde(default)]
+    pub devin_cli: Option<DevinCliSettings>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(unused)]
+pub struct SourceBudgetSettings {
+    #[serde(default, alias = "stage_input_budget")]
+    pub stage_input_tokens: Option<usize>,
+    #[serde(default, alias = "stage_output_budget")]
+    pub stage_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub review_input_tokens: Option<usize>,
+    #[serde(default)]
+    pub review_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub warn_pct: Option<f32>,
+    #[serde(default)]
+    pub severe_pct: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(unused)]
+pub struct ValidationBudgetSettings {
+    #[serde(default)]
+    pub request_input_tokens: usize,
+    #[serde(default)]
+    pub request_output_tokens: usize,
+    #[serde(default)]
+    pub review_input_tokens: usize,
+    #[serde(default)]
+    pub review_output_tokens: usize,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(unused)]
+pub struct ModelExperimentSettings {
+    #[serde(default)]
+    pub validation_budget: ValidationBudgetSettings,
+}
+
+impl SourceBudgetSettings {
+    fn with_overrides(&self, overrides: &Self) -> Self {
+        Self {
+            stage_input_tokens: overrides.stage_input_tokens.or(self.stage_input_tokens),
+            stage_output_tokens: overrides.stage_output_tokens.or(self.stage_output_tokens),
+            review_input_tokens: overrides.review_input_tokens.or(self.review_input_tokens),
+            review_output_tokens: overrides.review_output_tokens.or(self.review_output_tokens),
+            warn_pct: overrides.warn_pct.or(self.warn_pct),
+            severe_pct: overrides.severe_pct.or(self.severe_pct),
+        }
+    }
+}
+
+fn deserialize_probability<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = f64::deserialize(deserializer)?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "model experiment probability must be between 0.0 and 1.0",
+        ))
+    }
+}
+
+fn deserialize_additional_models<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AdditionalModelSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let models = Vec::<AdditionalModelSettings>::deserialize(deserializer)?;
+    let mut names = std::collections::HashSet::new();
+    for model in &models {
+        if model.name.is_empty()
+            || model.name == "main"
+            || !model
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(serde::de::Error::custom(
+                "model experiment name must contain only ASCII letters, digits, '_' or '-', and must not be 'main'",
+            ));
+        }
+        if !names.insert(&model.name) {
+            return Err(serde::de::Error::custom(format!(
+                "duplicate model experiment name: {}",
+                model.name
+            )));
+        }
+    }
+    Ok(models)
+}
+
+impl AdditionalModelSettings {
+    pub fn effective_ai(&self, main: &AiSettings) -> AiSettings {
+        let mut ai = main.clone();
+        ai.additional_models.clear();
+        if let Some(value) = &self.provider {
+            ai.provider.clone_from(value);
+        }
+        if let Some(value) = &self.model {
+            ai.model.clone_from(value);
+        }
+        if let Some(value) = self.max_input_tokens {
+            ai.max_input_tokens = value;
+        }
+        if let Some(value) = self.max_interactions {
+            ai.max_interactions = value;
+        }
+        ai.budget = ai.budget.with_overrides(&self.budget);
+        if let Some(value) = self.temperature {
+            ai.temperature = value;
+        }
+        if let Some(value) = self.api_timeout_secs {
+            ai.api_timeout_secs = value;
+        }
+        if self.claude.is_some() {
+            ai.claude.clone_from(&self.claude);
+        }
+        if self.gemini.is_some() {
+            ai.gemini.clone_from(&self.gemini);
+        }
+        #[cfg(feature = "bedrock")]
+        if self.bedrock.is_some() {
+            ai.bedrock.clone_from(&self.bedrock);
+        }
+        #[cfg(feature = "vertex")]
+        if self.vertex.is_some() {
+            ai.vertex.clone_from(&self.vertex);
+        }
+        if self.openai_compat.is_some() {
+            ai.openai_compat.clone_from(&self.openai_compat);
+        }
+        if self.ollama.is_some() {
+            ai.ollama.clone_from(&self.ollama);
+        }
+        if self.kiro_cli.is_some() {
+            ai.kiro_cli.clone_from(&self.kiro_cli);
+        }
+        if self.claude_cli.is_some() {
+            ai.claude_cli.clone_from(&self.claude_cli);
+        }
+        if self.devin_cli.is_some() {
+            ai.devin_cli.clone_from(&self.devin_cli);
+        }
+        ai
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
@@ -324,10 +518,18 @@ pub struct AiSettings {
     /// Multiplier from stage budgets to the shared review-wide budget.
     #[serde(default)]
     pub review_budget_multiplier: f32,
+    /// Explicit source budget. Values override the legacy flat budget fields.
+    #[serde(default)]
+    pub budget: SourceBudgetSettings,
+    #[serde(default)]
+    pub model_experiments: ModelExperimentSettings,
     #[serde(default)]
     pub response_cache: bool,
     #[serde(default = "default_response_cache_ttl_days")]
     pub response_cache_ttl_days: u64,
+    /// Models sampled independently for complete analytical patch reviews.
+    #[serde(default, deserialize_with = "deserialize_additional_models")]
+    pub additional_models: Vec<AdditionalModelSettings>,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
@@ -607,6 +809,12 @@ impl Settings {
 mod tests {
     use super::*;
 
+    #[derive(Deserialize)]
+    struct AdditionalModelsWrapper {
+        #[serde(deserialize_with = "deserialize_additional_models")]
+        models: Vec<AdditionalModelSettings>,
+    }
+
     #[test]
     fn test_local_review_path_prefers_current_directory() {
         let temp = tempfile::tempdir().unwrap();
@@ -637,5 +845,63 @@ mod tests {
                 std::env::remove_var("XDG_CONFIG_HOME");
             }
         }
+    }
+
+    #[test]
+    fn additional_model_probability_must_be_bounded() {
+        let invalid = serde_json::json!({
+            "name": "variant",
+            "probability": 1.1
+        });
+        let error = serde_json::from_value::<AdditionalModelSettings>(invalid).unwrap_err();
+        assert!(error.to_string().contains("between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn additional_model_names_are_route_safe() {
+        for name in ["main", "bad]route", "has space"] {
+            let value = serde_json::json!({
+                "models": [{"name": name, "probability": 0.5}]
+            });
+            assert!(
+                serde_json::from_value::<AdditionalModelsWrapper>(value).is_err(),
+                "accepted invalid experiment name {name}"
+            );
+        }
+        let valid = serde_json::json!({
+            "models": [{"name": "model-b_2", "probability": 0.5}]
+        });
+        assert_eq!(
+            serde_json::from_value::<AdditionalModelsWrapper>(valid)
+                .unwrap()
+                .models
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn experiment_budget_tables_deserialize() {
+        let model: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
+            "name": "variant",
+            "probability": 0.5,
+            "budget": {
+                "stage_input_tokens": 100,
+                "review_output_tokens": 200
+            }
+        }))
+        .unwrap();
+        assert_eq!(model.budget.stage_input_tokens, Some(100));
+        assert_eq!(model.budget.review_output_tokens, Some(200));
+
+        let experiments: ModelExperimentSettings = serde_json::from_value(serde_json::json!({
+            "validation_budget": {
+                "request_input_tokens": 300,
+                "review_output_tokens": 400
+            }
+        }))
+        .unwrap();
+        assert_eq!(experiments.validation_budget.request_input_tokens, 300);
+        assert_eq!(experiments.validation_budget.review_output_tokens, 400);
     }
 }

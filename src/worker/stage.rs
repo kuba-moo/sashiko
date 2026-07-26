@@ -94,6 +94,7 @@ impl ReviewStage for Stage8 {
                 ));
             }
             validate_source_stages(c, "concern")?;
+            validate_model_provenance(c, "concern")?;
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'concerns' array in output".to_string(),
@@ -134,6 +135,7 @@ impl ReviewStage for Stage9 {
                 ));
             }
             validate_source_stages(c, "concern")?;
+            validate_model_provenance(c, "concern")?;
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'concerns' array in output".to_string(),
@@ -166,6 +168,18 @@ impl ReviewStage for Stage10 {
                 ));
             }
             validate_source_stages(f, "finding")?;
+            validate_model_provenance(f, "finding")?;
+            if f.as_array().is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    !finding
+                        .get("requires_validation")
+                        .is_some_and(Value::is_boolean)
+                })
+            }) {
+                return Err(ValidationError::FormatViolation(
+                    "every finding must contain a 'requires_validation' boolean".to_string(),
+                ));
+            }
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'findings' array in output".to_string(),
@@ -320,6 +334,22 @@ fn validate_source_stages(value: &Value, item_name: &str) -> Result<(), Validati
     {
         return Err(ValidationError::FormatViolation(format!(
             "every {} must contain a 'source_stages' array",
+            item_name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_provenance(value: &Value, item_name: &str) -> Result<(), ValidationError> {
+    let Some(items) = value.as_array() else {
+        return Ok(());
+    };
+    if items.iter().any(|item| {
+        !item.get("source_models").is_some_and(Value::is_array)
+            || !item.get("finding_ids").is_some_and(Value::is_array)
+    }) {
+        return Err(ValidationError::FormatViolation(format!(
+            "every {} must contain 'source_models' and 'finding_ids' arrays",
             item_name
         )));
     }

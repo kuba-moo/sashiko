@@ -626,6 +626,7 @@ pub mod copilot_cli;
 pub mod devin_cli;
 pub mod gemini;
 pub mod kiro_cli;
+pub mod model_experiment;
 pub mod ollama;
 pub mod openai;
 pub mod proxy;

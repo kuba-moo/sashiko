@@ -81,6 +81,80 @@ Core AI settings that apply to all providers.
 | `response_cache` | bool | `false` | Cache AI responses to disk. |
 | `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). |
 
+#### `[ai.budget]`
+
+Optional explicit limits for the main model's discovery ledger. These values
+override the legacy `stage_input_budget`, `stage_output_budget`, and derived
+review limits. Zero or an omitted value disables that limit.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `stage_input_tokens` | integer | legacy value | Input-token limit for one analytical stage. |
+| `stage_output_tokens` | integer | legacy value | Output-token limit for one analytical stage. |
+| `review_input_tokens` | integer | derived | Input-token limit across the patch review. |
+| `review_output_tokens` | integer | derived | Output-token limit across the patch review. |
+| `warn_pct` | float | legacy value | Fraction that triggers the first budget warning. |
+| `severe_pct` | float | legacy value | Fraction that forces the session to conclude. |
+
+#### `[[ai.additional_models]]`
+
+Optional live model experiments. Each model is sampled once per patch review.
+When selected, it runs every analytical review stage (stages 1 through 7) that
+the planner selects for the main model. The main model always runs. Unspecified
+settings inherit from `[ai]`; provider-specific tables may also be specified on
+an additional model. `probability` must be between `0.0` and `1.0`.
+
+```toml
+[[ai.additional_models]]
+name = "sonnet"
+model = "claude-sonnet-4-6"
+probability = 0.10
+
+[ai.additional_models.budget]
+stage_input_tokens = 120000
+stage_output_tokens = 6000
+review_input_tokens = 480000
+review_output_tokens = 24000
+
+[[ai.additional_models]]
+name = "gemini"
+provider = "gemini"
+model = "gemini-3-pro"
+temperature = 0.7
+probability = 0.05
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | -- | Stable, unique experiment name using ASCII letters, digits, `_`, or `-`. The reserved name `main` is not allowed. |
+| `probability` | float | -- | Independent probability of running this model for the complete patch review. |
+| `provider` | string | main provider | Provider override. |
+| `model` | string | main model | Model identifier override. |
+| `temperature` | float | main setting | Sampling temperature override. |
+| `max_input_tokens` | integer | main setting | Input token limit override. |
+| `max_interactions` | integer | main setting | Tool-call round limit override. |
+| `api_timeout_secs` | integer | main setting | Provider request timeout override. |
+
+Each selected model owns an independent budget ledger. The optional
+`[ai.additional_models.budget]` table accepts the same keys as `[ai.budget]`
+and inherits omitted values from the main model. Variant consumption never
+changes the main model's warning flags or retry behavior.
+
+#### `[ai.model_experiments.validation_budget]`
+
+Confirmation requests use independent ledgers keyed by confirming source.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `request_input_tokens` | integer | `0` | Input-token limit for one confirmation batch. |
+| `request_output_tokens` | integer | `0` | Output-token limit for one confirmation batch. |
+| `review_input_tokens` | integer | `0` | Input-token limit for confirmations by one source in a patch review. |
+| `review_output_tokens` | integer | `0` | Output-token limit for confirmations by one source in a patch review. |
+
+Budget exhaustion makes confirmation unavailable. It is not interpreted as a
+rejection: main-only findings fall back to normal Stage 10 verification, while
+variant-only findings are not published without main confirmation.
+
 #### `[ai.claude]`
 
 Settings specific to the Claude API provider (`provider = "claude"`).

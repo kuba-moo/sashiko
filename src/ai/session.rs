@@ -275,9 +275,9 @@ impl<'a> SessionRunner<'a> {
         let mut validation_attempts = 0;
         let mut transient_retries = 0;
         let mut provider_error_retries = 0;
-        let mut total_prompt_tokens = 0;
-        let mut total_completion_tokens = 0;
-        let mut total_cached_tokens = 0;
+        let mut total_prompt_tokens: usize = 0;
+        let mut total_completion_tokens: usize = 0;
+        let mut total_cached_tokens: usize = 0;
         let mut severe_seen = false;
         let mut force_conclude = false;
         let mut stage_budget_flags = 0;
@@ -299,6 +299,12 @@ impl<'a> SessionRunner<'a> {
                 response_format: session.response_format(),
                 context_tag: session.context_tag(),
             };
+            let estimated_input = self.provider.estimate_tokens(&request);
+            if self.budget.as_ref().is_some_and(|budget| {
+                !budget.allows_request_input(total_prompt_tokens.saturating_add(estimated_input))
+            }) {
+                anyhow::bail!("request input exceeds the source-owned stage token limit");
+            }
 
             if let Some((dump, label)) = &self.conversation_dump
                 && let Err(error) = dump.write(label, turns, "req", &request).await
@@ -389,6 +395,9 @@ impl<'a> SessionRunner<'a> {
                         usage.prompt_tokens,
                         usage.completion_tokens,
                     );
+                    if budget.hard_limit_exceeded(total_prompt_tokens, total_completion_tokens) {
+                        anyhow::bail!("source-owned stage or review token limit was exceeded");
+                    }
                 }
             }
 

@@ -21,6 +21,8 @@ use serde_json::json;
 use tracing::info;
 
 pub struct Database {
+    database: libsql::Database,
+    is_in_memory: bool,
     pub conn: libsql::Connection,
 }
 
@@ -465,7 +467,11 @@ impl Database {
             .next()
             .await;
 
-        Ok(Self { conn })
+        Ok(Self {
+            database: db,
+            is_in_memory: settings.url == ":memory:",
+            conn,
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -509,6 +515,102 @@ impl Database {
                 "idx_patchsets_cover_message_id",
                 "patchsets",
                 "cover_letter_message_id",
+            )
+            .await;
+        for sql in [
+            "CREATE TABLE IF NOT EXISTS model_experiment_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', stage INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE TABLE IF NOT EXISTS model_experiment_sources (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', selected INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id), UNIQUE(review_id, experiment_name))",
+            "CREATE TABLE IF NOT EXISTS model_experiment_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, additional_model TEXT NOT NULL, main_model_id TEXT NOT NULL DEFAULT '', additional_model_id TEXT NOT NULL DEFAULT '', main_provider_id TEXT NOT NULL DEFAULT '', additional_provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, outcome TEXT NOT NULL, severity TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE TABLE IF NOT EXISTS model_confirmation_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, model TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_input INTEGER NOT NULL DEFAULT 0, budget_output INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE INDEX IF NOT EXISTS idx_model_experiment_runs_review ON model_experiment_runs(review_id)",
+            "CREATE INDEX IF NOT EXISTS idx_model_experiment_sources_review ON model_experiment_sources(review_id)",
+            "CREATE INDEX IF NOT EXISTS idx_model_experiment_findings_review ON model_experiment_findings(review_id)",
+            "CREATE INDEX IF NOT EXISTS idx_model_confirmation_runs_review ON model_confirmation_runs(review_id)",
+        ] {
+            let _ = self.conn.execute(sql, ()).await;
+        }
+        let _ = self
+            .try_add_column(
+                "model_experiment_runs",
+                "model_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            .await;
+        let _ = self
+            .try_add_column(
+                "model_experiment_runs",
+                "provider_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            .await;
+        let _ = self
+            .try_add_column(
+                "model_confirmation_runs",
+                "provider_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            .await;
+        for (column, definition) in [
+            ("budget_input", "INTEGER NOT NULL DEFAULT 0"),
+            ("budget_output", "INTEGER NOT NULL DEFAULT 0"),
+            ("budget_flags", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let _ = self
+                .try_add_column("model_confirmation_runs", column, definition)
+                .await;
+        }
+        for column in ["main_provider_id", "additional_provider_id"] {
+            let _ = self
+                .try_add_column(
+                    "model_experiment_findings",
+                    column,
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                .await;
+        }
+        for table in ["model_experiment_runs", "model_confirmation_runs"] {
+            let _ = self
+                .try_add_column(table, "status", "TEXT NOT NULL DEFAULT 'completed'")
+                .await;
+            let _ = self.try_add_column(table, "error", "TEXT").await;
+        }
+        let _ = self
+            .try_add_column(
+                "model_experiment_findings",
+                "main_model_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            .await;
+        let _ = self
+            .try_add_column(
+                "model_experiment_findings",
+                "additional_model_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            .await;
+        let _ = self
+            .conn
+            .execute(
+                "UPDATE model_experiment_findings
+                 SET main_model_id = COALESCE(NULLIF(main_model_id, ''), (
+                         SELECT model_id FROM model_experiment_runs
+                         WHERE review_id = model_experiment_findings.review_id
+                           AND experiment_name = 'main' LIMIT 1
+                     ), ''),
+                     additional_model_id = COALESCE(NULLIF(additional_model_id, ''), (
+                         SELECT model_id FROM model_experiment_runs
+                         WHERE review_id = model_experiment_findings.review_id
+                           AND experiment_name = model_experiment_findings.additional_model LIMIT 1
+                     ), '')
+                 WHERE main_model_id = '' OR additional_model_id = ''",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_add_column(
+                "model_confirmation_runs",
+                "model_id",
+                "TEXT NOT NULL DEFAULT ''",
             )
             .await;
         let _ = self.try_add_column("patches", "status", "TEXT").await;
@@ -916,6 +1018,355 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn save_model_experiment(
+        &self,
+        review_id: i64,
+        experiment: &serde_json::Value,
+        findings: &serde_json::Value,
+    ) -> Result<()> {
+        if self.is_in_memory {
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let result = self
+                .save_model_experiment_records(&self.conn, review_id, experiment, findings)
+                .await;
+            return match result {
+                Ok(()) => {
+                    self.conn.execute("COMMIT", ()).await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            };
+        }
+        let connection = self.database.connect()?;
+        let _ = connection
+            .query("PRAGMA busy_timeout = 5000", ())
+            .await?
+            .next()
+            .await;
+        let transaction = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result = self
+            .save_model_experiment_records(&transaction, review_id, experiment, findings)
+            .await;
+        match result {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn save_model_experiment_records(
+        &self,
+        connection: &libsql::Connection,
+        review_id: i64,
+        experiment: &serde_json::Value,
+        findings: &serde_json::Value,
+    ) -> Result<()> {
+        use std::collections::HashMap;
+
+        connection
+            .execute(
+                "DELETE FROM model_experiment_runs WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        connection
+            .execute(
+                "DELETE FROM model_experiment_findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        connection
+            .execute(
+                "DELETE FROM model_confirmation_runs WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        connection
+            .execute(
+                "DELETE FROM model_experiment_sources WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let runs = experiment["runs"].as_array().cloned().unwrap_or_default();
+        let mut sources: Vec<(String, String, String, bool)> = Vec::new();
+        if let Some(main) = experiment["cohort"]["main"].as_object() {
+            sources.push((
+                main.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("main")
+                    .to_string(),
+                main.get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                main.get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                true,
+            ));
+        }
+        for member in experiment["cohort"]["variants"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(source) = member["source"].as_object() {
+                sources.push((
+                    source
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    source
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    source
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    member["selected"].as_bool().unwrap_or(false),
+                ));
+            }
+        }
+        if sources.is_empty() {
+            let mut legacy_sources = std::collections::BTreeMap::new();
+            for run in &runs {
+                legacy_sources
+                    .entry(run["model"].as_str().unwrap_or("unknown").to_string())
+                    .or_insert_with(|| {
+                        (
+                            run["provider_id"].as_str().unwrap_or("unknown").to_string(),
+                            run["model_id"].as_str().unwrap_or("unknown").to_string(),
+                        )
+                    });
+            }
+            sources.extend(
+                legacy_sources
+                    .into_iter()
+                    .map(|(name, (provider, model))| (name, provider, model, true)),
+            );
+        }
+        for (name, provider, model, selected) in sources {
+            let source_runs: Vec<&serde_json::Value> = runs
+                .iter()
+                .filter(|run| run["model"].as_str() == Some(name.as_str()))
+                .collect();
+            let status = if !selected {
+                "not_selected"
+            } else if source_runs.is_empty()
+                || source_runs
+                    .iter()
+                    .any(|run| run["status"].as_str() != Some("completed"))
+            {
+                "failed"
+            } else {
+                "completed"
+            };
+            let error = source_runs.iter().find_map(|run| run["error"].as_str());
+            connection
+                .execute(
+                    "INSERT INTO model_experiment_sources (review_id, experiment_name, provider_id, model_id, selected, status, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        name,
+                        provider,
+                        model,
+                        i64::from(selected),
+                        status,
+                        error,
+                    ],
+                )
+                .await?;
+        }
+
+        for run in &runs {
+            connection
+                .execute(
+                    "INSERT INTO model_experiment_runs (review_id, experiment_name, model_id, provider_id, stage, status, error, tokens_in, tokens_out, tokens_cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        run["model"].as_str().unwrap_or("unknown"),
+                        run["model_id"].as_str().unwrap_or("unknown"),
+                        run["provider_id"].as_str().unwrap_or("unknown"),
+                        run["stage"].as_i64().unwrap_or_default(),
+                        run["status"].as_str().unwrap_or("failed"),
+                        run["error"].as_str(),
+                        run["tokens_in"].as_i64().unwrap_or_default(),
+                        run["tokens_out"].as_i64().unwrap_or_default(),
+                        run["tokens_cached"].as_i64().unwrap_or_default(),
+                    ],
+                )
+                .await?;
+        }
+
+        let mut severities = HashMap::new();
+        for finding in findings.as_array().into_iter().flatten() {
+            let severity = finding["severity"].as_str().unwrap_or("unknown");
+            for id in finding["finding_ids"].as_array().into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    severities.insert(id, severity);
+                }
+            }
+        }
+        for comparison in experiment["comparisons"].as_array().into_iter().flatten() {
+            let finding_id = comparison["finding_id"].as_str().unwrap_or("unknown");
+            connection
+                .execute(
+                    "INSERT INTO model_experiment_findings (review_id, additional_model, main_model_id, additional_model_id, main_provider_id, additional_provider_id, finding_id, outcome, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        comparison["additional_model"].as_str().unwrap_or("unknown"),
+                        comparison["main_model_id"].as_str().unwrap_or("unknown"),
+                        comparison["additional_model_id"].as_str().unwrap_or("unknown"),
+                        comparison["main_provider_id"].as_str().unwrap_or("unknown"),
+                        comparison["additional_provider_id"].as_str().unwrap_or("unknown"),
+                        finding_id,
+                        comparison["outcome"].as_str().unwrap_or("unknown"),
+                        comparison["severity"]
+                            .as_str()
+                            .or_else(|| severities.get(finding_id).copied()),
+                    ],
+                )
+                .await?;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        for run in experiment["confirmation_runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            connection
+                .execute(
+                    "INSERT INTO model_confirmation_runs (review_id, model, model_id, provider_id, status, error, tokens_in, tokens_out, tokens_cached, budget_input, budget_output, budget_flags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        run["model"].as_str().unwrap_or("unknown"),
+                        run["model_id"].as_str().unwrap_or("unknown"),
+                        run["provider_id"].as_str().unwrap_or("unknown"),
+                        run["status"].as_str().unwrap_or("failed"),
+                        run["error"].as_str(),
+                        run["tokens_in"].as_i64().unwrap_or_default(),
+                        run["tokens_out"].as_i64().unwrap_or_default(),
+                        run["tokens_cached"].as_i64().unwrap_or_default(),
+                        run["budget_input"].as_i64().unwrap_or_default(),
+                        run["budget_output"].as_i64().unwrap_or_default(),
+                        run["budget_flags"].as_i64().unwrap_or_default(),
+                        now,
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_model_experiment_stats(&self) -> Result<serde_json::Value> {
+        let mut run_status = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT experiment_name, provider_id, model_id, status, count(*) FROM model_experiment_runs GROUP BY experiment_name, provider_id, model_id, status ORDER BY experiment_name, provider_id, model_id, status",
+                (),
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            run_status.push(json!({
+                "experiment_name": row.get::<String>(0)?,
+                "provider": row.get::<String>(1)?,
+                "model": row.get::<String>(2)?,
+                "status": row.get::<String>(3)?,
+                "count": row.get::<i64>(4)?,
+            }));
+        }
+        drop(rows);
+
+        let mut cohort_status = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT experiment_name, provider_id, model_id, selected, status, count(*) FROM model_experiment_sources GROUP BY experiment_name, provider_id, model_id, selected, status ORDER BY experiment_name, provider_id, model_id, selected, status",
+                (),
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            cohort_status.push(json!({
+                "experiment_name": row.get::<String>(0)?,
+                "provider": row.get::<String>(1)?,
+                "model": row.get::<String>(2)?,
+                "selected": row.get::<i64>(3)? != 0,
+                "status": row.get::<String>(4)?,
+                "count": row.get::<i64>(5)?,
+            }));
+        }
+        drop(rows);
+
+        let mut outcomes = Vec::new();
+        let mut rows = self.conn.query(
+            "SELECT additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')), count(*) FROM model_experiment_findings GROUP BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')) ORDER BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome",
+            (),
+        ).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            outcomes.push(json!({
+                "additional_model": row.get::<String>(0)?,
+                "main_provider_id": row.get::<String>(1)?,
+                "main_model_id": row.get::<String>(2)?,
+                "additional_provider_id": row.get::<String>(3)?,
+                "additional_model_id": row.get::<String>(4)?,
+                "outcome": row.get::<String>(5)?,
+                "severity": row.get::<String>(6)?,
+                "count": row.get::<i64>(7)?,
+            }));
+        }
+        drop(rows);
+
+        let mut paired_cost = Vec::new();
+        let mut rows = self.conn.query(
+            "SELECT v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id, avg(m.tokens_in), avg(m.tokens_out), avg(m.tokens_cached), avg(v.tokens_in), avg(v.tokens_out), avg(v.tokens_cached), count(*) FROM model_experiment_runs m JOIN model_experiment_runs v ON m.review_id = v.review_id AND m.stage = v.stage WHERE m.experiment_name = 'main' AND v.experiment_name != 'main' AND m.status = 'completed' AND v.status = 'completed' GROUP BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id ORDER BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id",
+            (),
+        ).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            paired_cost.push(json!({
+                "additional_model": row.get::<String>(0)?,
+                "main": {"provider": row.get::<String>(1).unwrap_or_default(), "model": row.get::<String>(2).unwrap_or_default(), "tokens_in": row.get::<f64>(5).unwrap_or(0.0), "tokens_out": row.get::<f64>(6).unwrap_or(0.0), "tokens_cached": row.get::<f64>(7).unwrap_or(0.0)},
+                "additional": {"provider": row.get::<String>(3).unwrap_or_default(), "model": row.get::<String>(4).unwrap_or_default(), "tokens_in": row.get::<f64>(8).unwrap_or(0.0), "tokens_out": row.get::<f64>(9).unwrap_or(0.0), "tokens_cached": row.get::<f64>(10).unwrap_or(0.0)},
+                "paired_stages": row.get::<i64>(11).unwrap_or(0),
+            }));
+        }
+        drop(rows);
+
+        let mut confirmation_cost = Vec::new();
+        let mut rows = self.conn.query(
+            "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch'), provider_id, model_id, sum(tokens_in), sum(tokens_out), sum(tokens_cached) FROM model_confirmation_runs GROUP BY 1, provider_id, model_id ORDER BY 1, provider_id, model_id",
+            (),
+        ).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            confirmation_cost.push(json!({
+                "day": row.get::<String>(0)?, "provider": row.get::<String>(1)?, "model": row.get::<String>(2)?,
+                "tokens_in": row.get::<i64>(3).unwrap_or(0), "tokens_out": row.get::<i64>(4).unwrap_or(0),
+                "tokens_cached": row.get::<i64>(5).unwrap_or(0),
+            }));
+        }
+        Ok(
+            json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost}),
+        )
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
@@ -6938,6 +7389,120 @@ mod tests {
         assert_eq!(
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_experiment_stats_use_paired_stage_costs() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("experiment.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await.unwrap());
+        db.migrate().await.unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute("INSERT INTO patchsets (id, thread_id) VALUES (1, 1)", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, patchset_id, status, created_at) VALUES (99, 1, 'Reviewed', 1000), (100, 1, 'Reviewed', 1000)",
+                (),
+            )
+            .await
+            .unwrap();
+        let experiment = json!({
+            "cohort": {
+                "main": {"name": "main", "provider": "openai", "model": "model-a"},
+                "variants": [{
+                    "source": {"name": "variant", "provider": "claude", "model": "model-b"},
+                    "selected": true
+                }]
+            },
+            "runs": [
+                {"model": "main", "provider_id": "openai", "model_id": "model-a", "stage": 3, "status": "completed", "tokens_in": 100, "tokens_out": 10, "tokens_cached": 20},
+                {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 3, "status": "completed", "tokens_in": 80, "tokens_out": 8, "tokens_cached": 10},
+                {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 4, "status": "failed", "error": "provider unavailable", "tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
+            ],
+            "comparisons": [
+                {"additional_model": "variant", "main_provider_id": "openai", "main_model_id": "model-a", "additional_provider_id": "claude", "additional_model_id": "model-b", "finding_id": "f1", "outcome": "both"}
+            ],
+            "confirmation_runs": [
+                {"model": "main", "provider_id": "openai", "model_id": "model-a", "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 5, "budget_input": 40, "budget_output": 4, "budget_flags": 1}
+            ]
+        });
+        let findings = json!([{"finding_ids": ["f1"], "severity": "High"}]);
+        db.save_model_experiment(99, &experiment, &findings)
+            .await
+            .unwrap();
+        let stats = db.get_model_experiment_stats().await.unwrap();
+        assert_eq!(stats["outcomes"][0]["severity"], "high");
+        assert_eq!(stats["paired_cost"][0]["main"]["model"], "model-a");
+        assert_eq!(stats["paired_cost"][0]["main"]["provider"], "openai");
+        assert_eq!(stats["outcomes"][0]["additional_provider_id"], "claude");
+        assert_eq!(stats["paired_cost"][0]["paired_stages"], 1);
+        assert_eq!(stats["confirmation_cost"][0]["model"], "model-a");
+        assert!(
+            stats["run_status"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["status"] == "failed" && row["count"] == 1 })
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT error FROM model_experiment_runs WHERE status = 'failed'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "provider unavailable"
+        );
+
+        let (first, second) = tokio::join!(
+            db.save_model_experiment(99, &experiment, &findings),
+            db.save_model_experiment(100, &experiment, &findings),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let mut invalid = experiment.clone();
+        invalid["cohort"]["variants"] = json!([{
+            "source": {"name": "main", "provider": "other", "model": "duplicate"},
+            "selected": true
+        }]);
+        assert!(
+            db.save_model_experiment(99, &invalid, &findings)
+                .await
+                .is_err()
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT count(*) FROM model_experiment_runs WHERE review_id = 99",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            3
         );
     }
 }

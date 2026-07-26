@@ -1338,6 +1338,18 @@ impl Reviewer {
                                         )
                                         .await;
                                 }
+                                if let Some(experiment) = review_content.get("model_experiment")
+                                    && let Err(error) = ctx
+                                        .db
+                                        .save_model_experiment(
+                                            review_id,
+                                            experiment,
+                                            &review_content["findings"],
+                                        )
+                                        .await
+                                {
+                                    error!("Failed to save model experiment: {}", error);
+                                }
 
                                 let mut db_success = true;
 
@@ -1544,6 +1556,33 @@ async fn run_review_tool(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
+    let mut experiment_providers = std::collections::HashMap::new();
+    for model in &settings.ai.additional_models {
+        if review_index.is_some_and(|patch_index| {
+            !crate::ai::model_experiment::sampled_for_review(
+                model.probability,
+                patchset_id,
+                patch_index,
+                &model.name,
+            )
+        }) {
+            continue;
+        }
+        let variant_ai = model.effective_ai(&settings.ai);
+        match crate::ai::create_provider_from_ai(&variant_ai) {
+            Ok(variant) => {
+                experiment_providers.insert(model.name.clone(), Some(variant));
+            }
+            Err(error) => {
+                warn!(
+                    "Disabling model experiment {}: failed to create provider: {}",
+                    model.name, error
+                );
+                experiment_providers.insert(model.name.clone(), None);
+            }
+        }
+    }
+    let experiment_providers = Arc::new(experiment_providers);
     let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
         Command::new(override_bin)
     } else {
@@ -1600,6 +1639,10 @@ async fn run_review_tool(
             cmd.env(&key, &value);
         }
     }
+    cmd.env(
+        "SASHIKO_EXPERIMENT_MAIN_PROVIDER",
+        settings.ai.provider.as_str(),
+    );
 
     if let Some(idx) = review_index {
         cmd.arg("--review-patch-index").arg(idx.to_string());
@@ -1746,6 +1789,7 @@ async fn run_review_tool(
 
                                         let db_clone = db.clone();
                                         let provider_clone = provider.clone();
+                                        let experiment_providers_clone = experiment_providers.clone();
                                         let quota_clone = quota_manager.clone();
                                         let settings_clone = settings.clone();
                                         let stdin_clone = stdin_writer.clone();
@@ -1757,12 +1801,30 @@ async fn run_review_tool(
                                         let llm_semaphore_clone = llm_semaphore.clone();
 
                                         let handle = tokio::spawn(async move {
-                                            let req: AiRequest = match serde_json::from_value(payload) {
+                                            let mut req: AiRequest = match serde_json::from_value(payload) {
                                                 Ok(r) => r,
                                                 Err(e) => {
                                                     let _ = abort_tx_clone.send(anyhow::anyhow!("Failed to parse AiRequest payload: {}", e)).await;
                                                     return;
                                                 }
+                                            };
+                                            let model_route = crate::ai::model_experiment::take_route(
+                                                &mut req.context_tag,
+                                            );
+                                            let is_experiment_request = model_route.is_some();
+                                            let selected_provider: Result<Arc<dyn AiProvider>> = match model_route.as_deref() {
+                                                Some("main") | None => Ok(provider_clone),
+                                                Some(route) => experiment_providers_clone
+                                                    .get(route)
+                                                    .and_then(Option::clone)
+                                                    .ok_or_else(|| anyhow::anyhow!(
+                                                        "Model experiment provider is unavailable: {}", route
+                                                    )),
+                                            };
+                                            let request_quota = if is_experiment_request {
+                                                Arc::new(QuotaManager::new())
+                                            } else {
+                                                quota_clone
                                             };
 
                                             let mut tool_calls_map = std::collections::HashMap::new();
@@ -1813,10 +1875,11 @@ async fn run_review_tool(
                                             }
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
-                                            let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
+                                            let resp_payload = match selected_provider {
+                                                Ok(selected_provider) => crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
                                                 let mut local_transient_errors = 0;
                                                 loop {
-                                                    let slept = quota_clone.wait_for_access().await;
+                                                    let slept = request_quota.wait_for_access().await;
                                                     {
                                                         let mut d = deadline_clone.lock().unwrap();
                                                         *d += slept;
@@ -1835,15 +1898,18 @@ async fn run_review_tool(
 
                                                     let _permit = llm_semaphore_clone.acquire().await?;
 
-                                                    match provider_clone.generate_content(req.clone()).await {
+                                                    match selected_provider.generate_content(req.clone()).await {
                                                         Ok(resp) => {
-                                                            quota_clone.report_success().await;
+                                                            request_quota.report_success().await;
                                                             break Ok(resp);
                                                         }
                                                         Err(e) => {
+                                                            if is_experiment_request {
+                                                                break Err(e);
+                                                            }
                                                             match classify_ai_error(&e) {
                                                                 AiErrorClass::RateLimit { retry_after } => {
-                                                                    quota_clone
+                                                                    request_quota
                                                                         .report_quota_error(retry_after)
                                                                         .await;
                                                                     continue;
@@ -1865,11 +1931,15 @@ async fn run_review_tool(
                                                         }
                                                     }
                                                 }
-                                            }).await;
+                                                }).await,
+                                                Err(error) => Err(error),
+                                            };
 
                                             let reply = match resp_payload {
                                                 Ok(p) => {
-                                                    if let Some(usage) = &p.usage {
+                                                    if !is_experiment_request
+                                                        && let Some(usage) = &p.usage
+                                                    {
                                                         let cached = usage.cached_tokens.unwrap_or(0);
                                                         let uncached_input = usage.prompt_tokens.saturating_sub(cached);
                                                         let current_total = total_tokens_used_clone.fetch_add(uncached_input + usage.completion_tokens, Ordering::SeqCst) + uncached_input + usage.completion_tokens;

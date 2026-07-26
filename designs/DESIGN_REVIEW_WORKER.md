@@ -1,17 +1,22 @@
 # Design: Sashiko Review Worker
 
 ## Goal
-Implement an automated AI worker (`sashiko-review`) that uses **Gemini 3 Pro** to review Linux kernel patchsets. The worker should emulate a maintainer's review process, leveraging the `masoncl/review-prompts` philosophy. It requires read-only access to the git repository to inspect context (blame, history, file content) before delivering a verdict.
+Implement an automated, provider-neutral AI worker (`sashiko-review`) that
+reviews Linux kernel patchsets as a staged maintainer workflow. It requires
+read-only access to the repository so stages can inspect history and source
+context before producing a structured verdict.
 
 ## Architecture
 
 ### 1. Binary: `sashiko-review` (`src/bin/review.rs`)
-A standalone CLI tool that interfaces with the existing `sashiko` database and the local git repository.
+A worker entry point that reads a serialized review request from standard input
+and delegates repository preparation and review execution to `local_review`.
 
-**Arguments:**
-- `--patchset <ID>`: Database ID of the patchset to review.
-- `--model <NAME>`: Defaults to the model configured in `Settings.toml`.
-- `--dry-run`: Output review to stdout instead of saving to DB.
+Its command-line options override request or configuration values, including
+`--baseline`, `--repo`, `--worktree-dir`, `--prompts`,
+`--review-patch-index`, `--review-commit`, `--no-ai`, `--reuse-worktree`,
+`--ai-provider`, and `--custom-prompt`. `--json` remains as a deprecated
+compatibility flag; JSON input is always expected.
 
 ### 2. Core Components
 
@@ -33,7 +38,7 @@ multi-turn loop, tool dispatch, validation feedback, optional transcript dumps,
 and optional budget steering. This keeps worker stages independent of Gemini,
 Bedrock, Claude, or other provider protocols.
 
-#### C. `ToolBox` (`src/worker/tools.rs`)
+#### C. `ToolBox` (`src/toolbox/`)
 Provides a safe, read-only interface to the system.
 - **Git Tools**:
     - `git_show(ref, path)`: Read file content at specific revision.
@@ -71,11 +76,12 @@ Provides a safe, read-only interface to the system.
 
 ### 3. Data Flow
 
-1.  **Trigger**: User runs `sashiko-review --patchset 123`.
+1.  **Trigger**: The reviewer launches `sashiko-review` and writes a JSON
+    review request to its standard input.
 2.  **Context Loading**:
-    -   Fetch `Patchset(123)` from DB.
-    -   Fetch associated `Patches` and `Messages`.
-    -   Identify the base git repo/commit (using `baselines` table).
+    -   Parse patchset, patch, provider, and repository data from the request.
+    -   Resolve the configured baseline and prepare or reuse a worktree.
+    -   Apply the requested patches and construct per-patch review context.
 3.  **Analysis Pipeline**:
     -   Pre-screen and planning establish the relevant scope.
     -   Investigation stages use the shared toolbox to gather evidence and emit
@@ -83,9 +89,10 @@ Provides a safe, read-only interface to the system.
     -   Consolidation merges duplicate concerns while unioning provenance.
     -   Validation stages retain supported concerns and produce findings.
     -   The application derives deduplication statistics and budget flags.
-4.  **Storage**:
-    -   Save output to `reviews` table.
-    -   Save token usage to `ai_interactions` table.
+4.  **Result Handling**:
+    -   The worker writes its structured result to standard output.
+    -   The parent reviewer persists review output, findings, provenance,
+        budget flags, and AI interaction usage.
 
 ## Execution Plan
 

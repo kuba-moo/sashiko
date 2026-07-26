@@ -84,6 +84,8 @@ def _build_tool_result_map(dump_dir: Path):
             msgs = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
+        if isinstance(msgs, dict):
+            msgs = msgs.get("messages", [])
         if not isinstance(msgs, list):
             continue
         for msg in msgs:

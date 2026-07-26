@@ -280,6 +280,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_cached_tokens = 0;
         let mut severe_seen = false;
         let mut force_conclude = false;
+        let mut stage_budget_flags = 0;
 
         loop {
             turns += 1;
@@ -382,6 +383,7 @@ impl<'a> SessionRunner<'a> {
                 total_cached_tokens += usage.cached_tokens.unwrap_or(0);
                 if let Some(budget) = &self.budget {
                     budget_level = budget.record_and_check(
+                        &mut stage_budget_flags,
                         total_prompt_tokens,
                         total_completion_tokens,
                         usage.prompt_tokens,
@@ -405,7 +407,33 @@ impl<'a> SessionRunner<'a> {
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls {
                 if force_conclude {
-                    anyhow::bail!("Token budget exhausted after final-conclusion warning");
+                    tracing::warn!(
+                        "Model made tool calls after the final token-budget warning; \
+                         accepting any valid final content without executing the calls"
+                    );
+                    let output = match session.validate(&resp) {
+                        Ok(output) => output,
+                        Err(ValidationError::FormatViolation(violation)) => anyhow::bail!(
+                            "Token budget exhausted and final response was invalid: {}",
+                            violation
+                        ),
+                        Err(ValidationError::Fatal(error)) => anyhow::bail!(
+                            "Token budget exhausted and final response failed validation: {}",
+                            error
+                        ),
+                    };
+                    let usage = AiUsage {
+                        prompt_tokens: total_prompt_tokens,
+                        completion_tokens: total_completion_tokens,
+                        total_tokens: total_prompt_tokens + total_completion_tokens,
+                        cached_tokens: Some(total_cached_tokens),
+                        cache_write_tokens: None,
+                    };
+                    return Ok(SessionResult {
+                        output,
+                        history: log_history,
+                        usage,
+                    });
                 }
                 let results = session.call_tools(tool_calls.clone()).await?;
                 for (call_id, result) in results {

@@ -52,6 +52,7 @@ impl ReviewBudget {
 
     pub fn record_and_check(
         &self,
+        stage_flags: &mut u8,
         stage_input: usize,
         stage_output: usize,
         input_delta: usize,
@@ -68,7 +69,7 @@ impl ReviewBudget {
         let review_output_limit =
             (self.config.stage_output as f32 * self.config.review_multiplier) as usize;
 
-        let values = [
+        let stage_values = [
             (
                 stage_input,
                 self.config.stage_input,
@@ -81,6 +82,34 @@ impl ReviewBudget {
                 STAGE_OUTPUT_WARN,
                 STAGE_OUTPUT_SEVERE,
             ),
+        ];
+
+        let mut level = None;
+        for (used, limit, warn_flag, severe_flag) in stage_values {
+            if limit == 0 {
+                continue;
+            }
+            let severe = (limit as f32 * self.config.severe_pct) as usize;
+            let warn = (limit as f32 * self.config.warn_pct) as usize;
+            if severe > 0 && used >= severe {
+                let old = *stage_flags;
+                *stage_flags |= severe_flag | warn_flag;
+                self.flags
+                    .fetch_or(severe_flag | warn_flag, Ordering::Relaxed);
+                if old & severe_flag == 0 {
+                    level = Some(BudgetLevel::Severe);
+                }
+            } else if warn > 0 && used >= warn {
+                let old = *stage_flags;
+                *stage_flags |= warn_flag;
+                self.flags.fetch_or(warn_flag, Ordering::Relaxed);
+                if old & warn_flag == 0 && level.is_none() {
+                    level = Some(BudgetLevel::Warn);
+                }
+            }
+        }
+
+        let review_values = [
             (
                 review_input,
                 review_input_limit,
@@ -94,9 +123,7 @@ impl ReviewBudget {
                 REVIEW_OUTPUT_SEVERE,
             ),
         ];
-
-        let mut level = None;
-        for (used, limit, warn_flag, severe_flag) in values {
+        for (used, limit, warn_flag, severe_flag) in review_values {
             if limit == 0 {
                 continue;
             }
@@ -133,19 +160,46 @@ mod tests {
             severe_pct: 0.9,
             review_multiplier: 2.0,
         });
+        let mut stage_flags = 0;
 
         assert!(matches!(
-            budget.record_and_check(50, 0, 50, 0),
+            budget.record_and_check(&mut stage_flags, 50, 0, 50, 0),
             Some(BudgetLevel::Warn)
         ));
-        assert!(budget.record_and_check(60, 0, 10, 0).is_none());
+        assert!(
+            budget
+                .record_and_check(&mut stage_flags, 60, 0, 10, 0)
+                .is_none()
+        );
         assert!(matches!(
-            budget.record_and_check(90, 0, 30, 0),
+            budget.record_and_check(&mut stage_flags, 90, 0, 30, 0),
             Some(BudgetLevel::Severe)
         ));
         assert_eq!(
             budget.flags() & (STAGE_INPUT_WARN | STAGE_INPUT_SEVERE),
             STAGE_INPUT_WARN | STAGE_INPUT_SEVERE
         );
+    }
+
+    #[test]
+    fn stage_thresholds_are_independent_between_sessions() {
+        let budget = ReviewBudget::new(BudgetConfig {
+            stage_input: 100,
+            stage_output: 0,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+        });
+        let mut first_stage = 0;
+        let mut second_stage = 0;
+
+        assert!(matches!(
+            budget.record_and_check(&mut first_stage, 50, 0, 50, 0),
+            Some(BudgetLevel::Warn)
+        ));
+        assert!(matches!(
+            budget.record_and_check(&mut second_stage, 50, 0, 50, 0),
+            Some(BudgetLevel::Warn)
+        ));
     }
 }

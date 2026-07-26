@@ -93,6 +93,7 @@ impl ReviewStage for Stage8 {
                     "output 'concerns' is not an array".to_string(),
                 ));
             }
+            validate_source_stages(c, "concern")?;
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'concerns' array in output".to_string(),
@@ -132,6 +133,7 @@ impl ReviewStage for Stage9 {
                     "output 'concerns' is not an array".to_string(),
                 ));
             }
+            validate_source_stages(c, "concern")?;
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'concerns' array in output".to_string(),
@@ -163,6 +165,7 @@ impl ReviewStage for Stage10 {
                     "output 'findings' is not an array".to_string(),
                 ));
             }
+            validate_source_stages(f, "finding")?;
         } else {
             return Err(ValidationError::FormatViolation(
                 "missing 'findings' array in output".to_string(),
@@ -305,6 +308,22 @@ fn required_stage_arrays(value: &Value) -> std::result::Result<(&[Value], &[Valu
         })?;
 
     Ok((concerns.as_slice(), dismissed_concerns.as_slice()))
+}
+
+fn validate_source_stages(value: &Value, item_name: &str) -> Result<(), ValidationError> {
+    let Some(items) = value.as_array() else {
+        return Ok(());
+    };
+    if items
+        .iter()
+        .any(|item| !item.get("source_stages").is_some_and(Value::is_array))
+    {
+        return Err(ValidationError::FormatViolation(format!(
+            "every {} must contain a 'source_stages' array",
+            item_name
+        )));
+    }
+    Ok(())
 }
 
 fn parse_json_response(response: &AiResponse) -> Result<serde_json::Value, ValidationError> {

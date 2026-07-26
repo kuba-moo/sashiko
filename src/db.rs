@@ -3437,7 +3437,7 @@ impl Database {
             .await?;
 
         if let Ok(Some(r)) = rows.next().await {
-            let embargo_until: Option<i64> = r.get(21).ok();
+            let embargo_until: Option<i64> = r.get(20).ok();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
@@ -3471,7 +3471,7 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
-                "budget_flags": r.get::<Option<i64>>(20).ok().flatten().unwrap_or(0),
+                "budget_flags": r.get::<Option<i64>>(19).ok().flatten().unwrap_or(0),
             })))
         } else {
             Ok(None)
@@ -4948,9 +4948,33 @@ mod tests {
             .await
             .unwrap();
 
-        db.create_review(ps_id, None, "gemini", "test-model", None, None)
+        let review_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
             .await
             .unwrap();
+        db.conn
+            .execute(
+                "UPDATE reviews SET status = 'Reviewed', summary = 'private review', budget_flags = 0x42 WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+
+        let hidden = db
+            .get_review_details(review_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hidden["status"], "Embargoed");
+        assert!(hidden.get("summary").is_none());
+
+        let visible = db
+            .get_review_details(review_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible["summary"], "private review");
+        assert_eq!(visible["budget_flags"], 0x42);
 
         let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
         assert_eq!(patchsets[0].status.as_deref(), Some("Embargoed"));

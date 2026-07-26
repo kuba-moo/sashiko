@@ -5,17 +5,20 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 const SEMCODE_DB_DIR: &str = ".semcode.db";
+const SEMCODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SemcodeToolBox {
     child: Mutex<Child>,
     stdin: Mutex<tokio::process::ChildStdin>,
     stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
+    request: Mutex<()>,
     next_id: AtomicU64,
 }
 
@@ -55,6 +58,7 @@ impl SemcodeToolBox {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
+            request: Mutex::new(()),
             next_id: AtomicU64::new(1),
         };
 
@@ -78,6 +82,25 @@ impl SemcodeToolBox {
     }
 
     async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
+        tokio::time::timeout(
+            SEMCODE_REQUEST_TIMEOUT,
+            self.send_request_inner(method, params),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "semcode-mcp request '{}' timed out after {:?}",
+                method,
+                SEMCODE_REQUEST_TIMEOUT
+            )
+        })?
+    }
+
+    async fn send_request_inner(&self, method: &str, params: Value) -> Result<Value> {
+        // semcode-mcp uses one stdin/stdout pair. Keep the complete
+        // write/read transaction serialized so another caller cannot consume
+        // this request's response while stages or tool calls run in parallel.
+        let _request = self.request.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "jsonrpc": "2.0",

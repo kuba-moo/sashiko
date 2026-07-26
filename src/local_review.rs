@@ -838,7 +838,7 @@ async fn run_worker_in_worktree(
         },
     );
 
-    if let Some(settings) = semcode.filter(|settings| settings.enabled) {
+    let semcode_ready = if let Some(settings) = semcode.filter(|settings| settings.enabled) {
         let setup = async {
             crate::worker::semcode_tools::copy_semcode_db(&worktree.repo_path, &worktree.path)
                 .await?;
@@ -856,8 +856,13 @@ async fn run_worker_in_worktree(
         };
         if let Err(error) = setup.await {
             tracing::warn!("Semcode setup failed; continuing without it: {}", error);
+            false
+        } else {
+            true
         }
-    }
+    } else {
+        false
+    };
 
     let rich_patches: Vec<Value> = patches_to_review
         .iter()
@@ -902,7 +907,7 @@ async fn run_worker_in_worktree(
                 options,
                 baseline_sha,
                 progress,
-                semcode,
+                semcode.filter(|_| semcode_ready),
             )
             .await
         }

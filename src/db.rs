@@ -1630,12 +1630,57 @@ impl Database {
             }
         }
 
+        // Attribute shared findings to every stage that contributed to them.
+        let subsystem_join = if subsystem_id.is_some() {
+            "JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id"
+        } else {
+            ""
+        };
+        let subsystem_filter = if subsystem_id.is_some() {
+            "AND ps.subsystem_id = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT CAST(stage.value AS INTEGER) AS stage,
+                    COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 THEN f.id END),
+                    COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) > 1 THEN f.id END)
+             FROM findings f
+             JOIN reviews r ON f.review_id = r.id
+             {}
+             JOIN json_each(
+                CASE WHEN json_valid(f.source_stages) THEN f.source_stages ELSE '[]' END
+             ) AS stage
+             WHERE r.created_at >= unixepoch('now', '-13 days', 'start of day')
+               AND json_valid(f.source_stages)
+               AND json_type(f.source_stages) = 'array'
+               AND json_array_length(f.source_stages) > 0
+               AND stage.type = 'integer'
+               {}
+             GROUP BY stage.value
+             ORDER BY stage",
+            subsystem_join, subsystem_filter
+        );
+        let mut findings_by_stage = Vec::new();
+        let mut rows = match subsystem_id {
+            Some(sid) => self.conn.query(&sql, libsql::params![sid]).await?,
+            None => self.conn.query(&sql, ()).await?,
+        };
+        while let Ok(Some(row)) = rows.next().await {
+            findings_by_stage.push(json!({
+                "stage": row.get::<i64>(0)?,
+                "unique": row.get::<i64>(1)?,
+                "duplicates": row.get::<i64>(2)?,
+            }));
+        }
+
         Ok(json!({
             "messages": messages_data,
             "patchsets": patchsets_data,
             "patches": patches_data,
             "reviews": reviews_data,
-            "findings": findings_data
+            "findings": findings_data,
+            "findings_by_stage": findings_by_stage
         }))
     }
 
@@ -4897,6 +4942,40 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn timeline_stats_count_unique_and_duplicate_findings_by_stage() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO reviews (id, patchset_id, created_at) VALUES
+                    (1, 1, unixepoch('now')),
+                    (2, 1, unixepoch('now', '-14 days'));
+                 INSERT INTO findings (review_id, severity, source_stages) VALUES
+                    (1, 1, '[1]'),
+                    (1, 1, '[1,2]'),
+                    (1, 1, '[2,3]'),
+                    (1, 1, '[3,3]'),
+                    (1, 1, 'invalid'),
+                    (1, 1, NULL),
+                    (2, 1, '[1]');",
+            )
+            .await
+            .unwrap();
+
+        let stats = db.get_timeline_stats(None).await.unwrap();
+
+        assert_eq!(
+            stats["findings_by_stage"],
+            json!([
+                {"stage": 1, "unique": 1, "duplicates": 1},
+                {"stage": 2, "unique": 0, "duplicates": 2},
+                {"stage": 3, "unique": 0, "duplicates": 2},
+            ])
+        );
     }
 
     #[tokio::test]

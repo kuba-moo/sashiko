@@ -3428,6 +3428,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += '<h3>Review Outcomes</h3><div class="chart-section"><div id="chart-review-outcomes" class="chart-container"></div></div>';
 
                 html += '<h3>Findings Severity</h3><div class="chart-section"><div id="chart-findings" class="chart-container"></div></div>';
+                html += '<h3>Unique vs Duplicate Findings by Stage (last 14 days)</h3><div class="chart-section"><div id="chart-findings-stage" class="chart-container"></div></div>';
 
                 // Calculate total tokens
                 // Exclude In Review (Pending/In Review) AND Failed To Apply
@@ -3483,6 +3484,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += renderStatCard('Cost last 30 days', '$' + cost30.toFixed(2));
                 html += '</div>';
                 html += '<h3>Daily cost by model</h3><div class="chart-section"><div id="chart-cost-daily" style="width:100%; height:300px;"></div></div>';
+                html += '<h3>Monthly LLM Token Usage by Model</h3><div class="chart-section"><div id="chart-model-usage-monthly" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Per-patch cost &amp; time (with vs without findings)</h3><div class="chart-section"><div id="chart-cost-perpatch" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Throughput &amp; signal</h3><div class="chart-section"><div id="chart-throughput" style="width:100%; height:300px;"></div></div>';
 
@@ -3723,6 +3725,27 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     document.getElementById('chart-findings').innerHTML = '<p class="loading">No findings data available.</p>';
                 }
 
+                // --- 4.5. Unique and duplicate findings by contributing stage ---
+                if (timeline.findings_by_stage && timeline.findings_by_stage.length) {
+                    const chart = echarts.init(document.getElementById('chart-findings-stage'), isDark ? 'dark' : null);
+                    const stageFindings = timeline.findings_by_stage;
+                    chart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                        legend: { data: ['Unique', 'Duplicates'], bottom: 0 },
+                        grid: { left: '3%', right: '4%', bottom: '15%', top: '5%', containLabel: true },
+                        xAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
+                        yAxis: { type: 'category', data: stageFindings.map(row => 'Stage ' + row.stage) },
+                        series: [
+                            { name: 'Unique', type: 'bar', stack: 'findings', itemStyle: { color: '#2e7d32' }, data: stageFindings.map(row => row.unique) },
+                            { name: 'Duplicates', type: 'bar', stack: 'findings', itemStyle: { color: '#e07a1f' }, data: stageFindings.map(row => row.duplicates) }
+                        ]
+                    });
+                    state.activeCharts.push(chart);
+                } else {
+                    document.getElementById('chart-findings-stage').innerHTML = '<p class="loading">No stage provenance available in the last 14 days.</p>';
+                }
+
                 // --- 5. Cost charts ---
                 if (daily.length) {
                     const costDates = daily.map(d => d.day);
@@ -3757,7 +3780,44 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         yAxis: { type: 'value', axisLabel: { formatter: '${value}' }, splitLine: { lineStyle: { type: 'dashed' } } },
                         series: modelSeries
                     });
-                    window.addEventListener('resize', () => costChart.resize());
+                    state.activeCharts.push(costChart);
+
+                    // Calendar-month token totals, stacked by model.
+                    const monthlyUsage = new Map();
+                    daily.forEach(day => {
+                        const month = day.day.slice(0, 7);
+                        if (!monthlyUsage.has(month)) monthlyUsage.set(month, new Map());
+                        const usageByModel = monthlyUsage.get(month);
+                        (day.by_model || []).forEach(entry => {
+                            const model = entry.model || '(unknown)';
+                            // Cached tokens are already included in tokens_in.
+                            const tokens = (entry.tokens_in || 0) + (entry.tokens_out || 0);
+                            usageByModel.set(model, (usageByModel.get(model) || 0) + tokens);
+                        });
+                    });
+                    const months = [...monthlyUsage.keys()].sort();
+                    const monthLabel = month => {
+                        const [year, monthNumber] = month.split('-').map(Number);
+                        return new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' })
+                            .format(new Date(Date.UTC(year, monthNumber - 1, 1)));
+                    };
+                    const usageChart = echarts.init(document.getElementById('chart-model-usage-monthly'), isDark ? 'dark' : null);
+                    usageChart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: value => Number(value || 0).toLocaleString() + ' tokens' },
+                        legend: { data: models, bottom: 0 },
+                        grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
+                        xAxis: { type: 'category', data: months.map(monthLabel), axisLine: { lineStyle: { color: themeAxis } } },
+                        yAxis: { type: 'value', axisLabel: { formatter: value => echarts.format.addCommas(value) }, splitLine: { lineStyle: { type: 'dashed' } } },
+                        series: models.map(model => ({
+                            name: model,
+                            type: 'bar',
+                            stack: 'tokens',
+                            emphasis: { focus: 'series' },
+                            data: months.map(month => monthlyUsage.get(month).get(model) || 0)
+                        }))
+                    });
+                    state.activeCharts.push(usageChart);
 
                     // 5b. Per-patch avg cost and duration, split by with/without findings.
                     const avg = (sumTokens, count, model) => {
@@ -3853,6 +3913,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     window.addEventListener('resize', () => tChart.resize());
                 } else {
                     document.getElementById('chart-cost-daily').innerHTML = '<p class="loading">No cost data available.</p>';
+                    document.getElementById('chart-model-usage-monthly').innerHTML = '<p class="loading">No LLM usage data available.</p>';
                     document.getElementById('chart-cost-perpatch').innerHTML = '<p class="loading">No cost data available.</p>';
                     document.getElementById('chart-throughput').innerHTML = '<p class="loading">No cost data available.</p>';
                 }

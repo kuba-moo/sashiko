@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS patchsets (
     provider TEXT,
     embargo_until INTEGER,
     embargo_release_started_at INTEGER,
+    cross_review_status TEXT NOT NULL DEFAULT 'disabled',
+    cross_reviewed_at INTEGER,
+    cross_review_generation INTEGER NOT NULL DEFAULT 0,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
@@ -136,6 +139,8 @@ CREATE TABLE IF NOT EXISTS findings (
     preexisting INTEGER, -- 0 = false, 1 = true
     locations TEXT,
     source_stages TEXT,
+    cross_review_job_id INTEGER,
+    external_finding_id TEXT,
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_review_id ON findings(review_id);
@@ -318,6 +323,86 @@ CREATE TABLE IF NOT EXISTS model_confirmation_runs (
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_model_confirmation_runs_review ON model_confirmation_runs(review_id);
+
+CREATE TABLE IF NOT EXISTS cross_review_jobs (
+    id INTEGER PRIMARY KEY,
+    patchset_id INTEGER NOT NULL,
+    source_name TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    local_model TEXT NOT NULL DEFAULT '',
+    local_provider TEXT NOT NULL DEFAULT '',
+    lookup_message_id TEXT NOT NULL,
+    fallback_message_id TEXT,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    first_attempt_at INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL,
+    deadline_at INTEGER NOT NULL,
+    lease_until INTEGER,
+    lease_token TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    completed_at INTEGER,
+    remote_model TEXT,
+    remote_provider TEXT,
+    payload_hash TEXT,
+    merge_tokens_in INTEGER NOT NULL DEFAULT 0,
+    merge_tokens_out INTEGER NOT NULL DEFAULT 0,
+    merge_tokens_cached INTEGER NOT NULL DEFAULT 0,
+    merge_budget_flags INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+    UNIQUE(patchset_id, generation, source_name)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_review_jobs_due
+    ON cross_review_jobs(status, next_attempt_at, lease_until);
+
+CREATE TABLE IF NOT EXISTS cross_review_findings (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    patch_message_id TEXT NOT NULL,
+    finding_json TEXT NOT NULL,
+    accepted INTEGER,
+    FOREIGN KEY(job_id) REFERENCES cross_review_jobs(id),
+    UNIQUE(job_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_review_findings_job
+    ON cross_review_findings(job_id);
+
+CREATE TABLE IF NOT EXISTS cross_review_comparisons (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    matched_finding_id TEXT,
+    outcome TEXT NOT NULL,
+    severity TEXT,
+    FOREIGN KEY(job_id) REFERENCES cross_review_jobs(id),
+    UNIQUE(job_id, finding_id, outcome)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_review_comparisons_job
+    ON cross_review_comparisons(job_id);
+
+CREATE TABLE IF NOT EXISTS local_canonical_findings (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    finding_json TEXT NOT NULL,
+    accepted INTEGER NOT NULL,
+    FOREIGN KEY(review_id) REFERENCES reviews(id),
+    UNIQUE(review_id, finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_local_canonical_findings_review
+    ON local_canonical_findings(review_id);
+
+CREATE TABLE IF NOT EXISTS review_merge_runs (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL UNIQUE,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    tokens_cached INTEGER NOT NULL DEFAULT 0,
+    budget_flags INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(review_id) REFERENCES reviews(id)
+);
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_date ON patchsets(date DESC);
 CREATE INDEX IF NOT EXISTS idx_reviews_patchset_status ON reviews(patchset_id, status);

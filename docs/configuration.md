@@ -96,6 +96,25 @@ review limits. Zero or an omitted value disables that limit.
 | `warn_pct` | float | legacy value | Fraction that triggers the first budget warning. |
 | `severe_pct` | float | legacy value | Fraction that forces the session to conclude. |
 
+#### `[ai.merge_budget]`
+
+Optional limits for the merge ledger used by stages 8 through 11 and by each
+cross-instance integration. It accepts the same keys as `[ai.budget]`.
+Omitted keys inherit from `[ai.budget]`; each local patch merge and each remote
+source starts a fresh ledger.
+
+```toml
+[ai.merge_budget]
+stage_input_tokens = 150000
+stage_output_tokens = 6000
+review_input_tokens = 450000
+review_output_tokens = 18000
+```
+
+Discovery and merge consumption are isolated. A cross-instance merge that
+exhausts this budget fails only its durable cross-review job and cannot change
+an already published local result.
+
 #### `[[ai.additional_models]]`
 
 Optional live model experiments. Each model is sampled once per patch review.
@@ -385,6 +404,28 @@ context: sashiko
 ```
 
 Downstream tools can parse this format with simple line splitting.
+
+## Cross-instance reviews
+
+Configure one or more public Sashiko instances whose final results should be
+imported after the local review is published:
+
+```toml
+[[cross_review.instances]]
+name = "gemini-instance"
+url = "https://gemini-review.example.org"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | -- | Stable, unique source name using ASCII letters, digits, `_`, or `-`. `main` is reserved. |
+| `url` | string | -- | Base HTTP or HTTPS URL of a Sashiko instance running the public origin/main API. |
+
+Sashiko polls the remote `/api/patchset` endpoint by message ID. Pending,
+in-progress, missing, and embargoed results are retried hourly for up to three
+days. All polling state is stored in the database and survives restarts.
+Remote-only findings are batch-confirmed by the local main model before they
+are added to the local web and API result. Previously sent email is unchanged.
 
 ## Environment variables
 

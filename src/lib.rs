@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod ai;
 pub mod api;
 pub mod baseline;
+pub mod cross_review;
 pub mod db;
 pub mod email_policy;
 pub mod email_router;

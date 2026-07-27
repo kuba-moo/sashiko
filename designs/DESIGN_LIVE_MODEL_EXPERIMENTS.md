@@ -138,24 +138,36 @@ does not weaken normal false-positive filtering.
 
 ## Budget Ownership
 
-Every source owns an independent discovery ledger. Confirmation work uses
-independent validation ledgers keyed by confirmer. Numeric limits inherit from
-the main configuration unless a variant overrides them.
+Every source owns an independent discovery ledger for stages 1 through 7.
+Stages 8 through 11 use a separate merge ledger. Confirmation performed while
+merging local model results is charged to that merge ledger rather than to a
+discovering source.
 
 ```text
 patch review
   main discovery ledger
   variant A discovery ledger
   variant B discovery ledger
-  validation ledger: main
-  validation ledger: variant A
-  validation ledger: variant B
+  initial merge ledger
 ```
+
+The main discovery ledger therefore cannot steer merge retry behavior, and
+variant usage cannot consume either the main discovery or merge budget.
+Additional merge invocations, such as later cross-instance integration, each
+start a fresh ledger from the same merge configuration.
 
 The current implementation records aggregate usage for each discovery stage and
 each batched validation run. Retry usage is included when the provider reports
 it. Cached input remains part of context usage and is also recorded separately
 for pricing. Request- and attempt-level ledger persistence remains future work.
+
+The review subprocess aggregation boundary preserves private per-patch merge
+metadata alongside the public findings. In particular, canonical candidates,
+experiment runs and comparisons, and the merge-ledger snapshot must reach the
+parent reviewer unchanged for a single-patch production invocation. Failed
+merge attempts return a structured ledger snapshot as well; a later successful
+retry accumulates prior attempt usage, while a terminal failure persists the
+snapshot on the failed review.
 
 Each request checks its input estimate against the source's stage limit before
 dispatch. Completion atomically records actual input and output usage, then
@@ -170,6 +182,9 @@ Existing flat budget settings remain accepted. New nested source budget values
 map directly to stage and review input/output limits. Explicit review limits
 supersede the legacy review multiplier when both are present.
 
+`[ai.merge_budget]` accepts the same stage and review fields as `[ai.budget]`.
+When omitted it inherits `[ai.budget]`, preserving existing configurations.
+
 ## Configuration
 
 ```toml
@@ -183,6 +198,12 @@ stage_input_tokens = 120000
 stage_output_tokens = 6000
 review_input_tokens = 480000
 review_output_tokens = 24000
+
+[ai.merge_budget]
+stage_input_tokens = 150000
+stage_output_tokens = 6000
+review_input_tokens = 450000
+review_output_tokens = 18000
 
 [ai.model_experiments.validation_budget]
 request_input_tokens = 150000

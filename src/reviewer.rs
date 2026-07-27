@@ -19,6 +19,7 @@ use crate::ai::{
     create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, extract_files_from_diff};
+use crate::cross_review::{CrossReviewClient, PollResult, analyze_remote_result};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
@@ -71,6 +72,14 @@ fn generate_id() -> String {
     format!("rev_{}", since_the_epoch.as_millis())
 }
 
+fn public_review_output(review: &Value) -> String {
+    let mut public_review = review.clone();
+    if let Some(object) = public_review.as_object_mut() {
+        object.remove("canonical_candidates");
+    }
+    public_review.to_string()
+}
+
 /// The `Reviewer` service orchestrates the review process for patchsets.
 ///
 /// It manages:
@@ -86,6 +95,7 @@ pub struct Reviewer {
     baseline_registry: Arc<BaselineRegistry>,
     quota_manager: Arc<QuotaManager>,
     provider: Arc<dyn AiProvider>,
+    cross_review_client: CrossReviewClient,
 }
 
 impl Reviewer {
@@ -123,6 +133,8 @@ impl Reviewer {
         )
         .await
         .expect("Failed to create AI provider");
+        let cross_review_client =
+            CrossReviewClient::new().expect("Failed to create cross-review HTTP client");
 
         // Mathematically derived from Sashiko's review pipeline stage composition:
         // Stages 1-7 run in parallel (7 slots), while Stages 8-11 run sequentially (1 slot).
@@ -143,6 +155,7 @@ impl Reviewer {
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
+            cross_review_client,
         }
     }
 
@@ -196,6 +209,10 @@ impl Reviewer {
                 error!("Error releasing embargoed results: {}", e);
             }
 
+            if let Err(e) = self.process_cross_reviews().await {
+                error!("Error processing cross-instance reviews: {}", e);
+            }
+
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     }
@@ -230,6 +247,142 @@ impl Reviewer {
             });
         }
 
+        Ok(())
+    }
+
+    async fn process_cross_reviews(&self) -> Result<()> {
+        if self.settings.cross_review.instances.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let jobs = self.db.claim_due_cross_reviews(now, 4).await?;
+        for job in jobs {
+            let db = self.db.clone();
+            let provider = self.provider.clone();
+            let client = self.cross_review_client.clone();
+            let llm_semaphore = self.llm_semaphore.clone();
+            let merge_budget_config = self.settings.ai.merge_budget_config();
+            tokio::spawn(async move {
+                if let Err(error) = Self::process_cross_review_job(
+                    db,
+                    provider,
+                    client,
+                    llm_semaphore,
+                    merge_budget_config,
+                    job,
+                )
+                .await
+                {
+                    error!("Cross-review job failed: {}", error);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn process_cross_review_job(
+        db: Arc<Database>,
+        provider: Arc<dyn AiProvider>,
+        client: CrossReviewClient,
+        llm_semaphore: Arc<Semaphore>,
+        merge_budget_config: crate::ai::review_budget::BudgetConfig,
+        job: crate::db::CrossReviewJob,
+    ) -> Result<()> {
+        match client
+            .poll(
+                &job.source_url,
+                &job.lookup_message_id,
+                job.fallback_message_id.as_deref(),
+                &job.source_name,
+            )
+            .await
+        {
+            PollResult::Waiting(reason) => {
+                let now = chrono::Utc::now().timestamp();
+                db.retry_cross_review(&job, now, &reason).await?;
+                Ok(())
+            }
+            PollResult::Terminal(error) => {
+                let now = chrono::Utc::now().timestamp();
+                db.finish_cross_review_job(&job, "error", now, Some(&error))
+                    .await?;
+                Ok(())
+            }
+            PollResult::Complete(remote) => {
+                Self::integrate_cross_review_job(
+                    db,
+                    provider,
+                    llm_semaphore,
+                    merge_budget_config,
+                    job,
+                    remote,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn integrate_cross_review_job(
+        db: Arc<Database>,
+        provider: Arc<dyn AiProvider>,
+        llm_semaphore: Arc<Semaphore>,
+        merge_budget_config: crate::ai::review_budget::BudgetConfig,
+        job: crate::db::CrossReviewJob,
+        remote: crate::cross_review::RemoteReviewResult,
+    ) -> Result<()> {
+        let mut total_usage = crate::cross_review::CrossReviewUsage::default();
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            let merge_budget = crate::ai::review_budget::ReviewBudget::new(merge_budget_config);
+            let mut usage = crate::cross_review::CrossReviewUsage::default();
+            let result = async {
+                let (local, patch_context) = db.load_cross_review_inputs(job.patchset_id).await?;
+                let _permit = llm_semaphore.acquire().await?;
+                analyze_remote_result(
+                    provider.as_ref(),
+                    &patch_context,
+                    &local,
+                    &remote.findings,
+                    Some(&merge_budget),
+                    &mut usage,
+                )
+                .await
+            }
+            .await;
+            usage.budget_flags |= merge_budget.flags();
+            total_usage.add(usage);
+
+            let result = match result {
+                Ok(analysis) => {
+                    let now = chrono::Utc::now().timestamp();
+                    db.persist_cross_review_result(&job, &remote, &analysis, &total_usage, now)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    warn!(
+                        "Cross-review integration attempt {}/3 failed for {}: {}",
+                        attempt, job.source_name, error
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let error = last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "cross-review integration failed".to_string());
+        if db
+            .record_cross_review_usage(&job, now, &total_usage)
+            .await?
+        {
+            db.finish_cross_review_job(&job, "error", now, Some(&error))
+                .await?;
+        }
         Ok(())
     }
 
@@ -291,6 +444,22 @@ impl Reviewer {
         }
 
         let result = Self::queue_patchset_notifications(ctx, patchset).await;
+        if result.is_ok() {
+            let instances: Vec<(String, String)> = ctx
+                .settings
+                .cross_review
+                .instances
+                .iter()
+                .map(|instance| (instance.name.clone(), instance.url.clone()))
+                .collect();
+            if let Err(error) = ctx
+                .db
+                .enqueue_cross_reviews(patchset.id, &instances, now)
+                .await
+            {
+                error!("Failed to enqueue cross-reviews: {}", error);
+            }
+        }
         if result.is_err()
             && let Err(e) = ctx
                 .db
@@ -723,6 +892,30 @@ impl Reviewer {
                     .db
                     .update_patchset_status(patchset_id, &final_status)
                     .await;
+
+                if review_success
+                    && patchset.embargo_until.is_none()
+                    && !ctx.settings.cross_review.instances.is_empty()
+                {
+                    let instances: Vec<(String, String)> = ctx
+                        .settings
+                        .cross_review
+                        .instances
+                        .iter()
+                        .map(|instance| (instance.name.clone(), instance.url.clone()))
+                        .collect();
+                    if let Err(error) = ctx
+                        .db
+                        .enqueue_cross_reviews(
+                            patchset_id,
+                            &instances,
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await
+                    {
+                        error!("Failed to enqueue cross-reviews: {}", error);
+                    }
+                }
 
                 if review_success
                     && patchset.embargo_until.is_some()
@@ -1229,7 +1422,7 @@ impl Reviewer {
                         let i_id = generate_id();
                         let input_ctx = json_output["input_context"].as_str().unwrap_or("");
                         let output_raw = if let Some(r) = json_output.get("review") {
-                            r.to_string()
+                            public_review_output(r)
                         } else if let Some(e) = json_output.get("error") {
                             e.to_string()
                         } else {
@@ -1263,6 +1456,12 @@ impl Reviewer {
                                 "Review tool returned error for ps={} idx={}: {}",
                                 patchset_id, index, error_msg
                             );
+                            if let Some(usage) = json_output.get("merge_usage")
+                                && let Err(error) =
+                                    ctx.db.save_review_merge_run(review_id, usage).await
+                            {
+                                error!("Failed to save failed merge usage: {}", error);
+                            }
                             let _ = ctx
                                 .db
                                 .complete_review(
@@ -1349,6 +1548,22 @@ impl Reviewer {
                                         .await
                                 {
                                     error!("Failed to save model experiment: {}", error);
+                                }
+                                if let Some(canonical) = review_content.get("canonical_candidates")
+                                {
+                                    ctx.db
+                                        .save_local_canonical_findings(
+                                            review_id,
+                                            canonical,
+                                            &review_content["findings"],
+                                        )
+                                        .await?;
+                                }
+                                if let Some(usage) = review_content.get("merge_usage")
+                                    && let Err(error) =
+                                        ctx.db.save_review_merge_run(review_id, usage).await
+                                {
+                                    error!("Failed to save merge usage: {}", error);
                                 }
 
                                 let mut db_success = true;
@@ -2570,6 +2785,21 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[test]
+    fn public_review_output_hides_internal_canonical_candidates() {
+        let output = public_review_output(&json!({
+            "findings": [{"problem": "published"}],
+            "canonical_candidates": [
+                {"problem": "published"},
+                {"problem": "rejected internal candidate"}
+            ]
+        }));
+
+        assert!(output.contains("published"));
+        assert!(!output.contains("canonical_candidates"));
+        assert!(!output.contains("rejected internal candidate"));
+    }
+
     struct MockProvider;
     #[async_trait]
     impl AiProvider for MockProvider {
@@ -2614,6 +2844,127 @@ mod tests {
                 context_window_size: 1000,
             }
         }
+    }
+
+    struct MalformedCrossReviewProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for MalformedCrossReviewProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some("{".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                    cached_tokens: Some(1),
+                    cache_write_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "malformed-cross-review".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_review_integration_stops_after_three_immediate_attempts() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, status, target_review_count, model_name, provider)
+                    VALUES (1, 1, 'Reviewed', 1, 'local-model', 'local-provider');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                 INSERT INTO ai_interactions (id, input_context, output_raw)
+                    VALUES ('local', 'prepared context', '{\"findings\":[]}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status)
+                    VALUES (20, 1, 10, 'local', 'Reviewed');",
+            )
+            .await?;
+        let now = chrono::Utc::now().timestamp();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            now,
+        )
+        .await?;
+        let job = db
+            .claim_due_cross_reviews(now, 1)
+            .await?
+            .pop()
+            .expect("cross-review job was not claimed");
+        let provider = Arc::new(MalformedCrossReviewProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let remote = crate::cross_review::RemoteReviewResult {
+            model: "remote-model".to_string(),
+            provider: "remote-provider".to_string(),
+            payload_hash: "payload".to_string(),
+            findings: vec![crate::cross_review::RemoteFinding {
+                finding_id: "remote".to_string(),
+                patch_message_id: "patch@example".to_string(),
+                severity: "High".to_string(),
+                problem: "remote problem".to_string(),
+                reasoning: String::new(),
+                locations: json!([]),
+            }],
+        };
+        Reviewer::integrate_cross_review_job(
+            db.clone(),
+            provider.clone(),
+            Arc::new(Semaphore::new(1)),
+            settings.ai.merge_budget_config(),
+            job,
+            remote,
+        )
+        .await?;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, merge_tokens_in, merge_tokens_out,
+                        merge_tokens_cached
+                 FROM cross_review_jobs WHERE patchset_id = 1",
+                (),
+            )
+            .await?;
+        let row = rows.next().await?.expect("cross-review job disappeared");
+        assert_eq!(row.get::<String>(0)?, "error");
+        assert_eq!(row.get::<i64>(1)?, 6);
+        assert_eq!(row.get::<i64>(2)?, 3);
+        assert_eq!(row.get::<i64>(3)?, 3);
+        drop(rows);
+        assert!(
+            db.claim_due_cross_reviews(now + 60 * 60, 1)
+                .await?
+                .is_empty()
+        );
+        Ok(())
     }
 
     struct RateLimitThenSuccessProvider {

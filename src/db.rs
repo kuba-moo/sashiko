@@ -27,6 +27,34 @@ pub struct Database {
     pub conn: libsql::Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct CrossReviewJob {
+    pub id: i64,
+    pub patchset_id: i64,
+    pub source_name: String,
+    pub source_url: String,
+    pub local_model: String,
+    pub local_provider: String,
+    pub lookup_message_id: String,
+    pub fallback_message_id: Option<String>,
+    pub generation: i64,
+    pub lease_token: String,
+    pub deadline_at: i64,
+    pub attempts: i64,
+}
+
+fn append_unique_string(value: &mut serde_json::Value, item: &str) {
+    if !value.is_array() {
+        *value = serde_json::Value::Array(Vec::new());
+    }
+    let Some(values) = value.as_array_mut() else {
+        return;
+    };
+    if !values.iter().any(|value| value.as_str() == Some(item)) {
+        values.push(serde_json::Value::String(item.to_string()));
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subsystem {
     pub id: i64,
@@ -69,6 +97,8 @@ pub struct PatchsetRow {
     pub concerns_unique: Option<i64>,
     pub findings_multi_stage: Option<i64>,
     pub budget_flags_or: Option<i64>,
+    pub cross_review_status: Option<String>,
+    pub cross_reviewed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,9 +558,57 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_sources_review ON model_experiment_sources(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_findings_review ON model_experiment_findings(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_confirmation_runs_review ON model_confirmation_runs(review_id)",
+            "CREATE TABLE IF NOT EXISTS cross_review_jobs (id INTEGER PRIMARY KEY, patchset_id INTEGER NOT NULL, source_name TEXT NOT NULL, source_url TEXT NOT NULL, local_model TEXT NOT NULL DEFAULT '', local_provider TEXT NOT NULL DEFAULT '', lookup_message_id TEXT NOT NULL, fallback_message_id TEXT, generation INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', first_attempt_at INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL, deadline_at INTEGER NOT NULL, lease_until INTEGER, lease_token TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, completed_at INTEGER, remote_model TEXT, remote_provider TEXT, payload_hash TEXT, merge_tokens_in INTEGER NOT NULL DEFAULT 0, merge_tokens_out INTEGER NOT NULL DEFAULT 0, merge_tokens_cached INTEGER NOT NULL DEFAULT 0, merge_budget_flags INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(patchset_id) REFERENCES patchsets(id), UNIQUE(patchset_id, generation, source_name))",
+            "CREATE INDEX IF NOT EXISTS idx_cross_review_jobs_due ON cross_review_jobs(status, next_attempt_at, lease_until)",
+            "CREATE TABLE IF NOT EXISTS cross_review_findings (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, finding_id TEXT NOT NULL, patch_message_id TEXT NOT NULL, finding_json TEXT NOT NULL, accepted INTEGER, FOREIGN KEY(job_id) REFERENCES cross_review_jobs(id), UNIQUE(job_id, finding_id))",
+            "CREATE INDEX IF NOT EXISTS idx_cross_review_findings_job ON cross_review_findings(job_id)",
+            "CREATE TABLE IF NOT EXISTS cross_review_comparisons (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, finding_id TEXT NOT NULL, matched_finding_id TEXT, outcome TEXT NOT NULL, severity TEXT, FOREIGN KEY(job_id) REFERENCES cross_review_jobs(id), UNIQUE(job_id, finding_id, outcome))",
+            "CREATE INDEX IF NOT EXISTS idx_cross_review_comparisons_job ON cross_review_comparisons(job_id)",
+            "CREATE TABLE IF NOT EXISTS local_canonical_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, finding_id TEXT NOT NULL, finding_json TEXT NOT NULL, accepted INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id), UNIQUE(review_id, finding_id))",
+            "CREATE INDEX IF NOT EXISTS idx_local_canonical_findings_review ON local_canonical_findings(review_id)",
+            "CREATE TABLE IF NOT EXISTS review_merge_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL UNIQUE, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
         ] {
             let _ = self.conn.execute(sql, ()).await;
         }
+        let _ = self
+            .try_add_column("cross_review_jobs", "fallback_message_id", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column(
+                "cross_review_jobs",
+                "generation",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            .await;
+        let _ = self
+            .try_add_column("cross_review_jobs", "lease_token", "TEXT")
+            .await;
+        for column in ["local_model", "local_provider"] {
+            let _ = self
+                .try_add_column("cross_review_jobs", column, "TEXT NOT NULL DEFAULT ''")
+                .await;
+        }
+        let _ = self
+            .try_add_column("cross_review_comparisons", "matched_finding_id", "TEXT")
+            .await;
+        for column in [
+            "merge_tokens_in",
+            "merge_tokens_out",
+            "merge_tokens_cached",
+            "merge_budget_flags",
+        ] {
+            let _ = self
+                .try_add_column("cross_review_jobs", column, "INTEGER NOT NULL DEFAULT 0")
+                .await;
+        }
+        let _ = self
+            .try_add_column(
+                "patchsets",
+                "cross_review_generation",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            .await;
+        self.migrate_cross_review_job_generations().await?;
         let _ = self
             .try_add_column(
                 "model_experiment_runs",
@@ -634,6 +712,21 @@ impl Database {
             .try_add_column("findings", "source_stages", "TEXT")
             .await;
         let _ = self
+            .try_add_column("findings", "cross_review_job_id", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("findings", "external_finding_id", "TEXT")
+            .await;
+        let _ = self
+            .conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_findings_cross_review_external
+                 ON findings(cross_review_job_id, external_finding_id)
+                 WHERE cross_review_job_id IS NOT NULL",
+                (),
+            )
+            .await;
+        let _ = self
             .try_add_column("reviews", "concerns_total", "INTEGER")
             .await;
         let _ = self
@@ -676,6 +769,16 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("patchsets", "embargo_release_started_at", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column(
+                "patchsets",
+                "cross_review_status",
+                "TEXT NOT NULL DEFAULT 'disabled'",
+            )
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "cross_reviewed_at", "INTEGER")
             .await;
         let _ = self.try_add_column("patchsets", "slug", "TEXT").await;
         let _ = self
@@ -1017,6 +1120,949 @@ impl Database {
             .execute(
                 "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
                 libsql::params![total, unique, multi_stage, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn enqueue_cross_reviews(
+        &self,
+        patchset_id: i64,
+        instances: &[(String, String)],
+        now: i64,
+    ) -> Result<()> {
+        if instances.is_empty() {
+            return Ok(());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT (SELECT message_id FROM patches
+                         WHERE patchset_id = patchsets.id ORDER BY part_index LIMIT 1),
+                        NULLIF(cover_letter_message_id, ''),
+                        COALESCE(target_review_count, 1),
+                        COALESCE(model_name, ''), COALESCE(provider, '')
+                 FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("patchset does not exist"))?;
+        let first_patch_message_id: Option<String> = row.get(0).ok();
+        let cover_message_id: Option<String> = row.get(1).ok();
+        let lookup_message_id = first_patch_message_id
+            .clone()
+            .or_else(|| cover_message_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("patchset has no cross-instance message ID"))?;
+        let fallback_message_id = first_patch_message_id
+            .is_some()
+            .then_some(cover_message_id)
+            .flatten()
+            .filter(|cover| cover != &lookup_message_id);
+        let generation: i64 = row.get(2)?;
+        let local_model: String = row.get(3)?;
+        let local_provider: String = row.get(4)?;
+        drop(rows);
+
+        for (name, url) in instances {
+            self.conn
+                .execute(
+                    "INSERT INTO cross_review_jobs
+                     (patchset_id, source_name, source_url, local_model,
+                      local_provider, lookup_message_id, fallback_message_id,
+                      generation, status, first_attempt_at, next_attempt_at,
+                      deadline_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                     ON CONFLICT(patchset_id, generation, source_name) DO NOTHING",
+                    libsql::params![
+                        patchset_id,
+                        name.clone(),
+                        url.clone(),
+                        local_model.clone(),
+                        local_provider.clone(),
+                        lookup_message_id.clone(),
+                        fallback_message_id.clone(),
+                        generation,
+                        now,
+                        now,
+                        now + 3 * 24 * 60 * 60,
+                    ],
+                )
+                .await?;
+        }
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cross_review_status = 'pending',
+                 cross_reviewed_at = NULL, cross_review_generation = ? WHERE id = ?",
+                libsql::params![generation, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claim_due_cross_reviews(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<CrossReviewJob>> {
+        let mut expired_rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT j.patchset_id FROM cross_review_jobs j
+                 JOIN patchsets p ON p.id = j.patchset_id
+                 WHERE j.generation = p.cross_review_generation
+                   AND j.status IN ('pending', 'processing') AND j.deadline_at <= ?",
+                libsql::params![now],
+            )
+            .await?;
+        let mut expired_patchsets = Vec::new();
+        while let Some(row) = expired_rows.next().await? {
+            expired_patchsets.push(row.get::<i64>(0)?);
+        }
+        drop(expired_rows);
+        self.conn
+            .execute(
+                "UPDATE cross_review_jobs SET status = 'expired', lease_until = NULL,
+                 lease_token = NULL,
+                 last_error = 'cross-review deadline expired'
+                 WHERE status IN ('pending', 'processing') AND deadline_at <= ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![now],
+            )
+            .await?;
+        for patchset_id in expired_patchsets {
+            self.refresh_cross_review_status(patchset_id, now).await?;
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT j.id, j.patchset_id, j.source_name, j.source_url,
+                        j.local_model, j.local_provider, j.lookup_message_id,
+                        j.fallback_message_id, j.generation, j.deadline_at,
+                        j.attempts
+                 FROM cross_review_jobs j
+                 JOIN patchsets p ON p.id = j.patchset_id
+                 WHERE j.generation = p.cross_review_generation
+                   AND j.status IN ('pending', 'processing')
+                   AND next_attempt_at <= ?
+                   AND (lease_until IS NULL OR lease_until <= ?)
+                   AND deadline_at > ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM cross_review_jobs active
+                       WHERE active.patchset_id = j.patchset_id
+                         AND active.generation = j.generation
+                         AND active.id != j.id
+                         AND active.status = 'processing'
+                         AND active.lease_until > ?)
+                 ORDER BY j.next_attempt_at, j.id LIMIT ?",
+                libsql::params![now, now, now, now, limit as i64],
+            )
+            .await?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().await? {
+            candidates.push(CrossReviewJob {
+                id: row.get(0)?,
+                patchset_id: row.get(1)?,
+                source_name: row.get(2)?,
+                source_url: row.get(3)?,
+                local_model: row.get(4)?,
+                local_provider: row.get(5)?,
+                lookup_message_id: row.get(6)?,
+                fallback_message_id: row.get(7).ok(),
+                generation: row.get(8)?,
+                deadline_at: row.get(9)?,
+                attempts: row.get(10)?,
+                lease_token: String::new(),
+            });
+        }
+        drop(rows);
+
+        let mut claimed = Vec::new();
+        for job in candidates {
+            let lease_token = format!("{}-{}-{}", job.id, now, job.attempts + 1);
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE cross_review_jobs SET status = 'processing',
+                     lease_until = ?, lease_token = ?, attempts = attempts + 1
+                     WHERE id = ? AND status IN ('pending', 'processing')
+                       AND (lease_until IS NULL OR lease_until <= ?)
+                       AND deadline_at > ?
+                       AND generation = (SELECT cross_review_generation FROM patchsets
+                                         WHERE id = cross_review_jobs.patchset_id)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM cross_review_jobs active
+                           WHERE active.patchset_id = cross_review_jobs.patchset_id
+                             AND active.generation = cross_review_jobs.generation
+                             AND active.id != cross_review_jobs.id
+                             AND active.status = 'processing'
+                             AND active.lease_until > ?)",
+                    libsql::params![now + 60 * 60, lease_token.clone(), job.id, now, now, now],
+                )
+                .await?;
+            if changed == 1 {
+                claimed.push(CrossReviewJob {
+                    attempts: job.attempts + 1,
+                    lease_token,
+                    ..job
+                });
+            }
+        }
+        Ok(claimed)
+    }
+
+    pub async fn retry_cross_review(
+        &self,
+        job: &CrossReviewJob,
+        now: i64,
+        error: &str,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE cross_review_jobs SET status = 'pending', lease_until = NULL,
+                 lease_token = NULL, next_attempt_at = ?, last_error = ?
+                 WHERE id = ? AND status = 'processing' AND lease_token = ?
+                   AND lease_until > ? AND deadline_at > ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![
+                    now + 60 * 60,
+                    error,
+                    job.id,
+                    job.lease_token.clone(),
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    pub async fn record_cross_review_usage(
+        &self,
+        job: &CrossReviewJob,
+        now: i64,
+        usage: &crate::cross_review::CrossReviewUsage,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE cross_review_jobs
+                 SET merge_tokens_in = merge_tokens_in + ?,
+                     merge_tokens_out = merge_tokens_out + ?,
+                     merge_tokens_cached = merge_tokens_cached + ?,
+                     merge_budget_flags = merge_budget_flags | ?
+                 WHERE id = ? AND status = 'processing' AND lease_token = ?
+                   AND lease_until > ? AND deadline_at > ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![
+                    usage.tokens_in as i64,
+                    usage.tokens_out as i64,
+                    usage.tokens_cached as i64,
+                    usage.budget_flags as i64,
+                    job.id,
+                    job.lease_token.clone(),
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
+    pub async fn finish_cross_review_job(
+        &self,
+        job: &CrossReviewJob,
+        status: &str,
+        now: i64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE cross_review_jobs SET status = ?, lease_until = NULL,
+                 lease_token = NULL, completed_at = ?, last_error = ?
+                 WHERE id = ? AND status = 'processing' AND lease_token = ?
+                   AND lease_until > ? AND deadline_at > ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![
+                    status,
+                    now,
+                    error,
+                    job.id,
+                    job.lease_token.clone(),
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        if changed == 1 {
+            self.refresh_cross_review_status(job.patchset_id, now)
+                .await?;
+        }
+        Ok(changed == 1)
+    }
+
+    async fn refresh_cross_review_status(&self, patchset_id: i64, now: i64) -> Result<()> {
+        self.refresh_cross_review_status_on(&self.conn, patchset_id, now)
+            .await
+    }
+
+    async fn refresh_cross_review_status_on(
+        &self,
+        connection: &libsql::Connection,
+        patchset_id: i64,
+        now: i64,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END)
+                 FROM cross_review_jobs
+                 WHERE patchset_id = ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets WHERE id = ?)",
+                libsql::params![patchset_id, patchset_id],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing cross-review aggregate"))?;
+        let total: i64 = row.get(0)?;
+        let complete: i64 = row.get(1).unwrap_or_default();
+        let errors: i64 = row.get(2).unwrap_or_default();
+        let expired: i64 = row.get(3).unwrap_or_default();
+        let status = if errors > 0 {
+            "error"
+        } else if expired > 0 {
+            "expired"
+        } else if total > 0 && complete == total {
+            "complete"
+        } else {
+            "pending"
+        };
+        let completed_at = (status == "complete").then_some(now);
+        connection
+            .execute(
+                "UPDATE patchsets SET cross_review_status = ?, cross_reviewed_at = ?
+                 WHERE id = ?",
+                libsql::params![status, completed_at, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn save_local_canonical_findings(
+        &self,
+        review_id: i64,
+        canonical: &serde_json::Value,
+        published: &serde_json::Value,
+    ) -> Result<()> {
+        let published = published.as_array().cloned().unwrap_or_default();
+        self.conn
+            .execute(
+                "DELETE FROM local_canonical_findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        for finding in canonical.as_array().into_iter().flatten() {
+            if finding["preexisting"].as_bool() == Some(true) {
+                continue;
+            }
+            let finding_id = finding["finding_ids"]
+                .as_array()
+                .and_then(|ids| ids.first())
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("canonical finding is missing its ID"))?;
+            let candidate_ids: std::collections::HashSet<&str> = finding["finding_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            let published_finding = published.iter().find(|published_finding| {
+                published_finding["finding_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|id| candidate_ids.contains(id))
+            });
+            self.conn
+                .execute(
+                    "INSERT INTO local_canonical_findings
+                     (review_id, finding_id, finding_json, accepted)
+                     VALUES (?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        finding_id,
+                        published_finding.unwrap_or(finding).to_string(),
+                        i64::from(published_finding.is_some()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn save_review_merge_run(
+        &self,
+        review_id: i64,
+        usage: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO review_merge_runs
+                 (review_id, tokens_in, tokens_out, tokens_cached, budget_flags)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(review_id) DO UPDATE SET
+                   tokens_in = excluded.tokens_in,
+                   tokens_out = excluded.tokens_out,
+                   tokens_cached = excluded.tokens_cached,
+                   budget_flags = excluded.budget_flags",
+                libsql::params![
+                    review_id,
+                    usage["tokens_in"].as_i64().unwrap_or(0),
+                    usage["tokens_out"].as_i64().unwrap_or(0),
+                    usage["tokens_cached"].as_i64().unwrap_or(0),
+                    usage["budget_flags"].as_i64().unwrap_or(0),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_cross_review_inputs(
+        &self,
+        patchset_id: i64,
+    ) -> Result<(Vec<crate::cross_review::LocalCanonicalFinding>, String)> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT l.finding_id, l.finding_json, l.accepted, p.message_id, r.id
+                 FROM local_canonical_findings l
+                 JOIN reviews r ON r.id = l.review_id
+                 JOIN patches p ON p.id = r.patch_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                   AND r.id = (SELECT MAX(current.id) FROM reviews current
+                               WHERE current.patchset_id = r.patchset_id
+                                 AND current.patch_id = r.patch_id
+                                 AND current.status = 'Reviewed')",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut findings = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let raw_finding_id: String = row.get(0)?;
+            let patch_message_id: String = row.get(3)?;
+            let review_id: i64 = row.get(4)?;
+            findings.push(crate::cross_review::LocalCanonicalFinding {
+                finding_id: format!("{review_id}:{patch_message_id}:{raw_finding_id}"),
+                finding: serde_json::from_str(&row.get::<String>(1)?)?,
+                accepted: row.get::<i64>(2)? != 0,
+                patch_message_id,
+                review_id: Some(review_id),
+                source_name: None,
+                external_finding_id: None,
+                cross_review_job_id: None,
+            });
+        }
+        drop(rows);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT f.finding_id, f.finding_json, f.patch_message_id,
+                        j.id, j.source_name
+                 FROM cross_review_findings f
+                 JOIN cross_review_jobs j ON j.id = f.job_id
+                 JOIN patchsets p ON p.id = j.patchset_id
+                 JOIN findings published
+                   ON published.cross_review_job_id = j.id
+                  AND published.external_finding_id = f.finding_id
+                 WHERE j.patchset_id = ? AND j.generation = p.cross_review_generation
+                   AND j.status = 'complete' AND f.accepted = 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let external_finding_id: String = row.get(0)?;
+            let job_id: i64 = row.get(3)?;
+            findings.push(crate::cross_review::LocalCanonicalFinding {
+                finding_id: format!("remote:{job_id}:{external_finding_id}"),
+                finding: serde_json::from_str(&row.get::<String>(1)?)?,
+                accepted: true,
+                patch_message_id: row.get(2)?,
+                review_id: None,
+                source_name: Some(row.get(4)?),
+                external_finding_id: Some(external_finding_id),
+                cross_review_job_id: Some(job_id),
+            });
+        }
+        drop(rows);
+        let mut context_rows = self
+            .conn
+            .query(
+                "SELECT p.message_id, ai.input_context
+                 FROM reviews r
+                 JOIN patches p ON p.id = r.patch_id
+                 JOIN ai_interactions ai ON ai.id = r.interaction_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                   AND r.id = (SELECT MAX(current.id) FROM reviews current
+                               WHERE current.patchset_id = r.patchset_id
+                                 AND current.patch_id = r.patch_id
+                                 AND current.status = 'Reviewed')
+                 ORDER BY p.part_index",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut context = String::from("Prepared code-review context:\n");
+        while let Some(row) = context_rows.next().await? {
+            use std::fmt::Write;
+            let message_id: String = row.get(0)?;
+            let prepared: String = row.get(1).unwrap_or_default();
+            let _ = write!(context, "\nPatch {message_id}:\n{prepared}\n");
+            if context.len() > 500_000 {
+                let mut truncate_at = context.len().min(500_000);
+                while !context.is_char_boundary(truncate_at) {
+                    truncate_at -= 1;
+                }
+                context.truncate(truncate_at);
+                context.push_str("\n[remaining prepared context truncated]");
+                break;
+            }
+        }
+        Ok((findings, context))
+    }
+
+    pub async fn persist_cross_review_result(
+        &self,
+        job: &CrossReviewJob,
+        remote: &crate::cross_review::RemoteReviewResult,
+        analysis: &crate::cross_review::CrossReviewAnalysis,
+        usage: &crate::cross_review::CrossReviewUsage,
+        now: i64,
+    ) -> Result<()> {
+        if self.is_in_memory {
+            let _transaction_guard = self.in_memory_transaction.lock().await;
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let result = self
+                .persist_cross_review_records(&self.conn, job, remote, analysis, usage, now)
+                .await;
+            return match result {
+                Ok(()) => {
+                    self.conn.execute("COMMIT", ()).await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            };
+        }
+        let connection = self.database.connect()?;
+        let _ = connection
+            .query("PRAGMA busy_timeout = 5000", ())
+            .await?
+            .next()
+            .await;
+        let transaction = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result = self
+            .persist_cross_review_records(&transaction, job, remote, analysis, usage, now)
+            .await;
+        match result {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_cross_review_records(
+        &self,
+        connection: &libsql::Connection,
+        job: &CrossReviewJob,
+        remote: &crate::cross_review::RemoteReviewResult,
+        analysis: &crate::cross_review::CrossReviewAnalysis,
+        usage: &crate::cross_review::CrossReviewUsage,
+        now: i64,
+    ) -> Result<()> {
+        let mut fence = connection
+            .query(
+                "SELECT 1 FROM cross_review_jobs
+                 WHERE id = ? AND status = 'processing' AND lease_token = ?
+                   AND lease_until > ? AND deadline_at > ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![job.id, job.lease_token.clone(), now, now],
+            )
+            .await?;
+        if fence.next().await?.is_none() {
+            return Ok(());
+        }
+        drop(fence);
+        connection
+            .execute(
+                "DELETE FROM cross_review_findings WHERE job_id = ?",
+                libsql::params![job.id],
+            )
+            .await?;
+        connection
+            .execute(
+                "DELETE FROM cross_review_comparisons WHERE job_id = ?",
+                libsql::params![job.id],
+            )
+            .await?;
+        let accepted_ids: std::collections::HashSet<&str> = analysis
+            .comparisons
+            .iter()
+            .filter(|comparison| comparison.outcome != "remote_hallucination")
+            .map(|comparison| comparison.finding_id.as_str())
+            .collect();
+        for finding in &remote.findings {
+            connection
+                .execute(
+                    "INSERT INTO cross_review_findings
+                     (job_id, finding_id, patch_message_id, finding_json, accepted)
+                     VALUES (?, ?, ?, ?, ?)",
+                    libsql::params![
+                        job.id,
+                        finding.finding_id.clone(),
+                        finding.patch_message_id.clone(),
+                        serde_json::to_string(finding)?,
+                        i64::from(accepted_ids.contains(finding.finding_id.as_str())),
+                    ],
+                )
+                .await?;
+        }
+        for comparison in &analysis.comparisons {
+            connection
+                .execute(
+                    "INSERT INTO cross_review_comparisons
+                     (job_id, finding_id, matched_finding_id, outcome, severity)
+                     VALUES (?, ?, ?, ?, ?)",
+                    libsql::params![
+                        job.id,
+                        comparison.finding_id.clone(),
+                        comparison.matched_finding_id.clone(),
+                        comparison.outcome.clone(),
+                        comparison.severity.clone(),
+                    ],
+                )
+                .await?;
+        }
+        for finding in &analysis.accepted_remote {
+            self.publish_cross_review_finding(connection, job, finding)
+                .await?;
+        }
+        for matched in &analysis.matched_local {
+            self.merge_local_cross_review_provenance(connection, job, matched)
+                .await?;
+        }
+        for matched in &analysis.matched_remote {
+            self.merge_imported_cross_review_provenance(connection, job, matched)
+                .await?;
+        }
+        let changed = connection
+            .execute(
+                "UPDATE cross_review_jobs SET remote_model = ?, remote_provider = ?,
+                 payload_hash = ?, merge_tokens_in = merge_tokens_in + ?,
+                 merge_tokens_out = merge_tokens_out + ?,
+                 merge_tokens_cached = merge_tokens_cached + ?,
+                 merge_budget_flags = merge_budget_flags | ?,
+                 status = 'complete', lease_until = NULL,
+                 lease_token = NULL, completed_at = ?, last_error = NULL
+                 WHERE id = ? AND status = 'processing' AND lease_token = ?
+                   AND lease_until > ? AND deadline_at > ?
+                   AND generation = (SELECT cross_review_generation FROM patchsets
+                                     WHERE id = cross_review_jobs.patchset_id)",
+                libsql::params![
+                    remote.model.clone(),
+                    remote.provider.clone(),
+                    remote.payload_hash.clone(),
+                    usage.tokens_in as i64,
+                    usage.tokens_out as i64,
+                    usage.tokens_cached as i64,
+                    usage.budget_flags as i64,
+                    now,
+                    job.id,
+                    job.lease_token.clone(),
+                    now,
+                    now,
+                ],
+            )
+            .await?;
+        if changed != 1 {
+            anyhow::bail!("cross-review lease was lost while publishing");
+        }
+        self.refresh_cross_review_status_on(connection, job.patchset_id, now)
+            .await
+    }
+
+    async fn publish_cross_review_finding(
+        &self,
+        connection: &libsql::Connection,
+        job: &CrossReviewJob,
+        finding: &crate::cross_review::RemoteFinding,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                "SELECT r.id, r.interaction_id, r.inline_review, ai.output_raw
+                 FROM reviews r
+                 JOIN patches p ON p.id = r.patch_id
+                 LEFT JOIN ai_interactions ai ON ai.id = r.interaction_id
+                 WHERE r.patchset_id = ? AND p.message_id = ?
+                   AND r.status = 'Reviewed'
+                 ORDER BY r.created_at DESC LIMIT 1",
+                libsql::params![job.patchset_id, finding.patch_message_id.clone()],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("remote finding has no local reviewed patch"))?;
+        let review_id: i64 = row.get(0)?;
+        let interaction_id: Option<String> = row.get(1).ok();
+        let inline_review: Option<String> = row.get(2).ok();
+        let output_raw: Option<String> = row.get(3).ok();
+        drop(rows);
+
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO findings
+                 (review_id, severity, severity_explanation, problem, preexisting,
+                  locations, cross_review_job_id, external_finding_id)
+                 VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+                libsql::params![
+                    review_id,
+                    crate::db::Severity::from_str(&finding.severity) as i64,
+                    finding.reasoning.clone(),
+                    finding.problem.clone(),
+                    finding.locations.to_string(),
+                    job.id,
+                    finding.finding_id.clone(),
+                ],
+            )
+            .await?;
+
+        if let (Some(interaction_id), Some(output_raw)) = (interaction_id, output_raw) {
+            let mut output: serde_json::Value =
+                serde_json::from_str(&crate::utils::clean_json_string(&output_raw))?;
+            let review = if output.get("review").is_some() {
+                output
+                    .get_mut("review")
+                    .ok_or_else(|| anyhow::anyhow!("stored review is unavailable"))?
+            } else {
+                &mut output
+            };
+            let findings = review["findings"]
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("stored review output has no findings array"))?;
+            if !findings
+                .iter()
+                .any(|item| item["cross_review_finding_id"].as_str() == Some(&finding.finding_id))
+            {
+                findings.push(serde_json::json!({
+                    "problem": finding.problem,
+                    "severity": finding.severity,
+                    "severity_explanation": finding.reasoning,
+                    "preexisting": false,
+                    "locations": finding.locations,
+                    "source_models": [job.source_name],
+                    "finding_ids": [finding.finding_id],
+                    "cross_review_source": job.source_name,
+                    "cross_review_finding_id": finding.finding_id,
+                }));
+                connection
+                    .execute(
+                        "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
+                        libsql::params![output.to_string(), interaction_id],
+                    )
+                    .await?;
+            }
+        }
+        let marker = format!(
+            "Cross-instance finding from {} ({})",
+            job.source_name, finding.finding_id
+        );
+        if !inline_review
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&marker)
+        {
+            let rendered = format!(
+                "{}\n\n{}:\n- [{}] {}",
+                inline_review.unwrap_or_default(),
+                marker,
+                finding.severity,
+                finding.problem,
+            );
+            connection
+                .execute(
+                    "UPDATE reviews SET inline_review = ? WHERE id = ?",
+                    libsql::params![rendered, review_id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn merge_local_cross_review_provenance(
+        &self,
+        connection: &libsql::Connection,
+        job: &CrossReviewJob,
+        matched: &crate::cross_review::CrossLocalMatch,
+    ) -> Result<()> {
+        if matched.local_accepted {
+            return self
+                .update_review_finding_provenance(
+                    connection,
+                    matched.local_review_id,
+                    None,
+                    &matched.local_finding_ids,
+                    std::slice::from_ref(&job.source_name),
+                    std::slice::from_ref(&matched.finding_id),
+                )
+                .await;
+        }
+
+        let review_id = self
+            .published_cross_review_finding_review_id(connection, job.id, &matched.finding_id)
+            .await?;
+        self.update_review_finding_provenance(
+            connection,
+            review_id,
+            Some(&matched.finding_id),
+            &[],
+            &matched.local_source_models,
+            &matched.local_finding_ids,
+        )
+        .await
+    }
+
+    async fn merge_imported_cross_review_provenance(
+        &self,
+        connection: &libsql::Connection,
+        job: &CrossReviewJob,
+        matched: &crate::cross_review::CrossRemoteMatch,
+    ) -> Result<()> {
+        let review_id = self
+            .published_cross_review_finding_review_id(
+                connection,
+                matched.existing_job_id,
+                &matched.existing_finding_id,
+            )
+            .await?;
+        self.update_review_finding_provenance(
+            connection,
+            review_id,
+            Some(&matched.existing_finding_id),
+            &[],
+            std::slice::from_ref(&job.source_name),
+            std::slice::from_ref(&matched.finding_id),
+        )
+        .await
+    }
+
+    async fn published_cross_review_finding_review_id(
+        &self,
+        connection: &libsql::Connection,
+        job_id: i64,
+        finding_id: &str,
+    ) -> Result<i64> {
+        let mut rows = connection
+            .query(
+                "SELECT f.review_id FROM findings f
+                 WHERE f.cross_review_job_id = ? AND f.external_finding_id = ?
+                 LIMIT 1",
+                libsql::params![job_id, finding_id],
+            )
+            .await?;
+        let review_id = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("matched finding has no published local row"))?
+            .get(0)?;
+        drop(rows);
+        Ok(review_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_review_finding_provenance(
+        &self,
+        connection: &libsql::Connection,
+        review_id: i64,
+        cross_review_finding_id: Option<&str>,
+        matched_finding_ids: &[String],
+        source_models: &[String],
+        finding_ids: &[String],
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                "SELECT r.interaction_id, ai.output_raw
+                 FROM reviews r
+                 JOIN ai_interactions ai ON ai.id = r.interaction_id
+                 WHERE r.id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("matched review has no rendered output"))?;
+        let interaction_id: String = row.get(0)?;
+        let output_raw: String = row.get(1)?;
+        drop(rows);
+
+        let mut output: serde_json::Value =
+            serde_json::from_str(&crate::utils::clean_json_string(&output_raw))?;
+        let review = if output.get("review").is_some() {
+            output
+                .get_mut("review")
+                .ok_or_else(|| anyhow::anyhow!("stored review is unavailable"))?
+        } else {
+            &mut output
+        };
+        let findings = review["findings"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("stored review output has no findings array"))?;
+        let finding = findings
+            .iter_mut()
+            .find(|finding| {
+                if let Some(cross_id) = cross_review_finding_id {
+                    return finding["cross_review_finding_id"].as_str() == Some(cross_id);
+                }
+                finding["finding_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|id| matched_finding_ids.iter().any(|matched| matched == id))
+            })
+            .ok_or_else(|| anyhow::anyhow!("matched imported finding is absent from output"))?;
+        for source in source_models {
+            append_unique_string(&mut finding["source_models"], source);
+        }
+        for finding_id in finding_ids {
+            append_unique_string(&mut finding["finding_ids"], finding_id);
+        }
+        connection
+            .execute(
+                "UPDATE ai_interactions SET output_raw = ? WHERE id = ?",
+                libsql::params![output.to_string(), interaction_id],
             )
             .await?;
         Ok(())
@@ -1370,6 +2416,83 @@ impl Database {
         Ok(
             json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost}),
         )
+    }
+
+    pub async fn get_cross_review_stats(&self) -> Result<serde_json::Value> {
+        let mut sources = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT j.source_name, j.local_provider,
+                        j.local_model, COALESCE(j.remote_provider, ''),
+                        COALESCE(j.remote_model, ''), j.status, COUNT(*)
+                 FROM cross_review_jobs j
+                 GROUP BY j.source_name, j.local_provider, j.local_model,
+                          j.remote_provider, j.remote_model, j.status
+                 ORDER BY j.source_name, j.status",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            sources.push(json!({
+                "source": row.get::<String>(0)?,
+                "local_provider": row.get::<String>(1)?,
+                "local_model": row.get::<String>(2)?,
+                "remote_provider": row.get::<String>(3)?,
+                "remote_model": row.get::<String>(4)?,
+                "status": row.get::<String>(5)?,
+                "count": row.get::<i64>(6)?,
+            }));
+        }
+        drop(rows);
+        let mut outcomes = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT j.source_name, j.local_provider,
+                        j.local_model, COALESCE(j.remote_provider, ''),
+                        COALESCE(j.remote_model, ''), c.outcome,
+                        lower(COALESCE(c.severity, 'unknown')), COUNT(*)
+                 FROM cross_review_comparisons c
+                 JOIN cross_review_jobs j ON j.id = c.job_id
+                 GROUP BY j.source_name, j.local_provider, j.local_model,
+                          j.remote_provider, j.remote_model, c.outcome,
+                          lower(COALESCE(c.severity, 'unknown'))
+                 ORDER BY j.source_name, c.outcome",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            outcomes.push(json!({
+                "source": row.get::<String>(0)?,
+                "local_provider": row.get::<String>(1)?,
+                "local_model": row.get::<String>(2)?,
+                "remote_provider": row.get::<String>(3)?,
+                "remote_model": row.get::<String>(4)?,
+                "outcome": row.get::<String>(5)?,
+                "severity": row.get::<String>(6)?,
+                "count": row.get::<i64>(7)?,
+            }));
+        }
+        Ok(json!({"sources": sources, "outcomes": outcomes}))
+    }
+
+    pub async fn get_cross_review_status(&self, patchset_id: i64) -> Result<serde_json::Value> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT cross_review_status, cross_reviewed_at
+                 FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(serde_json::Value::Null);
+        };
+        Ok(json!({
+            "status": row.get::<String>(0).unwrap_or_else(|_| "disabled".to_string()),
+            "completed_at": row.get::<Option<i64>>(1).ok().flatten(),
+        }))
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
@@ -1978,6 +3101,164 @@ impl Database {
 
     pub async fn commit_transaction(&self) -> Result<()> {
         self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    async fn migrate_cross_review_job_generations(&self) -> Result<()> {
+        let mut indexes = self
+            .conn
+            .query("PRAGMA index_list(cross_review_jobs)", ())
+            .await?;
+        let mut rebuild = false;
+        while let Some(index) = indexes.next().await? {
+            if index.get::<i64>(2).unwrap_or(0) == 0 {
+                continue;
+            }
+            let name: String = index.get(1)?;
+            let escaped = name.replace('"', "\"\"");
+            let mut columns = self
+                .conn
+                .query(&format!("PRAGMA index_info(\"{escaped}\")"), ())
+                .await?;
+            let mut names = Vec::new();
+            while let Some(column) = columns.next().await? {
+                names.push(column.get::<String>(2)?);
+            }
+            if names == ["patchset_id", "source_name"] {
+                rebuild = true;
+                break;
+            }
+        }
+        drop(indexes);
+
+        if rebuild {
+            self.rebuild_cross_review_jobs().await?;
+            self.conn
+                .execute(
+                    "UPDATE cross_review_jobs
+                     SET generation = COALESCE(
+                         (SELECT target_review_count FROM patchsets
+                          WHERE id = cross_review_jobs.patchset_id), generation, 1)",
+                    (),
+                )
+                .await?;
+        }
+        self.conn
+            .execute(
+                "UPDATE cross_review_jobs
+                 SET local_model = COALESCE(NULLIF(local_model, ''),
+                                            (SELECT model_name FROM patchsets
+                                             WHERE id = cross_review_jobs.patchset_id), ''),
+                     local_provider = COALESCE(NULLIF(local_provider, ''),
+                                               (SELECT provider FROM patchsets
+                                                WHERE id = cross_review_jobs.patchset_id), '')",
+                (),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cross_review_generation = COALESCE(
+                     (SELECT MAX(generation) FROM cross_review_jobs
+                      WHERE patchset_id = patchsets.id), cross_review_generation)
+                 WHERE EXISTS (SELECT 1 FROM cross_review_jobs
+                               WHERE patchset_id = patchsets.id)",
+                (),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn rebuild_cross_review_jobs(&self) -> Result<()> {
+        self.conn
+            .query("PRAGMA foreign_keys=OFF", ())
+            .await?
+            .next()
+            .await?;
+        if let Err(error) = self.conn.execute("BEGIN IMMEDIATE", ()).await {
+            let _ = self
+                .conn
+                .query("PRAGMA foreign_keys=ON", ())
+                .await?
+                .next()
+                .await;
+            return Err(error.into());
+        }
+        let result = self
+            .conn
+            .execute_batch(
+                "DROP TABLE IF EXISTS cross_review_jobs_generation_migration;
+                 CREATE TABLE cross_review_jobs_generation_migration (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER NOT NULL,
+                    source_name TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    local_model TEXT NOT NULL DEFAULT '',
+                    local_provider TEXT NOT NULL DEFAULT '',
+                    lookup_message_id TEXT NOT NULL,
+                    fallback_message_id TEXT,
+                    generation INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    first_attempt_at INTEGER NOT NULL,
+                    next_attempt_at INTEGER NOT NULL,
+                    deadline_at INTEGER NOT NULL,
+                    lease_until INTEGER,
+                    lease_token TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    completed_at INTEGER,
+                    remote_model TEXT,
+                    remote_provider TEXT,
+                    payload_hash TEXT,
+                    merge_tokens_in INTEGER NOT NULL DEFAULT 0,
+                    merge_tokens_out INTEGER NOT NULL DEFAULT 0,
+                    merge_tokens_cached INTEGER NOT NULL DEFAULT 0,
+                    merge_budget_flags INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
+                    UNIQUE(patchset_id, generation, source_name)
+                 );
+                 INSERT INTO cross_review_jobs_generation_migration
+                    (id, patchset_id, source_name, source_url, local_model,
+                     local_provider, lookup_message_id, fallback_message_id,
+                     generation, status, first_attempt_at, next_attempt_at,
+                     deadline_at, lease_until, lease_token, attempts, last_error,
+                     completed_at, remote_model, remote_provider, payload_hash,
+                     merge_tokens_in, merge_tokens_out, merge_tokens_cached,
+                     merge_budget_flags)
+                 SELECT id, patchset_id, source_name, source_url, local_model,
+                        local_provider, lookup_message_id, fallback_message_id,
+                        generation, status, first_attempt_at, next_attempt_at,
+                        deadline_at, lease_until, lease_token, attempts, last_error,
+                        completed_at, remote_model, remote_provider, payload_hash,
+                        merge_tokens_in, merge_tokens_out, merge_tokens_cached,
+                        merge_budget_flags
+                 FROM cross_review_jobs;
+                 DROP TABLE cross_review_jobs;
+                 ALTER TABLE cross_review_jobs_generation_migration
+                    RENAME TO cross_review_jobs;
+                 CREATE INDEX idx_cross_review_jobs_due
+                    ON cross_review_jobs(status, next_attempt_at, lease_until);",
+            )
+            .await;
+        let result = match result {
+            Ok(_) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(error)
+            }
+        };
+        let _ = self
+            .conn
+            .query("PRAGMA foreign_keys=ON", ())
+            .await?
+            .next()
+            .await;
+        result?;
         Ok(())
     }
 
@@ -3094,7 +4375,8 @@ impl Database {
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
              p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug,
-             d.concerns_total, d.concerns_unique, d.findings_multi_stage, b.budget_flags_or
+             d.concerns_total, d.concerns_unique, d.findings_multi_stage, b.budget_flags_or,
+             p.cross_review_status, p.cross_reviewed_at
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -3218,6 +4500,8 @@ impl Database {
                         concerns_unique: row.get(25).ok(),
                         findings_multi_stage: row.get(26).ok(),
                         budget_flags_or: row.get::<Option<i64>>(27).ok().flatten(),
+                        cross_review_status: row.get(28).ok(),
+                        cross_reviewed_at: row.get(29).ok(),
                     });
                 }
                 Ok(None) => break,
@@ -4070,6 +5354,8 @@ impl Database {
                 concerns_total: None,
                 concerns_unique: None,
                 findings_multi_stage: None,
+                cross_review_status: None,
+                cross_reviewed_at: None,
             });
         }
         Ok(patchsets)
@@ -4133,6 +5419,8 @@ impl Database {
                         concerns_total: None,
                         concerns_unique: None,
                         findings_multi_stage: None,
+                        cross_review_status: None,
+                        cross_reviewed_at: None,
                     });
                 }
                 Ok(None) => break,
@@ -4403,7 +5691,19 @@ impl Database {
         // 2. Reset patchset status to Pending
         self.conn
             .execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+                "UPDATE patchsets SET status = 'Pending',
+                 cross_review_status = 'disabled', cross_reviewed_at = NULL,
+                 cross_review_generation = 0
+                 WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE cross_review_jobs SET status = 'superseded',
+                 lease_until = NULL, lease_token = NULL,
+                 last_error = 'superseded by local review rerun'
+                 WHERE patchset_id = ? AND status IN ('pending', 'processing')",
                 libsql::params![id],
             )
             .await?;
@@ -7617,5 +8917,845 @@ mod tests {
 
         first.unwrap();
         second.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_review_jobs_are_durable_and_lease_claimed() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('cover@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status)
+                    VALUES (1, 1, 'cover@example', 'Reviewed');",
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+
+        let claimed = db.claim_due_cross_reviews(1000, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].lookup_message_id, "cover@example");
+        assert!(
+            db.claim_due_cross_reviews(1001, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        db.retry_cross_review(&claimed[0], 1001, "embargoed")
+            .await
+            .unwrap();
+        assert!(
+            db.claim_due_cross_reviews(4600, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reclaimed = db.claim_due_cross_reviews(4601, 10).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        db.finish_cross_review_job(&reclaimed[0], "complete", 4601, None)
+            .await
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT cross_review_status, cross_reviewed_at FROM patchsets WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "complete");
+        assert_eq!(row.get::<i64>(1).unwrap(), 4601);
+    }
+
+    #[tokio::test]
+    async fn cross_review_result_publishes_confirmed_remote_findings() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status, provider, model_name)
+                    VALUES (1, 1, 'patch@example', 'Reviewed', 'local-provider', 'local-model');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                 INSERT INTO ai_interactions (id, input_context, output_raw)
+                    VALUES ('interaction', 'prepared context', '{\"review\":{\"findings\":[]}}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status, created_at, inline_review)
+                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000, 'Initial review');",
+            )
+            .await
+            .unwrap();
+        db.save_local_canonical_findings(
+            20,
+            &json!([{"finding_ids": ["local"], "severity": "High"}]),
+            &json!([{"finding_ids": ["local"], "severity": "High"}]),
+        )
+        .await
+        .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .claim_due_cross_reviews(1000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let finding = crate::cross_review::RemoteFinding {
+            finding_id: "remote".to_string(),
+            patch_message_id: "patch@example".to_string(),
+            severity: "Medium".to_string(),
+            problem: "remote problem".to_string(),
+            reasoning: "confirmed".to_string(),
+            locations: json!([]),
+        };
+        let remote = crate::cross_review::RemoteReviewResult {
+            model: "remote-model".to_string(),
+            provider: "remote-provider".to_string(),
+            payload_hash: "hash".to_string(),
+            findings: vec![finding.clone()],
+        };
+        let analysis = crate::cross_review::CrossReviewAnalysis {
+            accepted_remote: vec![finding],
+            matched_local: Vec::new(),
+            matched_remote: Vec::new(),
+            comparisons: vec![crate::cross_review::CrossComparison {
+                finding_id: "remote".to_string(),
+                matched_finding_id: None,
+                outcome: "remote_only".to_string(),
+                severity: "Medium".to_string(),
+            }],
+        };
+
+        db.persist_cross_review_result(
+            &job,
+            &remote,
+            &analysis,
+            &crate::cross_review::CrossReviewUsage::default(),
+            1100,
+        )
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE external_finding_id = 'remote'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT output_raw FROM ai_interactions WHERE id = 'interaction'",
+                (),
+            )
+            .await
+            .unwrap();
+        let output: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(output.contains("remote problem"));
+        let stats = db.get_cross_review_stats().await.unwrap();
+        assert_eq!(stats["outcomes"][0]["outcome"], "remote_only");
+        assert_eq!(stats["outcomes"][0]["local_model"], "local-model");
+        db.conn
+            .execute(
+                "UPDATE patchsets SET model_name = 'new-model', provider = 'new-provider'
+                 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let stats = db.get_cross_review_stats().await.unwrap();
+        assert_eq!(stats["outcomes"][0]["local_model"], "local-model");
+        assert_eq!(stats["outcomes"][0]["local_provider"], "local-provider");
+    }
+
+    #[tokio::test]
+    async fn cross_review_local_matches_preserve_both_sources() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, status, target_review_count, provider, model_name)
+                    VALUES (1, 1, 'Reviewed', 1, 'local-provider', 'local-model');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                 INSERT INTO ai_interactions (id, input_context, output_raw)
+                    VALUES ('interaction', 'context',
+                    '{\"review\":{\"findings\":[{\"problem\":\"local accepted\",\"finding_ids\":[\"local-a\"],\"source_models\":[\"main\"]}]}}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status, created_at)
+                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000);",
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .claim_due_cross_reviews(1000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let remote_finding = |id: &str, problem: &str| crate::cross_review::RemoteFinding {
+            finding_id: id.to_string(),
+            patch_message_id: "patch@example".to_string(),
+            severity: "High".to_string(),
+            problem: problem.to_string(),
+            reasoning: String::new(),
+            locations: json!([]),
+        };
+        let accepted = remote_finding("remote-a", "local accepted");
+        let corroborated = remote_finding("remote-r", "local rejected");
+        let remote = crate::cross_review::RemoteReviewResult {
+            model: "remote-model".to_string(),
+            provider: "remote-provider".to_string(),
+            payload_hash: "hash".to_string(),
+            findings: vec![accepted, corroborated.clone()],
+        };
+        let analysis = crate::cross_review::CrossReviewAnalysis {
+            accepted_remote: vec![corroborated],
+            matched_local: vec![
+                crate::cross_review::CrossLocalMatch {
+                    finding_id: "remote-a".to_string(),
+                    local_finding_id: "20:patch@example:local-a".to_string(),
+                    local_review_id: 20,
+                    local_finding_ids: vec!["local-a".to_string()],
+                    local_source_models: vec!["main".to_string()],
+                    local_accepted: true,
+                },
+                crate::cross_review::CrossLocalMatch {
+                    finding_id: "remote-r".to_string(),
+                    local_finding_id: "20:patch@example:local-r".to_string(),
+                    local_review_id: 20,
+                    local_finding_ids: vec!["local-r".to_string()],
+                    local_source_models: vec!["main".to_string()],
+                    local_accepted: false,
+                },
+            ],
+            matched_remote: Vec::new(),
+            comparisons: vec![
+                crate::cross_review::CrossComparison {
+                    finding_id: "remote-a".to_string(),
+                    matched_finding_id: Some("20:patch@example:local-a".to_string()),
+                    outcome: "both".to_string(),
+                    severity: "High".to_string(),
+                },
+                crate::cross_review::CrossComparison {
+                    finding_id: "remote-r".to_string(),
+                    matched_finding_id: Some("20:patch@example:local-r".to_string()),
+                    outcome: "both".to_string(),
+                    severity: "High".to_string(),
+                },
+            ],
+        };
+        db.persist_cross_review_result(
+            &job,
+            &remote,
+            &analysis,
+            &crate::cross_review::CrossReviewUsage::default(),
+            1100,
+        )
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT output_raw FROM ai_interactions WHERE id = 'interaction'",
+                (),
+            )
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(
+            &rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+        )
+        .unwrap();
+        let findings = output["review"]["findings"].as_array().unwrap();
+        let local = findings
+            .iter()
+            .find(|finding| finding["problem"] == "local accepted")
+            .unwrap();
+        assert!(
+            local["source_models"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("peer"))
+        );
+        assert!(
+            local["finding_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("remote-a"))
+        );
+        let imported = findings
+            .iter()
+            .find(|finding| finding["cross_review_finding_id"] == "remote-r")
+            .unwrap();
+        assert!(
+            imported["source_models"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("main"))
+        );
+        assert!(
+            imported["finding_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("local-r"))
+        );
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT matched_finding_id FROM cross_review_comparisons
+                 ORDER BY finding_id",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "20:patch@example:local-a"
+        );
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "20:patch@example:local-r"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_review_migration_upgrades_existing_findings_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("old.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.conn
+            .execute(
+                "CREATE TABLE findings (
+                    id INTEGER PRIMARY KEY,
+                    review_id INTEGER NOT NULL,
+                    severity INTEGER NOT NULL
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query("PRAGMA table_info(findings)", ())
+            .await
+            .unwrap();
+        let mut columns = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.insert(row.get::<String>(1).unwrap());
+        }
+        assert!(columns.contains("cross_review_job_id"));
+        assert!(columns.contains("external_finding_id"));
+    }
+
+    #[tokio::test]
+    async fn cross_review_migration_replaces_the_pre_generation_constraint() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("old-cross.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db.conn
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DROP TABLE cross_review_jobs;
+                 CREATE TABLE cross_review_jobs (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER NOT NULL,
+                    source_name TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    lookup_message_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    first_attempt_at INTEGER NOT NULL,
+                    next_attempt_at INTEGER NOT NULL,
+                    deadline_at INTEGER NOT NULL,
+                    lease_until INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    completed_at INTEGER,
+                    remote_model TEXT,
+                    remote_provider TEXT,
+                    payload_hash TEXT,
+                    UNIQUE(patchset_id, source_name)
+                 );
+                 PRAGMA foreign_keys=ON;
+                 INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('cover@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status,
+                     target_review_count, model_name, provider)
+                    VALUES (1, 1, 'cover@example', 'Reviewed', 1,
+                            'local-model', 'local-provider');
+                 INSERT INTO cross_review_jobs
+                    (id, patchset_id, source_name, source_url, lookup_message_id,
+                     status, first_attempt_at, next_attempt_at, deadline_at)
+                    VALUES (10, 1, 'peer', 'https://peer.example', 'cover@example',
+                            'complete', 1000, 1000, 2000);",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET target_review_count = 2 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            3000,
+        )
+        .await
+        .unwrap();
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT generation, local_model, local_provider
+                 FROM cross_review_jobs WHERE patchset_id = 1 ORDER BY generation",
+                (),
+            )
+            .await
+            .unwrap();
+        let first = rows.next().await.unwrap().unwrap();
+        assert_eq!(first.get::<i64>(0).unwrap(), 1);
+        assert_eq!(first.get::<String>(1).unwrap(), "local-model");
+        assert_eq!(first.get::<String>(2).unwrap(), "local-provider");
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2
+        );
+        drop(rows);
+
+        db.migrate().await.unwrap();
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT generation FROM cross_review_jobs
+                 WHERE patchset_id = 1 ORDER BY generation",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1
+        );
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_review_completion_requires_every_remote() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('cover@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status)
+                    VALUES (1, 1, 'cover@example', 'Reviewed');",
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[
+                ("peer-a".to_string(), "https://a.example".to_string()),
+                ("peer-b".to_string(), "https://b.example".to_string()),
+            ],
+            1000,
+        )
+        .await
+        .unwrap();
+        let jobs = db.claim_due_cross_reviews(1000, 10).await.unwrap();
+        db.finish_cross_review_job(&jobs[0], "complete", 1100, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_cross_review_status(1).await.unwrap()["status"],
+            "pending"
+        );
+        let second = db
+            .claim_due_cross_reviews(1101, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db.finish_cross_review_job(&second, "complete", 1200, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_cross_review_status(1).await.unwrap()["status"],
+            "complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_review_claims_are_fenced_and_generation_scoped() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES
+                    ('cover@example', 1), ('patch@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status, target_review_count)
+                    VALUES (1, 1, 'cover@example', 'Reviewed', 1);
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');",
+            )
+            .await
+            .unwrap();
+        let sources = [("peer".to_string(), "https://peer.example".to_string())];
+        db.enqueue_cross_reviews(1, &sources, 1000).await.unwrap();
+        let first = db
+            .claim_due_cross_reviews(1000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(first.lookup_message_id, "patch@example");
+        assert_eq!(first.fallback_message_id.as_deref(), Some("cover@example"));
+
+        let second = db
+            .claim_due_cross_reviews(4600, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(first.lease_token, second.lease_token);
+        assert!(
+            !db.finish_cross_review_job(&first, "complete", 4601, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.finish_cross_review_job(&second, "complete", 4601, None)
+                .await
+                .unwrap()
+        );
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET target_review_count = 2 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(1, &sources, 5000).await.unwrap();
+        let generation_two = db
+            .claim_due_cross_reviews(5000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(generation_two.generation, 2);
+        assert_eq!(
+            db.get_cross_review_status(1).await.unwrap()["status"],
+            "pending"
+        );
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cross_review_generation = 0 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.finish_cross_review_job(&generation_two, "complete", 5001, None)
+                .await
+                .unwrap()
+        );
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cross_review_generation = 2 WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        db.finish_cross_review_job(&generation_two, "complete", 5001, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_cross_review_status(1).await.unwrap()["status"],
+            "complete"
+        );
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM cross_review_jobs WHERE patchset_id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_candidates_match_any_published_provenance_id() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id, status) VALUES (1, 'Reviewed');
+                 INSERT INTO reviews (id, patchset_id) VALUES (1, 1);",
+            )
+            .await
+            .unwrap();
+        db.save_local_canonical_findings(
+            1,
+            &json!([{
+                "finding_ids": ["main-3-0", "variant-3-0"],
+                "problem": "candidate",
+                "preexisting": false
+            }]),
+            &json!([{
+                "finding_ids": ["variant-3-0"],
+                "problem": "published",
+                "preexisting": false
+            }]),
+        )
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT accepted, finding_json FROM local_canonical_findings WHERE review_id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert!(row.get::<String>(1).unwrap().contains("published"));
+    }
+
+    #[tokio::test]
+    async fn cross_review_inputs_exclude_unpublished_reviews() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets (id, thread_id, status) VALUES (1, 1, 'Reviewed');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                 INSERT INTO ai_interactions (id, input_context, output_raw) VALUES
+                    ('old', 'old context', '{}'),
+                    ('published', 'new context', '{}'),
+                    ('unfinished', 'unfinished context', '{}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status) VALUES
+                    (19, 1, 10, 'old', 'Reviewed'),
+                    (20, 1, 10, 'published', 'Reviewed'),
+                    (21, 1, 10, 'unfinished', 'In Review');
+                 INSERT INTO local_canonical_findings
+                    (review_id, finding_id, finding_json, accepted) VALUES
+                    (19, 'old', '{\"severity\":\"Low\"}', 1),
+                    (20, 'published', '{\"severity\":\"High\"}', 1),
+                    (21, 'unfinished', '{\"severity\":\"High\"}', 1);",
+            )
+            .await
+            .unwrap();
+
+        let (findings, context) = db.load_cross_review_inputs(1).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].finding_id.contains("published"));
+        assert!(context.contains("new context"));
+        assert!(!context.contains("old context"));
+    }
+
+    #[tokio::test]
+    async fn serial_cross_results_merge_remote_provenance() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets (id, thread_id, cover_letter_message_id, status)
+                    VALUES (1, 1, 'patch@example', 'Reviewed');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                 INSERT INTO ai_interactions (id, input_context, output_raw)
+                    VALUES ('interaction', 'context', '{\"review\":{\"findings\":[]}}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status, created_at, inline_review)
+                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000, 'Initial');",
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[
+                ("peer-a".to_string(), "https://a.example".to_string()),
+                ("peer-b".to_string(), "https://b.example".to_string()),
+            ],
+            1000,
+        )
+        .await
+        .unwrap();
+        let first = db
+            .claim_due_cross_reviews(1000, 2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let make_result = |id: &str| {
+            let finding = crate::cross_review::RemoteFinding {
+                finding_id: id.to_string(),
+                patch_message_id: "patch@example".to_string(),
+                severity: "Medium".to_string(),
+                problem: format!("problem {id}"),
+                reasoning: "confirmed".to_string(),
+                locations: json!([]),
+            };
+            (
+                crate::cross_review::RemoteReviewResult {
+                    model: "remote".to_string(),
+                    provider: "remote".to_string(),
+                    payload_hash: id.to_string(),
+                    findings: vec![finding.clone()],
+                },
+                crate::cross_review::CrossReviewAnalysis {
+                    accepted_remote: vec![finding],
+                    matched_local: Vec::new(),
+                    matched_remote: Vec::new(),
+                    comparisons: vec![crate::cross_review::CrossComparison {
+                        finding_id: id.to_string(),
+                        matched_finding_id: None,
+                        outcome: "remote_only".to_string(),
+                        severity: "Medium".to_string(),
+                    }],
+                },
+            )
+        };
+        let (remote_a, analysis_a) = make_result("remote-a");
+        let usage = crate::cross_review::CrossReviewUsage::default();
+        db.persist_cross_review_result(&first, &remote_a, &analysis_a, &usage, 1100)
+            .await
+            .unwrap();
+        let second = db
+            .claim_due_cross_reviews(1101, 2)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (remote_b, _) = make_result("remote-b");
+        let analysis_b = crate::cross_review::CrossReviewAnalysis {
+            accepted_remote: Vec::new(),
+            matched_local: Vec::new(),
+            matched_remote: vec![crate::cross_review::CrossRemoteMatch {
+                finding_id: "remote-b".to_string(),
+                existing_job_id: first.id,
+                existing_finding_id: "remote-a".to_string(),
+            }],
+            comparisons: vec![crate::cross_review::CrossComparison {
+                finding_id: "remote-b".to_string(),
+                matched_finding_id: Some(format!("remote:{}:remote-a", first.id)),
+                outcome: "remote_only".to_string(),
+                severity: "Medium".to_string(),
+            }],
+        };
+        db.persist_cross_review_result(&second, &remote_b, &analysis_b, &usage, 1200)
+            .await
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT output_raw FROM ai_interactions WHERE id = 'interaction'",
+                (),
+            )
+            .await
+            .unwrap();
+        let output: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(output.contains("problem remote-a"));
+        assert!(!output.contains("problem remote-b"));
+        assert!(output.contains("peer-a"));
+        assert!(output.contains("peer-b"));
+        assert!(output.contains("remote-b"));
+        let (inputs, _) = db.load_cross_review_inputs(1).await.unwrap();
+        let remote_inputs = inputs
+            .iter()
+            .filter(|finding| finding.source_name.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(remote_inputs.len(), 1);
+        assert_eq!(remote_inputs[0].source_name.as_deref(), Some("peer-a"));
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM findings WHERE review_id = 20", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1
+        );
     }
 }

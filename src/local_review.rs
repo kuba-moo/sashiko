@@ -427,6 +427,7 @@ async fn review_single_patch(
     semcode: Option<&SemcodeSettings>,
 ) -> Result<Value> {
     let mut last_error = None;
+    let mut prior_merge_usage = MergeUsageTotals::default();
     for attempt in 1..=3 {
         emit(
             progress,
@@ -521,31 +522,7 @@ async fn review_single_patch(
                     max_interactions: variant_ai.max_interactions,
                     model_id: variant_ai.model.clone(),
                     provider_id,
-                    budget: Some(ReviewBudget::new(BudgetConfig {
-                        stage_input: variant_ai
-                            .budget
-                            .stage_input_tokens
-                            .unwrap_or(variant_ai.stage_input_budget),
-                        stage_output: variant_ai
-                            .budget
-                            .stage_output_tokens
-                            .unwrap_or(variant_ai.stage_output_budget),
-                        review_input: variant_ai.budget.review_input_tokens.unwrap_or(0),
-                        review_output: variant_ai.budget.review_output_tokens.unwrap_or(0),
-                        warn_pct: variant_ai
-                            .budget
-                            .warn_pct
-                            .unwrap_or(variant_ai.budget_warn_pct),
-                        severe_pct: variant_ai
-                            .budget
-                            .severe_pct
-                            .unwrap_or(variant_ai.budget_severe_pct),
-                        review_multiplier: variant_ai.review_budget_multiplier,
-                        enforce_hard_limits: variant_ai.budget.stage_input_tokens.is_some()
-                            || variant_ai.budget.stage_output_tokens.is_some()
-                            || variant_ai.budget.review_input_tokens.is_some()
-                            || variant_ai.budget.review_output_tokens.is_some(),
-                    })),
+                    budget: Some(ReviewBudget::new(variant_ai.discovery_budget_config())),
                 }
             })
             .collect::<Vec<_>>();
@@ -596,6 +573,9 @@ async fn review_single_patch(
             .get(&p.index)
             .map(|sha| format!("{}..{}", baseline_sha, sha));
 
+        let discovery_budget = ReviewBudget::new(ai.discovery_budget_config());
+        let merge_budget = ReviewBudget::new(ai.merge_budget_config());
+        let merge_budget_observer = merge_budget.clone();
         let mut worker = Worker::new(
             provider,
             std::sync::Arc::new(tools),
@@ -609,25 +589,8 @@ async fn review_single_patch(
                 series_range,
                 stages: options.stages.clone(),
                 dump_conversation: ai.dump_conversation.as_ref().map(PathBuf::from),
-                budget: Some(ReviewBudget::new(BudgetConfig {
-                    stage_input: ai
-                        .budget
-                        .stage_input_tokens
-                        .unwrap_or(ai.stage_input_budget),
-                    stage_output: ai
-                        .budget
-                        .stage_output_tokens
-                        .unwrap_or(ai.stage_output_budget),
-                    review_input: ai.budget.review_input_tokens.unwrap_or(0),
-                    review_output: ai.budget.review_output_tokens.unwrap_or(0),
-                    warn_pct: ai.budget.warn_pct.unwrap_or(ai.budget_warn_pct),
-                    severe_pct: ai.budget.severe_pct.unwrap_or(ai.budget_severe_pct),
-                    review_multiplier: ai.review_budget_multiplier,
-                    enforce_hard_limits: ai.budget.stage_input_tokens.is_some()
-                        || ai.budget.stage_output_tokens.is_some()
-                        || ai.budget.review_input_tokens.is_some()
-                        || ai.budget.review_output_tokens.is_some(),
-                })),
+                budget: Some(discovery_budget),
+                merge_budget: Some(merge_budget),
                 retry_provider,
                 additional_models,
                 cohort,
@@ -717,7 +680,23 @@ async fn review_single_patch(
             )
             .await
         {
-            Ok(result) => {
+            Ok(mut result) => {
+                let mut merge_usage = prior_merge_usage;
+                merge_usage.add_snapshot(merge_budget_observer.snapshot());
+                if let Some(output) = result.output.as_mut()
+                    && let Some(object) = output.as_object_mut()
+                {
+                    object.insert("merge_usage".to_string(), merge_usage.to_json());
+                }
+                result.tokens_in = result
+                    .tokens_in
+                    .saturating_add(u32::try_from(prior_merge_usage.tokens_in).unwrap_or(u32::MAX));
+                result.tokens_out = result.tokens_out.saturating_add(
+                    u32::try_from(prior_merge_usage.tokens_out).unwrap_or(u32::MAX),
+                );
+                result.tokens_cached = result.tokens_cached.saturating_add(
+                    u32::try_from(prior_merge_usage.tokens_cached).unwrap_or(u32::MAX),
+                );
                 info!("AI review completed for patch {}.", p.index);
                 emit(
                     progress,
@@ -747,6 +726,7 @@ async fn review_single_patch(
                         p.index
                     );
                     if attempt < 3 {
+                        prior_merge_usage.add_snapshot(merge_budget_observer.snapshot());
                         continue;
                     }
                 }
@@ -764,16 +744,123 @@ async fn review_single_patch(
                 }));
             }
             Err(e) => {
+                prior_merge_usage.add_snapshot(merge_budget_observer.snapshot());
                 error!(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
+                if attempt == 3 {
+                    return Ok(json!({
+                        "patch_index": p.index,
+                        "review": null,
+                        "error": e.to_string(),
+                        "inline_review": null,
+                        "input_context": "",
+                        "history": [],
+                        "merge_usage": prior_merge_usage.to_json(),
+                        "tokens_in": prior_merge_usage.tokens_in,
+                        "tokens_out": prior_merge_usage.tokens_out,
+                        "tokens_cached": prior_merge_usage.tokens_cached,
+                    }));
+                }
                 last_error = Some(e);
             }
         }
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
+}
+
+#[derive(Clone, Copy, Default)]
+struct MergeUsageTotals {
+    tokens_in: usize,
+    tokens_out: usize,
+    tokens_cached: usize,
+    budget_flags: u8,
+}
+
+impl MergeUsageTotals {
+    fn add_snapshot(&mut self, snapshot: crate::ai::review_budget::BudgetSnapshot) {
+        self.tokens_in = self.tokens_in.saturating_add(snapshot.input);
+        self.tokens_out = self.tokens_out.saturating_add(snapshot.output);
+        self.tokens_cached = self.tokens_cached.saturating_add(snapshot.cached);
+        self.budget_flags |= snapshot.flags;
+    }
+
+    fn add_json(&mut self, usage: &Value) {
+        self.tokens_in = self
+            .tokens_in
+            .saturating_add(usage["tokens_in"].as_u64().unwrap_or(0) as usize);
+        self.tokens_out = self
+            .tokens_out
+            .saturating_add(usage["tokens_out"].as_u64().unwrap_or(0) as usize);
+        self.tokens_cached = self
+            .tokens_cached
+            .saturating_add(usage["tokens_cached"].as_u64().unwrap_or(0) as usize);
+        self.budget_flags |= usage["budget_flags"].as_u64().unwrap_or(0) as u8;
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "tokens_cached": self.tokens_cached,
+            "budget_flags": self.budget_flags,
+        })
+    }
+}
+
+struct PrivateReviewMetadata {
+    canonical_candidates: Vec<Value>,
+    model_experiment: Option<Value>,
+    merge_usage: MergeUsageTotals,
+    errors: Vec<String>,
+}
+
+fn collect_private_review_metadata(
+    results: &[Value],
+    patches: &[PatchInput],
+) -> PrivateReviewMetadata {
+    let mut metadata = PrivateReviewMetadata {
+        canonical_candidates: Vec::new(),
+        model_experiment: None,
+        merge_usage: MergeUsageTotals::default(),
+        errors: Vec::new(),
+    };
+    for result in results {
+        let patch_index = result["patch_index"].as_i64().unwrap_or(0);
+        let patch_subject = patches
+            .iter()
+            .find(|patch| patch.index == patch_index)
+            .and_then(|patch| patch.subject.as_deref())
+            .unwrap_or_default();
+        if let Some(review) = result.get("review") {
+            for candidate in review["canonical_candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let mut candidate = candidate.clone();
+                candidate["patch_index"] = json!(patch_index);
+                candidate["patch_subject"] = json!(patch_subject);
+                metadata.canonical_candidates.push(candidate);
+            }
+            if metadata.model_experiment.is_none() {
+                metadata.model_experiment = review.get("model_experiment").cloned();
+            }
+        }
+        if let Some(usage) = result
+            .get("review")
+            .and_then(|review| review.get("merge_usage"))
+            .or_else(|| result.get("merge_usage"))
+        {
+            metadata.merge_usage.add_json(usage);
+        }
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            metadata.errors.push(error.to_string());
+        }
+    }
+    metadata
 }
 
 #[cfg(feature = "bedrock")]
@@ -1086,8 +1173,9 @@ async fn run_worker_in_worktree(
     let mut total_concerns_count = 0;
     let mut total_dismissed_concerns_count = 0;
     let mut budget_flags = 0u64;
+    let private_metadata = collect_private_review_metadata(&results, &patches_to_review);
 
-    for res in results {
+    for res in &results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
         let patch_subject = patches_to_review
             .iter()
@@ -1168,6 +1256,9 @@ async fn run_worker_in_worktree(
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
         ,"budget_flags": budget_flags,
+        "canonical_candidates": private_metadata.canonical_candidates,
+        "merge_usage": private_metadata.merge_usage.to_json(),
+        "model_experiment": private_metadata.model_experiment,
         "dedup_stats": {
             "total_concerns": total_concerns_count,
             "unique_findings": unique_findings,
@@ -1187,6 +1278,8 @@ async fn run_worker_in_worktree(
         "tokens_in": total_tokens_in,
         "tokens_out": total_tokens_out,
         "tokens_cached": total_tokens_cached
+        ,"merge_usage": private_metadata.merge_usage.to_json()
+        ,"error": if private_metadata.errors.is_empty() { Value::Null } else { json!(private_metadata.errors.join("; ")) }
     });
 
     Ok(combined_result)
@@ -1402,6 +1495,57 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn private_review_metadata_survives_patch_aggregation() {
+        let patches = vec![PatchInput {
+            index: 3,
+            diff: String::new(),
+            subject: Some("Subject".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        }];
+        let results = vec![
+            json!({
+                "patch_index": 3,
+                "review": {
+                    "canonical_candidates": [{"finding_ids": ["main-3-0"]}],
+                    "model_experiment": {"runs": [{"model": "main"}]},
+                    "merge_usage": {
+                        "tokens_in": 10,
+                        "tokens_out": 4,
+                        "tokens_cached": 3,
+                        "budget_flags": 2
+                    }
+                }
+            }),
+            json!({
+                "patch_index": 3,
+                "review": null,
+                "error": "merge failed",
+                "merge_usage": {
+                    "tokens_in": 5,
+                    "tokens_out": 2,
+                    "tokens_cached": 1,
+                    "budget_flags": 4
+                }
+            }),
+        ];
+
+        let metadata = collect_private_review_metadata(&results, &patches);
+        assert_eq!(metadata.canonical_candidates.len(), 1);
+        assert_eq!(metadata.canonical_candidates[0]["patch_index"], 3);
+        assert_eq!(
+            metadata.model_experiment.unwrap()["runs"][0]["model"],
+            "main"
+        );
+        assert_eq!(metadata.merge_usage.tokens_in, 15);
+        assert_eq!(metadata.merge_usage.tokens_cached, 4);
+        assert_eq!(metadata.merge_usage.budget_flags, 6);
+        assert_eq!(metadata.errors, ["merge failed"]);
+    }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
         let output = Command::new("git")

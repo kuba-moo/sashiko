@@ -26,6 +26,7 @@ pub struct BudgetConfig {
 pub struct BudgetSnapshot {
     pub input: usize,
     pub output: usize,
+    pub cached: usize,
     pub flags: u8,
 }
 
@@ -34,6 +35,7 @@ pub struct ReviewBudget {
     config: BudgetConfig,
     review_input: Arc<AtomicUsize>,
     review_output: Arc<AtomicUsize>,
+    review_cached: Arc<AtomicUsize>,
     flags: Arc<AtomicU8>,
 }
 
@@ -48,6 +50,7 @@ impl ReviewBudget {
             config,
             review_input: Arc::new(AtomicUsize::new(0)),
             review_output: Arc::new(AtomicUsize::new(0)),
+            review_cached: Arc::new(AtomicUsize::new(0)),
             flags: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -60,6 +63,7 @@ impl ReviewBudget {
         BudgetSnapshot {
             input: self.review_input.load(Ordering::Relaxed),
             output: self.review_output.load(Ordering::Relaxed),
+            cached: self.review_cached.load(Ordering::Relaxed),
             flags: self.flags(),
         }
     }
@@ -120,6 +124,7 @@ impl ReviewBudget {
         stage_output: usize,
         input_delta: usize,
         output_delta: usize,
+        cached_delta: usize,
     ) -> Option<BudgetLevel> {
         let review_input =
             self.review_input.fetch_add(input_delta, Ordering::Relaxed) + input_delta;
@@ -127,6 +132,8 @@ impl ReviewBudget {
             .review_output
             .fetch_add(output_delta, Ordering::Relaxed)
             + output_delta;
+        self.review_cached
+            .fetch_add(cached_delta, Ordering::Relaxed);
         let review_input_limit = self.review_input_limit();
         let review_output_limit = self.review_output_limit();
 
@@ -227,16 +234,16 @@ mod tests {
         let mut stage_flags = 0;
 
         assert!(matches!(
-            budget.record_and_check(&mut stage_flags, 50, 0, 50, 0),
+            budget.record_and_check(&mut stage_flags, 50, 0, 50, 0, 0),
             Some(BudgetLevel::Warn)
         ));
         assert!(
             budget
-                .record_and_check(&mut stage_flags, 60, 0, 10, 0)
+                .record_and_check(&mut stage_flags, 60, 0, 10, 0, 0)
                 .is_none()
         );
         assert!(matches!(
-            budget.record_and_check(&mut stage_flags, 90, 0, 30, 0),
+            budget.record_and_check(&mut stage_flags, 90, 0, 30, 0, 0),
             Some(BudgetLevel::Severe)
         ));
         assert_eq!(
@@ -261,11 +268,11 @@ mod tests {
         let mut second_stage = 0;
 
         assert!(matches!(
-            budget.record_and_check(&mut first_stage, 50, 0, 50, 0),
+            budget.record_and_check(&mut first_stage, 50, 0, 50, 0, 0),
             Some(BudgetLevel::Warn)
         ));
         assert!(matches!(
-            budget.record_and_check(&mut second_stage, 50, 0, 50, 0),
+            budget.record_and_check(&mut second_stage, 50, 0, 50, 0, 0),
             Some(BudgetLevel::Warn)
         ));
     }
@@ -285,11 +292,28 @@ mod tests {
         let mut stage_flags = 0;
 
         assert!(matches!(
-            budget.record_and_check(&mut stage_flags, 25, 13, 25, 13),
+            budget.record_and_check(&mut stage_flags, 25, 13, 25, 13, 0),
             Some(BudgetLevel::Warn)
         ));
         assert_eq!(budget.snapshot().input, 25);
         assert_eq!(budget.snapshot().output, 13);
+    }
+
+    #[test]
+    fn snapshot_retains_cached_usage_after_an_attempt() {
+        let budget = ReviewBudget::new(BudgetConfig {
+            stage_input: 100,
+            stage_output: 100,
+            review_input: 100,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 1.0,
+            enforce_hard_limits: true,
+        });
+        let mut flags = 0;
+        budget.record_and_check(&mut flags, 20, 10, 20, 10, 7);
+        assert_eq!(budget.snapshot().cached, 7);
     }
 
     #[test]
@@ -306,7 +330,7 @@ mod tests {
         });
         let mut flags = 0;
         assert!(budget.allows(100, 50));
-        budget.record_and_check(&mut flags, 80, 30, 80, 30);
+        budget.record_and_check(&mut flags, 80, 30, 80, 30, 0);
         assert!(!budget.allows(80, 20));
         assert!(!budget.allows(20, 50));
         assert!(budget.allows(20, 20));
@@ -327,9 +351,9 @@ mod tests {
         assert!(budget.allows_request_input(80));
         assert!(!budget.allows_request_input(101));
         let mut flags = 0;
-        budget.record_and_check(&mut flags, 80, 30, 80, 30);
+        budget.record_and_check(&mut flags, 80, 30, 80, 30, 0);
         assert!(!budget.hard_limit_exceeded(80, 30));
-        budget.record_and_check(&mut flags, 80, 50, 80, 20);
+        budget.record_and_check(&mut flags, 80, 50, 80, 20, 0);
         assert!(budget.hard_limit_exceeded(80, 50));
     }
 }

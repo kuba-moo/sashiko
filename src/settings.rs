@@ -371,7 +371,7 @@ pub struct ModelExperimentSettings {
 }
 
 impl SourceBudgetSettings {
-    fn with_overrides(&self, overrides: &Self) -> Self {
+    pub(crate) fn with_overrides(&self, overrides: &Self) -> Self {
         Self {
             stage_input_tokens: overrides.stage_input_tokens.or(self.stage_input_tokens),
             stage_output_tokens: overrides.stage_output_tokens.or(self.stage_output_tokens),
@@ -521,6 +521,9 @@ pub struct AiSettings {
     /// Explicit source budget. Values override the legacy flat budget fields.
     #[serde(default)]
     pub budget: SourceBudgetSettings,
+    /// Budget for stages 8-11. Unspecified values inherit from `budget`.
+    #[serde(default)]
+    pub merge_budget: SourceBudgetSettings,
     #[serde(default)]
     pub model_experiments: ModelExperimentSettings,
     #[serde(default)]
@@ -542,6 +545,37 @@ pub struct AiSettings {
     pub kiro_cli: Option<KiroCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,
+}
+
+impl AiSettings {
+    pub(crate) fn discovery_budget_config(&self) -> crate::ai::review_budget::BudgetConfig {
+        self.budget_config(&self.budget)
+    }
+
+    pub(crate) fn merge_budget_config(&self) -> crate::ai::review_budget::BudgetConfig {
+        self.budget_config(&self.budget.with_overrides(&self.merge_budget))
+    }
+
+    fn budget_config(
+        &self,
+        budget: &SourceBudgetSettings,
+    ) -> crate::ai::review_budget::BudgetConfig {
+        crate::ai::review_budget::BudgetConfig {
+            stage_input: budget.stage_input_tokens.unwrap_or(self.stage_input_budget),
+            stage_output: budget
+                .stage_output_tokens
+                .unwrap_or(self.stage_output_budget),
+            review_input: budget.review_input_tokens.unwrap_or(0),
+            review_output: budget.review_output_tokens.unwrap_or(0),
+            warn_pct: budget.warn_pct.unwrap_or(self.budget_warn_pct),
+            severe_pct: budget.severe_pct.unwrap_or(self.budget_severe_pct),
+            review_multiplier: self.review_budget_multiplier,
+            enforce_hard_limits: budget.stage_input_tokens.is_some()
+                || budget.stage_output_tokens.is_some()
+                || budget.review_input_tokens.is_some()
+                || budget.review_output_tokens.is_some(),
+        }
+    }
 }
 
 fn default_response_cache_ttl_days() -> u64 {
@@ -674,6 +708,53 @@ pub struct SemcodeSettings {
     pub enabled: bool,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+#[allow(unused)]
+pub struct CrossReviewSettings {
+    #[serde(default, deserialize_with = "deserialize_cross_review_instances")]
+    pub instances: Vec<CrossReviewInstanceSettings>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct CrossReviewInstanceSettings {
+    pub name: String,
+    pub url: String,
+}
+
+fn deserialize_cross_review_instances<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CrossReviewInstanceSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut instances = Vec::<CrossReviewInstanceSettings>::deserialize(deserializer)?;
+    let mut names = std::collections::HashSet::new();
+    for instance in &mut instances {
+        if instance.name.is_empty()
+            || instance.name == "main"
+            || !instance
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || !names.insert(instance.name.clone())
+        {
+            return Err(serde::de::Error::custom(
+                "cross-review instance names must be unique, route-safe, and not 'main'",
+            ));
+        }
+        let parsed = reqwest::Url::parse(&instance.url)
+            .map_err(|_| serde::de::Error::custom("invalid cross-review instance URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(serde::de::Error::custom(
+                "cross-review instance URL must use HTTP or HTTPS",
+            ));
+        }
+        instance.url = instance.url.trim_end_matches('/').to_string();
+    }
+    Ok(instances)
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct Settings {
@@ -695,6 +776,8 @@ pub struct Settings {
     pub review: ReviewSettings,
     #[serde(default)]
     pub semcode: Option<SemcodeSettings>,
+    #[serde(default)]
+    pub cross_review: CrossReviewSettings,
 }
 
 fn default_subsystems() -> SubsystemsSettings {
@@ -815,6 +898,12 @@ mod tests {
         models: Vec<AdditionalModelSettings>,
     }
 
+    #[derive(Deserialize)]
+    struct CrossReviewWrapper {
+        #[serde(deserialize_with = "deserialize_cross_review_instances")]
+        instances: Vec<CrossReviewInstanceSettings>,
+    }
+
     #[test]
     fn test_local_review_path_prefers_current_directory() {
         let temp = tempfile::tempdir().unwrap();
@@ -903,5 +992,52 @@ mod tests {
         .unwrap();
         assert_eq!(experiments.validation_budget.request_input_tokens, 300);
         assert_eq!(experiments.validation_budget.review_output_tokens, 400);
+    }
+
+    #[test]
+    fn merge_budget_inherits_discovery_values() {
+        let ai: AiSettings = serde_json::from_value(serde_json::json!({
+            "provider": "test",
+            "model": "model",
+            "budget": {
+                "stage_input_tokens": 100,
+                "review_output_tokens": 400,
+                "warn_pct": 0.7
+            },
+            "merge_budget": {
+                "stage_output_tokens": 200
+            }
+        }))
+        .unwrap();
+
+        let discovery = ai.discovery_budget_config();
+        let merge = ai.merge_budget_config();
+        assert_eq!(discovery.stage_input, 100);
+        assert_eq!(merge.stage_input, 100);
+        assert_eq!(merge.stage_output, 200);
+        assert_eq!(merge.review_output, 400);
+        assert_eq!(merge.warn_pct, 0.7);
+        assert!(merge.enforce_hard_limits);
+    }
+
+    #[test]
+    fn cross_review_instances_validate_names_and_urls() {
+        let valid = serde_json::json!({
+            "instances": [{"name": "peer-a_2", "url": "https://peer.example/"}]
+        });
+        let parsed: CrossReviewWrapper = serde_json::from_value(valid).unwrap();
+        assert_eq!(parsed.instances[0].url, "https://peer.example");
+
+        for value in [
+            serde_json::json!({"instances": [{"name": "main", "url": "https://peer.example"}]}),
+            serde_json::json!({"instances": [{"name": "bad name", "url": "https://peer.example"}]}),
+            serde_json::json!({"instances": [{"name": "peer", "url": "file:///tmp/peer"}]}),
+            serde_json::json!({"instances": [
+                {"name": "peer", "url": "https://one.example"},
+                {"name": "peer", "url": "https://two.example"}
+            ]}),
+        ] {
+            assert!(serde_json::from_value::<CrossReviewWrapper>(value).is_err());
+        }
     }
 }

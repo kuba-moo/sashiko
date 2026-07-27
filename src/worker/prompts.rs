@@ -97,6 +97,7 @@ pub struct WorkerConfig {
     pub stages: Option<Vec<u8>>,
     pub dump_conversation: Option<std::path::PathBuf>,
     pub budget: Option<ReviewBudget>,
+    pub merge_budget: Option<ReviewBudget>,
     pub retry_provider: Option<Arc<dyn AiProvider>>,
     pub additional_models: Vec<AdditionalModelRunner>,
     pub cohort: crate::ai::model_experiment::ReviewCohort,
@@ -514,6 +515,7 @@ pub struct Worker {
     dump_conversation: Option<std::path::PathBuf>,
     conversation_dumper: Option<Arc<ConversationDumper>>,
     budget: Option<ReviewBudget>,
+    merge_budget: Option<ReviewBudget>,
     retry_provider: Option<Arc<dyn AiProvider>>,
     additional_models: Vec<AdditionalModelRunner>,
     cohort: crate::ai::model_experiment::ReviewCohort,
@@ -541,6 +543,7 @@ impl Worker {
             dump_conversation: config.dump_conversation,
             conversation_dumper: None,
             budget: config.budget,
+            merge_budget: config.merge_budget,
             retry_provider: config.retry_provider,
             additional_models: config.additional_models,
             cohort: config.cohort,
@@ -549,16 +552,28 @@ impl Worker {
         }
     }
 
-    fn provider_for_budget(&self) -> Arc<dyn AiProvider> {
-        if self
-            .budget
-            .as_ref()
-            .is_some_and(ReviewBudget::review_past_warn)
+    fn provider_for_budget(&self, budget: Option<&ReviewBudget>) -> Arc<dyn AiProvider> {
+        if budget.is_some_and(ReviewBudget::review_past_warn)
             && let Some(provider) = &self.retry_provider
         {
             return provider.clone();
         }
         self.provider.clone()
+    }
+
+    fn budget_flags(&self) -> u8 {
+        self.budget.as_ref().map_or(0, ReviewBudget::flags)
+            | self.merge_budget.as_ref().map_or(0, ReviewBudget::flags)
+    }
+
+    fn merge_usage(&self) -> Value {
+        let snapshot = self.merge_budget.as_ref().map(ReviewBudget::snapshot);
+        json!({
+            "tokens_in": snapshot.map_or(0, |usage| usage.input),
+            "tokens_out": snapshot.map_or(0, |usage| usage.output),
+            "tokens_cached": snapshot.map_or(0, |usage| usage.cached),
+            "budget_flags": snapshot.map_or(0, |usage| usage.flags),
+        })
     }
 
     pub async fn run(
@@ -943,7 +958,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 clean_system_prompt.clone(),
                 progress,
                 StageExecutionConfig {
-                    provider: self.provider_for_budget(),
+                    provider: self.provider_for_budget(self.budget.as_ref()),
                     name: "main".to_string(),
                     temperature: self.temperature,
                     max_interactions: self.max_interactions,
@@ -1029,7 +1044,9 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": 0,
-                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
+                "budget_flags": self.budget_flags(),
+                "merge_usage": self.merge_usage(),
+                "canonical_candidates": [],
                 "dismissed_concerns_count": dismissed_concerns_count
                 ,"dedup_stats": dedup_stats(0, &json!([]))
                 ,"model_experiment": {
@@ -1041,7 +1058,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             return Ok(WorkerResult {
                 output: Some(final_output),
                 error: None,
-                input_context: "Multi-stage execution completed".to_string(),
+                input_context: shared_context.clone(),
                 history: self.global_history.clone(),
                 history_before_pruning: self.global_history.clone(),
                 history_after_pruning: self.global_history.clone(),
@@ -1151,10 +1168,10 @@ Preserve the most precise location details from the input. Do not invent line nu
                 self.context_tag.as_deref(),
             );
             session.require_provenance(all_concerns.clone(), true, "concerns");
-            let provider = self.provider_for_budget();
+            let provider = self.provider_for_budget(self.merge_budget.as_ref());
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
-                .with_budget(self.budget.clone())
+                .with_budget(self.merge_budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1196,7 +1213,9 @@ Preserve the most precise location details from the input. Do not invent line nu
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
-                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
+                "budget_flags": self.budget_flags(),
+                "merge_usage": self.merge_usage(),
+                "canonical_candidates": [],
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len),
@@ -1211,7 +1230,7 @@ Preserve the most precise location details from the input. Do not invent line nu
             return Ok(WorkerResult {
                 output: Some(final_output),
                 error: None,
-                input_context: "Multi-stage execution completed".to_string(),
+                input_context: shared_context.clone(),
                 history: self.global_history.clone(),
                 history_before_pruning: self.global_history.clone(),
                 history_after_pruning: self.global_history.clone(),
@@ -1331,10 +1350,10 @@ Example Output:
                 false,
                 "concerns",
             );
-            let provider = self.provider_for_budget();
+            let provider = self.provider_for_budget(self.merge_budget.as_ref());
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
-                .with_budget(self.budget.clone())
+                .with_budget(self.merge_budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1355,6 +1374,7 @@ Example Output:
 
             conflict_resolved_concerns = result.output.get("concerns").unwrap().clone();
         }
+        let canonical_candidates = conflict_resolved_concerns.clone();
         if let Some(progress_cb) = progress {
             progress_cb(WorkerProgressEvent::StageFinished { stage: 9 });
         }
@@ -1371,7 +1391,9 @@ Example Output:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
-                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
+                "budget_flags": self.budget_flags(),
+                "merge_usage": self.merge_usage(),
+                "canonical_candidates": canonical_candidates,
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len),
@@ -1386,7 +1408,7 @@ Example Output:
             return Ok(WorkerResult {
                 output: Some(final_output),
                 error: None,
-                input_context: "Multi-stage execution completed".to_string(),
+                input_context: shared_context.clone(),
                 history: self.global_history.clone(),
                 history_before_pruning: self.global_history.clone(),
                 history_after_pruning: self.global_history.clone(),
@@ -1491,10 +1513,10 @@ Example Output:
                 false,
                 "findings",
             );
-            let provider = self.provider_for_budget();
+            let provider = self.provider_for_budget(self.merge_budget.as_ref());
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
-                .with_budget(self.budget.clone())
+                .with_budget(self.merge_budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1546,11 +1568,13 @@ Example Output:
                 "review_inline": "No issues found.",
                 "fixes": "",
                 "concerns_count": all_concerns.len(),
-                "budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
+                "budget_flags": self.budget_flags(),
+                "merge_usage": self.merge_usage(),
                 "dismissed_concerns_count": deduplicated_dismissed_concerns
                     .as_array()
                     .map_or(0, Vec::len),
                 "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
+                ,"canonical_candidates": canonical_candidates
                 ,"model_experiment": {
                     "cohort": &self.cohort,
                     "runs": experiment_runs,
@@ -1561,7 +1585,7 @@ Example Output:
             return Ok(WorkerResult {
                 output: Some(final_output),
                 error: None,
-                input_context: "Multi-stage execution completed".to_string(),
+                input_context: shared_context.clone(),
                 history: self.global_history.clone(),
                 history_before_pruning: self.global_history.clone(),
                 history_after_pruning: self.global_history.clone(),
@@ -1601,10 +1625,10 @@ Example Output:
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            let provider = self.provider_for_budget();
+            let provider = self.provider_for_budget(self.merge_budget.as_ref());
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
-                .with_budget(self.budget.clone())
+                .with_budget(self.merge_budget.clone())
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1641,8 +1665,10 @@ Example Output:
             "fixes": fixes_text,
             "concerns_count": all_concerns.len(),
             "dismissed_concerns_count": dismissed_concerns_count
-            ,"budget_flags": self.budget.as_ref().map_or(0, ReviewBudget::flags),
-            "dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
+            ,"budget_flags": self.budget_flags()
+            ,"merge_usage": self.merge_usage()
+            ,"dedup_stats": dedup_stats(all_concerns.len(), &findings_json)
+            ,"canonical_candidates": canonical_candidates
             ,"model_experiment": {
                 "cohort": &self.cohort,
                 "runs": experiment_runs,
@@ -1654,7 +1680,7 @@ Example Output:
         Ok(WorkerResult {
             output: Some(final_output),
             error: None,
-            input_context: "Multi-stage execution completed".to_string(),
+            input_context: shared_context.clone(),
             history: self.global_history.clone(),
             history_before_pruning: self.global_history.clone(),
             history_after_pruning: self.global_history.clone(),
@@ -1975,6 +2001,7 @@ Example:
             .iter()
             .map(|model| (model.name.as_str(), model.provider_id.as_str()))
             .collect();
+        let mut accepted = vec![true; items.len()];
 
         for (index, concern) in items.iter().enumerate() {
             let models: Vec<&str> = concern["source_models"]
@@ -2067,10 +2094,11 @@ Example:
                             vec![discoverer.to_string()]
                         },
                     });
+            } else if discoverer == "main" {
+                accepted[index] = baseline_decisions.get(&finding_id).copied().unwrap_or(true);
             }
         }
 
-        let mut accepted = vec![true; items.len()];
         let mut confirmation_runs = Vec::new();
         for (confirmer, batch) in batches {
             let (provider, confirmer_model_id, confirmer_provider_id) = if confirmer == "main" {
@@ -2245,6 +2273,7 @@ async fn request_confirmation(
                             usage.completion_tokens,
                             usage.prompt_tokens,
                             usage.completion_tokens,
+                            usage.cached_tokens.unwrap_or(0),
                         );
                     }
                     if !within_budget {
@@ -3012,6 +3041,7 @@ mod tests {
                 stages: None,
                 dump_conversation: None,
                 budget: None,
+                merge_budget: None,
                 retry_provider: None,
                 additional_models: vec![AdditionalModelRunner {
                     name: "variant".to_string(),
@@ -3086,6 +3116,7 @@ mod tests {
                 stages: None,
                 dump_conversation: None,
                 budget: None,
+                merge_budget: None,
                 retry_provider: None,
                 additional_models: vec![AdditionalModelRunner {
                     name: "variant".to_string(),
@@ -3436,6 +3467,7 @@ mod tests {
             stages: None,
             dump_conversation: None,
             budget: None,
+            merge_budget: None,
             retry_provider: None,
             additional_models: Vec::new(),
             cohort: test_cohort(),
@@ -3798,6 +3830,7 @@ mod tests {
             stages: Some(vec![1]),
             dump_conversation: None,
             budget: None,
+            merge_budget: None,
             retry_provider: None,
             additional_models: Vec::new(),
             cohort: test_cohort(),

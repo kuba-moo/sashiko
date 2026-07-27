@@ -414,6 +414,7 @@ impl<'a> SessionRunner<'a> {
                         total_completion_tokens,
                         usage.prompt_tokens,
                         usage.completion_tokens,
+                        usage.cached_tokens.unwrap_or(0),
                     );
                     if budget.hard_limit_exceeded(total_prompt_tokens, total_completion_tokens) {
                         return Err(SessionBudgetError {

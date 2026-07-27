@@ -379,6 +379,7 @@ pub fn build_router(
         .route("/api/stats/tools", get(stats_tools))
         .route("/api/stats/cost", get(stats_cost))
         .route("/api/stats/model-experiments", get(stats_model_experiments))
+        .route("/api/stats/cross-reviews", get(stats_cross_reviews))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
@@ -861,6 +862,11 @@ async fn get_patchset(
     match result {
         Ok(Some(mut details)) => {
             if let Some(obj) = details.as_object_mut() {
+                if let Some(id) = obj.get("id").and_then(serde_json::Value::as_i64)
+                    && let Ok(status) = state.db.get_cross_review_status(id).await
+                {
+                    obj.insert("cross_review".to_string(), status);
+                }
                 obj.insert(
                     "smtp_enabled".to_string(),
                     serde_json::Value::Bool(state.smtp_enabled),
@@ -933,6 +939,11 @@ async fn get_patchset_summary(
     match result {
         Ok(Some(mut details)) => {
             if let Some(obj) = details.as_object_mut() {
+                if let Some(id) = obj.get("id").and_then(serde_json::Value::as_i64)
+                    && let Ok(status) = state.db.get_cross_review_status(id).await
+                {
+                    obj.insert("cross_review".to_string(), status);
+                }
                 obj.insert(
                     "smtp_enabled".to_string(),
                     serde_json::Value::Bool(state.smtp_enabled),
@@ -1118,6 +1129,20 @@ async fn stats_model_experiments(
         .map(Json)
         .map_err(|error| {
             info!("Error getting model experiment stats: {}", error);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn stats_cross_reviews(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    state
+        .db
+        .get_cross_review_stats()
+        .await
+        .map(Json)
+        .map_err(|error| {
+            info!("Error getting cross-review stats: {}", error);
             StatusCode::INTERNAL_SERVER_ERROR
         })
 }

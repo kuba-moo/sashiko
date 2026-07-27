@@ -2143,6 +2143,9 @@
                     }
 
                     let statusLabel = p.status || 'Pending';
+                    if (statusLabel === 'Reviewed' && p.cross_review_status === 'complete') {
+                        statusLabel = 'Cross-reviewed';
+                    }
                     let findingsHtml = '-';
                     if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
                         const counts = {
@@ -2626,6 +2629,9 @@
             }
 
             let currentStatus = data.status || 'Pending';
+            if (currentStatus === 'Reviewed' && data.cross_review?.status === 'complete') {
+                currentStatus = 'Cross-reviewed';
+            }
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
@@ -2649,6 +2655,8 @@
                     <div class="kv-col-side">
                         <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
                         <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
+                        ${data.cross_review && data.cross_review.status !== 'disabled' ?
+                            `<div class="kv"><div class="label">Cross-review:</div><div>${escapeHtml(data.cross_review.status)}</div></div>` : ''}
                         <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
                     </div>
                 </div>
@@ -3374,17 +3382,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 if (!state.statsData) {
-                    const [timeline, reviewsData, tools, cost, modelExperiments] = await Promise.all([
+                    const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews] = await Promise.all([
                         apiFetch('api/stats/timeline').then(r => r.json()),
                         apiFetch('api/stats/reviews').then(r => r.json()),
                         apiFetch('api/stats/tools').then(r => r.json()),
                         apiFetch('api/stats/cost').then(r => r.json()),
-                        apiFetch('api/stats/model-experiments').then(r => r.json())
+                        apiFetch('api/stats/model-experiments').then(r => r.json()),
+                        apiFetch('api/stats/cross-reviews').then(r => r.json())
                     ]);
-                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments };
+                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews };
                 }
 
-                const { timeline, reviewsData, tools, cost, modelExperiments } = state.statsData;
+                const { timeline, reviewsData, tools, cost, modelExperiments, crossReviews } = state.statsData;
                 const reviews = reviewsData.reviews;
                 const historicalTotal = reviewsData.total_reviews;
                 const historicalFailed = reviewsData.total_failures;
@@ -3504,6 +3513,28 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     html += '<h3>False-positive confirmation cost</h3><div class="chart-section"><div id="chart-confirmation-cost" style="width:100%; height:300px;"></div></div>';
                 }
 
+                const crossPairs = [];
+                const crossPairKeys = new Set();
+                ((crossReviews && crossReviews.sources) || []).forEach(source => {
+                    if (!source.remote_model) return;
+                    const key = [source.source, source.local_provider, source.local_model,
+                        source.remote_provider, source.remote_model].join('\0');
+                    if (!crossPairKeys.has(key)) {
+                        crossPairKeys.add(key);
+                        crossPairs.push(source);
+                    }
+                });
+                if (crossPairs.length) {
+                    html += '<h2>Cross-Instance Comparisons</h2>';
+                    crossPairs.forEach((pair, index) => {
+                        html += '<h3>' + escapeHtml(pair.local_model || 'Local model') +
+                            ' (local) vs ' + escapeHtml(pair.remote_model || pair.source) +
+                            ' (' + escapeHtml(pair.source) + ')</h3>';
+                        html += '<div class="chart-section"><div id="chart-cross-pair-' + index +
+                            '" style="width:100%; height:250px;"></div></div>';
+                    });
+                }
+
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
 
                 const container = document.getElementById('stats-content');
@@ -3560,6 +3591,37 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         }))
                     });
                     state.activeCharts.push(chart);
+                }
+
+                if (crossPairs.length) {
+                    const severityOrder = ['critical', 'high', 'medium', 'low'];
+                    const severityColors = { critical: '#b71c1c', high: '#e64a19', medium: '#f9a825', low: '#2e7d32' };
+                    const outcomeOrder = ['both', 'local_only', 'remote_only', 'remote_hallucination'];
+                    const outcomeLabels = ['Both', 'Local instance', 'Remote instance', 'Remote hallucination'];
+                    crossPairs.forEach((pair, index) => {
+                        const rows = (crossReviews.outcomes || []).filter(row =>
+                            row.source === pair.source &&
+                            row.local_provider === pair.local_provider &&
+                            row.local_model === pair.local_model &&
+                            row.remote_provider === pair.remote_provider &&
+                            row.remote_model === pair.remote_model);
+                        const chart = echarts.init(document.getElementById('chart-cross-pair-' + index), isDark ? 'dark' : null);
+                        chart.setOption({
+                            backgroundColor: 'transparent',
+                            tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                            legend: { data: severityOrder.map(s => s.charAt(0).toUpperCase() + s.slice(1)), bottom: 0 },
+                            grid: { left: '3%', right: '4%', bottom: '18%', top: '5%', containLabel: true },
+                            xAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
+                            yAxis: { type: 'category', data: outcomeLabels },
+                            series: severityOrder.map(severity => ({
+                                name: severity.charAt(0).toUpperCase() + severity.slice(1),
+                                type: 'bar', stack: 'findings', itemStyle: { color: severityColors[severity] },
+                                data: outcomeOrder.map(outcome => rows.find(row =>
+                                    row.outcome === outcome && row.severity === severity)?.count || 0)
+                            }))
+                        });
+                        state.activeCharts.push(chart);
+                    });
                 }
 
                 // --- 1. Timeline Chart ---

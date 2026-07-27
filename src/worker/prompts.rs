@@ -1896,6 +1896,9 @@ Example:
                     "Experiment model {} failed stage {}: {}",
                     config.name, stage_num, error
                 );
+                let usage = error
+                    .downcast_ref::<crate::ai::session::SessionBudgetError>()
+                    .map(crate::ai::session::SessionBudgetError::usage);
                 return Ok(StageExecutionResult {
                     stage: stage_num,
                     model: config.name,
@@ -1903,9 +1906,9 @@ Example:
                     provider_id: config.provider_id,
                     concerns: Vec::new(),
                     dismissed_concerns: Vec::new(),
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    tokens_cached: 0,
+                    tokens_in: usage.map_or(0, |usage| usage.prompt_tokens as u32),
+                    tokens_out: usage.map_or(0, |usage| usage.completion_tokens as u32),
+                    tokens_cached: usage.and_then(|usage| usage.cached_tokens).unwrap_or(0) as u32,
                     history: Vec::new(),
                     failed: true,
                     error: Some(error.to_string()),
@@ -2313,7 +2316,11 @@ fn provenance_map(items: &[Value]) -> Result<std::collections::BTreeMap<String, 
         let ids = item["finding_ids"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing finding_ids"))?;
-        for id in ids.iter().filter_map(Value::as_str) {
+        let string_ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
+        if string_ids.len() != ids.len() {
+            return Err(anyhow::anyhow!("finding_ids contains non-string entries"));
+        }
+        for id in string_ids {
             if provenance.insert(id.to_string(), models.clone()).is_some() {
                 return Err(anyhow::anyhow!("duplicate finding ID: {id}"));
             }
@@ -2331,12 +2338,16 @@ fn validate_provenance(inputs: &[Value], outputs: &Value, require_all: bool) -> 
         .ok_or_else(|| anyhow::anyhow!("provenance output is not an array"))?;
     let mut seen = BTreeSet::new();
     for output in output_items {
-        let ids: Vec<&str> = output["finding_ids"]
+        let id_values = output["finding_ids"]
             .as_array()
-            .ok_or_else(|| anyhow::anyhow!("missing finding_ids"))?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
+            .ok_or_else(|| anyhow::anyhow!("missing finding_ids"))?;
+        let ids: Vec<&str> = id_values.iter().filter_map(Value::as_str).collect();
+        if ids.len() != id_values.len() {
+            return Err(ReviewError::FormatRejection(
+                "finding_ids contains non-string entries".to_string(),
+            )
+            .into());
+        }
         let actual_models: BTreeSet<&str> = output["source_models"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("missing source_models"))?
@@ -3189,6 +3200,15 @@ mod tests {
             {"finding_ids": ["b"], "source_models": ["variant"]}
         ]);
         assert!(validate_provenance(&inputs, &duplicated, true).is_err());
+
+        let non_string_input = vec![json!({"finding_ids": ["a", null], "source_models": ["main"]})];
+        assert!(provenance_map(&non_string_input).is_err());
+
+        let non_string_output = json!([
+            {"finding_ids": ["a", null], "source_models": ["main"]},
+            {"finding_ids": ["b"], "source_models": ["variant"]}
+        ]);
+        assert!(validate_provenance(&inputs, &non_string_output, true).is_err());
     }
 
     #[test]

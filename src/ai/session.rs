@@ -35,6 +35,26 @@ pub struct SessionResult<T> {
     pub usage: AiUsage,
 }
 
+/// Session failure that retains usage reported before a hard budget limit was detected.
+#[derive(Debug)]
+pub struct SessionBudgetError {
+    usage: AiUsage,
+}
+
+impl SessionBudgetError {
+    pub fn usage(&self) -> &AiUsage {
+        &self.usage
+    }
+}
+
+impl std::fmt::Display for SessionBudgetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("source-owned stage or review token limit was exceeded")
+    }
+}
+
+impl std::error::Error for SessionBudgetError {}
+
 pub struct ConversationDumper {
     directory: PathBuf,
 }
@@ -396,7 +416,16 @@ impl<'a> SessionRunner<'a> {
                         usage.completion_tokens,
                     );
                     if budget.hard_limit_exceeded(total_prompt_tokens, total_completion_tokens) {
-                        anyhow::bail!("source-owned stage or review token limit was exceeded");
+                        return Err(SessionBudgetError {
+                            usage: AiUsage {
+                                prompt_tokens: total_prompt_tokens,
+                                completion_tokens: total_completion_tokens,
+                                total_tokens: total_prompt_tokens + total_completion_tokens,
+                                cached_tokens: Some(total_cached_tokens),
+                                cache_write_tokens: None,
+                            },
+                        }
+                        .into());
                     }
                 }
             }
@@ -538,5 +567,95 @@ impl<'a> SessionRunner<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ProviderCapabilities;
+    use crate::ai::review_budget::BudgetConfig;
+
+    struct UsageProvider;
+
+    #[async_trait]
+    impl AiProvider for UsageProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: Some("{}".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(AiUsage {
+                    prompt_tokens: 11,
+                    completion_tokens: 7,
+                    total_tokens: 18,
+                    cached_tokens: Some(3),
+                    cache_write_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            10
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "usage-provider".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct TestSession;
+
+    #[async_trait]
+    impl LlmSession for TestSession {
+        type Output = Value;
+
+        fn system_prompt(&self) -> String {
+            String::new()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            String::new()
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            Ok(
+                serde_json::from_str(response.content.as_deref().unwrap_or("{}"))
+                    .unwrap_or_default(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_budget_error_retains_reported_usage() {
+        let budget = ReviewBudget::new(BudgetConfig {
+            stage_input: 100,
+            stage_output: 5,
+            review_input: 100,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+            enforce_hard_limits: true,
+        });
+        let result = SessionRunner::new(&UsageProvider)
+            .with_budget(Some(budget))
+            .run(&mut TestSession)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("session unexpectedly stayed within its budget"),
+            Err(error) => error,
+        };
+        let usage = error.downcast_ref::<SessionBudgetError>().unwrap().usage();
+
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.cached_tokens, Some(3));
     }
 }

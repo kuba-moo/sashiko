@@ -23,6 +23,7 @@ use tracing::info;
 pub struct Database {
     database: libsql::Database,
     is_in_memory: bool,
+    in_memory_transaction: tokio::sync::Mutex<()>,
     pub conn: libsql::Connection,
 }
 
@@ -470,6 +471,7 @@ impl Database {
         Ok(Self {
             database: db,
             is_in_memory: settings.url == ":memory:",
+            in_memory_transaction: tokio::sync::Mutex::new(()),
             conn,
         })
     }
@@ -1027,6 +1029,7 @@ impl Database {
         findings: &serde_json::Value,
     ) -> Result<()> {
         if self.is_in_memory {
+            let _transaction_guard = self.in_memory_transaction.lock().await;
             self.conn.execute("BEGIN IMMEDIATE", ()).await?;
             let result = self
                 .save_model_experiment_records(&self.conn, review_id, experiment, findings)
@@ -7583,5 +7586,36 @@ mod tests {
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_in_memory_experiment_saves_are_serialized() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO reviews (id, patchset_id, status, created_at) VALUES (99, 1, 'Reviewed', 1000), (100, 1, 'Reviewed', 1000)",
+            )
+            .await
+            .unwrap();
+        let experiment = json!({
+            "cohort": {
+                "main": {"name": "main", "provider": "openai", "model": "model-a"},
+                "variants": []
+            },
+            "runs": [],
+            "comparisons": [],
+            "confirmation_runs": []
+        });
+        let findings = json!([]);
+
+        let (first, second) = tokio::join!(
+            db.save_model_experiment(99, &experiment, &findings),
+            db.save_model_experiment(100, &experiment, &findings),
+        );
+
+        first.unwrap();
+        second.unwrap();
     }
 }

@@ -174,12 +174,13 @@ pub struct BedrockSettings {
     /// Max output tokens per Converse call.
     #[serde(default = "default_bedrock_max_tokens")]
     pub max_tokens: u32,
-    /// Thinking mode sent as additional_model_request_fields. Opus 4.7 only accepts "adaptive".
-    /// Leave unset to omit (thinking disabled). Valid values: "adaptive".
+    /// Thinking mode sent as additional_model_request_fields. Opus 4.7+ only accepts "adaptive".
+    /// Leave unset to omit. On Opus 4.7/4.8 that disables thinking; on Opus 5 thinking is on by
+    /// default, so omitting it is equivalent to "adaptive". Valid values: "adaptive".
     #[serde(default)]
     pub thinking: Option<String>,
     /// output_config.effort level. Valid values: "low", "medium", "high", "xhigh", "max".
-    /// Leave unset to use the model default. "xhigh" is Opus 4.7-only.
+    /// Leave unset to use the model default ("high"). "xhigh" requires Opus 4.7 or newer.
     #[serde(default)]
     pub effort: Option<String>,
     /// Effort level used for retries and after the review budget warning.

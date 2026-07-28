@@ -200,6 +200,7 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    on_prefix_cached: Option<Box<dyn Fn() + Send + Sync + 'a>>,
     conversation_dump: Option<(Arc<ConversationDumper>, String)>,
     budget: Option<ReviewBudget>,
 }
@@ -214,6 +215,7 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            on_prefix_cached: None,
             conversation_dump: None,
             budget: None,
         }
@@ -263,6 +265,18 @@ impl<'a> SessionRunner<'a> {
 
     pub fn with_budget(mut self, budget: Option<ReviewBudget>) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Configures a callback fired once the first response arrives, i.e. once the
+    /// provider has written this session's prompt prefix to its cache.  Callers use
+    /// it to release work that shares the same prefix and would otherwise pay for a
+    /// redundant cache write.
+    pub fn with_prefix_cached_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'a,
+    {
+        self.on_prefix_cached = Some(Box::new(cb));
         self
     }
 
@@ -386,6 +400,14 @@ impl<'a> SessionRunner<'a> {
                     }
                 },
             };
+
+            // The first response means the provider has cached this prompt prefix.
+            // Release anything waiting to reuse it, even if this turn later fails.
+            if turns == 1
+                && let Some(ref cb) = self.on_prefix_cached
+            {
+                cb();
+            }
 
             if let Some((dump, label)) = &self.conversation_dump
                 && let Err(error) = dump.write(label, turns, "resp", &resp).await

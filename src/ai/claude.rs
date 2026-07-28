@@ -689,6 +689,10 @@ impl AiProvider for ClaudeClient {
         }
     }
 
+    fn caches_prompt_prefix(&self) -> bool {
+        self.enable_caching
+    }
+
     // Optional caching methods - implement as no-ops for now
 }
 

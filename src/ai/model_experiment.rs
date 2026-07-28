@@ -123,6 +123,10 @@ impl AiProvider for RoutedProvider {
     fn cache_stats(&self) -> Option<CacheStats> {
         self.inner.cache_stats()
     }
+
+    fn caches_prompt_prefix(&self) -> bool {
+        self.inner.caches_prompt_prefix()
+    }
 }
 
 /// Removes and returns a model route from an incoming stdio request.

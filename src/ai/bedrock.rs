@@ -649,6 +649,10 @@ impl AiProvider for BedrockClient {
             context_window_size: self.context_window_size,
         }
     }
+
+    fn caches_prompt_prefix(&self) -> bool {
+        self.enable_caching
+    }
 }
 
 #[cfg(test)]

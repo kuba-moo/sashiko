@@ -925,6 +925,16 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             });
         }
 
+        // Stages 1-7 run concurrently but share a prompt prefix per (model, log
+        // variant): stages 1, 2 and 7 carry the log context, stages 3-6 do not.  Firing
+        // them all at once makes every one write the provider's prefix cache and none
+        // read it.  Elect the first stage of each group to warm the cache and hold the
+        // rest until it has done so; they then read the entry back at a fraction of the
+        // write price.  Gates are keyed per model so an experiment cohort with its own
+        // provider does not wait on the main model.
+        let mut prefix_gates: std::collections::HashMap<(String, bool), PrefixGate> =
+            std::collections::HashMap::new();
+
         // Construct futures for Stages 1-7
         let mut stage_futures = Vec::new();
         for stage_num in 1..=7 {
@@ -952,24 +962,40 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 clean_shared_context_no_log.clone()
             };
 
+            let main_provider = self.provider_for_budget(self.budget.as_ref());
+            let (main_opener, main_waiter) = claim_prefix_gate(
+                &mut prefix_gates,
+                "main",
+                use_log,
+                main_provider.caches_prompt_prefix(),
+            );
+
             stage_futures.push(self.execute_stage(
                 stage,
                 system_prompt.clone(),
                 clean_system_prompt.clone(),
                 progress,
                 StageExecutionConfig {
-                    provider: self.provider_for_budget(self.budget.as_ref()),
+                    provider: main_provider,
                     name: "main".to_string(),
                     temperature: self.temperature,
                     max_interactions: self.max_interactions,
                     model_id: self.main_model.clone(),
                     provider_id: self.cohort.main.provider.clone(),
                     budget: self.budget.clone(),
+                    prefix_opener: main_opener,
+                    wait_for_prefix: main_waiter,
                 },
             ));
 
             for model in &self.additional_models {
                 let variant_stage = create_stage(stage_num);
+                let (opener, waiter) = claim_prefix_gate(
+                    &mut prefix_gates,
+                    &model.name,
+                    use_log,
+                    model.provider.caches_prompt_prefix(),
+                );
                 stage_futures.push(self.execute_stage(
                     variant_stage,
                     system_prompt.clone(),
@@ -983,6 +1009,8 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                         model_id: model.model_id.clone(),
                         provider_id: model.provider_id.clone(),
                         budget: model.budget.clone(),
+                        prefix_opener: opener,
+                        wait_for_prefix: waiter,
                     },
                 ));
             }
@@ -990,8 +1018,9 @@ You MUST respond with ONLY a JSON object, no other text. Example:
 
         // Run planned stages concurrently
         info!(
-            "Running {} planned stages concurrently",
-            stage_futures.len()
+            "Running {} planned stages concurrently ({} prompt-prefix gate(s))",
+            stage_futures.len(),
+            prefix_gates.len()
         );
         let stage_results = futures::future::try_join_all(stage_futures).await?;
         let mut experiment_runs = Vec::new();
@@ -1822,6 +1851,31 @@ Example Output:
         if let Some(progress_cb) = progress {
             progress_cb(WorkerProgressEvent::StageStarted { stage: stage_num });
         }
+
+        // Hold off until a sibling stage has warmed the shared prompt prefix, so this
+        // request reads the cache entry instead of writing a duplicate.
+        if let Some(mut waiter) = config.wait_for_prefix
+            && !*waiter.borrow_and_update()
+        {
+            let waited = std::time::Instant::now();
+            match tokio::time::timeout(PREFIX_GATE_TIMEOUT, waiter.changed()).await {
+                Ok(Ok(())) => {
+                    info!(
+                        "Stage {} waited {:?} for the shared prompt prefix cache",
+                        stage_num,
+                        waited.elapsed()
+                    );
+                }
+                // Sender dropped: the warming stage is gone, so nothing to wait for.
+                Ok(Err(_)) => {}
+                Err(_) => warn!(
+                    "Stage {} timed out after {:?} waiting for the shared prompt prefix cache; \
+                     proceeding and paying for its own cache write",
+                    stage_num, PREFIX_GATE_TIMEOUT
+                ),
+            }
+        }
+
         info!("Running Stage {}", stage_num);
         let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage_num).await?;
 
@@ -1897,7 +1951,7 @@ Example:
             self.context_tag.as_deref(),
         );
 
-        let runner = SessionRunner::new(config.provider.as_ref())
+        let mut runner = SessionRunner::new(config.provider.as_ref())
             .with_conversation_dump(
                 self.conversation_dumper.clone(),
                 format!("{}-s{}", config.name, stage_num),
@@ -1914,6 +1968,13 @@ Example:
                     });
                 }
             });
+
+        // This stage warms the shared prompt prefix; release its siblings as soon as the
+        // provider has cached it.  The opener also opens on drop, so siblings are never
+        // stranded if this stage fails before its first response.
+        if let Some(opener) = config.prefix_opener {
+            runner = runner.with_prefix_cached_callback(move || opener.open());
+        }
 
         let result = match runner.run(&mut session).await {
             Ok(result) => result,
@@ -2539,6 +2600,70 @@ struct StageExecutionConfig {
     model_id: String,
     provider_id: String,
     budget: Option<ReviewBudget>,
+    /// Set on the one stage per prompt-prefix group that warms the provider cache.
+    prefix_opener: Option<Arc<PrefixGateOpener>>,
+    /// Set on stages that must wait for that warm-up before their first request.
+    wait_for_prefix: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Upper bound on how long a stage waits for a sibling to warm the shared prompt
+/// prefix.  Only a failsafe: the gate is normally opened by the first response, and
+/// unconditionally on drop.  Waiting longer than this is never cheaper than just
+/// paying for a second cache write.
+const PREFIX_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Opens a prompt-prefix gate, releasing stages that share the prefix.
+///
+/// Opens on the first response (the point at which the provider has written the
+/// cache entry) and again on drop, so a stage that fails outright cannot strand
+/// its siblings.
+struct PrefixGateOpener {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl PrefixGateOpener {
+    fn open(&self) {
+        let _ = self.tx.send(true);
+    }
+}
+
+impl Drop for PrefixGateOpener {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// A prompt-prefix group that already has a stage elected to warm it.
+struct PrefixGate {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Assigns a stage its role in the prompt-prefix group keyed by `(model, use_log)`.
+///
+/// The first caller for a group becomes the opener and runs immediately; later callers
+/// wait on it.  Returns no gate at all when the provider does not cache prefixes, so
+/// those stages keep running fully concurrently.
+fn claim_prefix_gate(
+    gates: &mut std::collections::HashMap<(String, bool), PrefixGate>,
+    model: &str,
+    use_log: bool,
+    provider_caches: bool,
+) -> (
+    Option<Arc<PrefixGateOpener>>,
+    Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if !provider_caches {
+        return (None, None);
+    }
+    let key = (model.to_string(), use_log);
+    match gates.get(&key) {
+        Some(gate) => (None, Some(gate.rx.clone())),
+        None => {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            gates.insert(key, PrefixGate { rx });
+            (Some(Arc::new(PrefixGateOpener { tx })), None)
+        }
+    }
 }
 
 struct ConfirmationTarget {
@@ -3848,5 +3973,69 @@ mod tests {
         if let Err(e) = &res {
             panic!("Expected run to succeed, got error: {:?}", e);
         }
+    }
+
+    #[test]
+    fn prefix_gate_elects_one_opener_per_model_and_log_variant() {
+        let mut gates = std::collections::HashMap::new();
+
+        // First stage of a group warms the cache and does not wait.
+        let (opener, waiter) = claim_prefix_gate(&mut gates, "main", true, true);
+        assert!(opener.is_some());
+        assert!(waiter.is_none());
+
+        // Later stages in the same group wait instead of writing the cache again.
+        let (second, second_waiter) = claim_prefix_gate(&mut gates, "main", true, true);
+        assert!(second.is_none());
+        assert!(second_waiter.is_some());
+
+        // The other log variant is a distinct prefix, so it gets its own opener.
+        let (nolog, nolog_waiter) = claim_prefix_gate(&mut gates, "main", false, true);
+        assert!(nolog.is_some());
+        assert!(nolog_waiter.is_none());
+
+        // A variant model has its own provider and must not wait on the main model.
+        let (variant, variant_waiter) = claim_prefix_gate(&mut gates, "fable", true, true);
+        assert!(variant.is_some());
+        assert!(variant_waiter.is_none());
+
+        assert_eq!(gates.len(), 3);
+    }
+
+    #[test]
+    fn prefix_gate_is_skipped_when_the_provider_does_not_cache() {
+        let mut gates = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let (opener, waiter) = claim_prefix_gate(&mut gates, "main", true, false);
+            assert!(opener.is_none(), "no stage should be held back");
+            assert!(waiter.is_none(), "no stage should wait");
+        }
+        assert!(gates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefix_gate_releases_waiters_once_the_cache_is_warm() {
+        let mut gates = std::collections::HashMap::new();
+        let (opener, _) = claim_prefix_gate(&mut gates, "main", true, true);
+        let (_, waiter) = claim_prefix_gate(&mut gates, "main", true, true);
+        let mut waiter = waiter.expect("second stage waits");
+
+        assert!(!*waiter.borrow_and_update(), "gate starts closed");
+        opener.expect("first stage opens").open();
+        assert!(waiter.changed().await.is_ok());
+        assert!(*waiter.borrow_and_update(), "gate is open");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_opener_releases_waiters() {
+        let mut gates = std::collections::HashMap::new();
+        let (opener, _) = claim_prefix_gate(&mut gates, "main", true, true);
+        let (_, waiter) = claim_prefix_gate(&mut gates, "main", true, true);
+        let mut waiter = waiter.expect("second stage waits");
+
+        // A stage that dies before its first response must not strand its siblings.
+        drop(opener);
+        assert!(waiter.changed().await.is_ok());
+        assert!(*waiter.borrow_and_update(), "drop opens the gate");
     }
 }

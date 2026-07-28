@@ -401,6 +401,13 @@ pub trait AiProvider: Send + Sync {
     fn cache_stats(&self) -> Option<CacheStats> {
         None
     }
+
+    /// Whether this provider writes an explicit, reusable cache entry for the prompt
+    /// prefix.  When true, concurrent sessions sharing a prefix are worth serializing
+    /// so the first one pays the cache write and the rest read it back.
+    fn caches_prompt_prefix(&self) -> bool {
+        false
+    }
 }
 
 /// Creates an AI provider, optionally wrapping it with a local response cache.

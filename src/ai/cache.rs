@@ -204,6 +204,10 @@ impl AiProvider for CachingAiProvider {
         self.inner.get_capabilities()
     }
 
+    fn caches_prompt_prefix(&self) -> bool {
+        self.inner.caches_prompt_prefix()
+    }
+
     fn cache_stats(&self) -> Option<CacheStats> {
         Some(CacheStats {
             hits_this_session: self.hits_this.load(Ordering::Relaxed),

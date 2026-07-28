@@ -14,8 +14,8 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
-    AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ReasoningBlock,
-    ToolCall,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
+    DEFAULT_RETRY_AFTER, ProviderCapabilities, ReasoningBlock, ToolCall, classify_status_code,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -30,6 +30,51 @@ use aws_sdk_bedrockruntime::types::{
 use aws_smithy_types::{Blob, Document, Number};
 use std::collections::HashMap;
 use tracing::info;
+
+/// Error returned by the Bedrock Converse API.
+///
+/// Carries the pieces needed to classify retryability: the HTTP status (when a
+/// raw response was available) and the AWS error code, which is the only signal
+/// for throttling and server-side faults when the SDK fails before a response.
+#[derive(Debug, thiserror::Error)]
+#[error("Bedrock Converse API error: status={} code={code} request_id={request_id} message={message}",
+    status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()))]
+pub struct BedrockError {
+    pub status: Option<u16>,
+    pub code: String,
+    pub request_id: String,
+    pub message: String,
+}
+
+impl ClassifyAiError for BedrockError {
+    fn ai_error_class(&self) -> AiErrorClass {
+        // Throttling is a rate limit regardless of how it surfaced.
+        if self.code.contains("Throttling") || self.code.contains("TooManyRequests") {
+            return AiErrorClass::RateLimit {
+                retry_after: DEFAULT_RETRY_AFTER,
+            };
+        }
+        // Server-side faults are retryable. These often arrive without a raw
+        // response (so no status), which is why the code is matched too.
+        if matches!(
+            self.code.as_str(),
+            "ServiceUnavailableException"
+                | "InternalServerException"
+                | "InternalFailure"
+                | "ServiceUnavailable"
+                | "ModelNotReadyException"
+                | "ModelTimeoutException"
+        ) {
+            return AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            };
+        }
+        self.status
+            .and_then(|s| reqwest::StatusCode::from_u16(s).ok())
+            .and_then(classify_status_code)
+            .unwrap_or(AiErrorClass::Fatal)
+    }
+}
 
 // --- serde_json::Value <-> aws_smithy_types::Document conversion ---
 
@@ -556,7 +601,6 @@ impl AiProvider for BedrockClient {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 let code = e.code().unwrap_or("unknown");
-                let is_throttle = code.contains("Throttling");
                 let msg = e.message().unwrap_or("no message");
                 tracing::error!(
                     status = status,
@@ -564,17 +608,16 @@ impl AiProvider for BedrockClient {
                     request_id = request_id,
                     "Bedrock API error: {msg}"
                 );
-                if is_throttle {
-                    tracing::warn!("Bedrock throttled, waiting 30s before retry...");
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
-                return Err(anyhow::anyhow!(
-                    "Bedrock Converse API error: status={} code={} request_id={} message={}",
-                    status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-                    code,
+                // Return a typed error so classify_ai_error() can tell transient
+                // server faults and throttling apart from fatal errors; the
+                // caller owns the backoff.
+                return Err(BedrockError {
+                    status,
+                    code: code.to_string(),
                     request_id,
-                    msg,
-                ));
+                    message: msg.to_string(),
+                }
+                .into());
             }
         };
 
@@ -613,6 +656,63 @@ mod tests {
     use super::*;
     use crate::ai::{AiMessage, AiRequest, AiRole, AiTool, ToolCall};
     use serde_json::json;
+
+    fn bedrock_error(status: Option<u16>, code: &str) -> BedrockError {
+        BedrockError {
+            status,
+            code: code.to_string(),
+            request_id: "req-1".to_string(),
+            message: "boom".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_server_faults_are_transient_without_a_status() {
+        // These arrive with no raw response, so only the code is available.
+        for code in [
+            "ServiceUnavailableException",
+            "InternalServerException",
+            "ModelNotReadyException",
+        ] {
+            assert!(
+                matches!(
+                    bedrock_error(None, code).ai_error_class(),
+                    AiErrorClass::Transient { .. }
+                ),
+                "{code} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn test_throttling_is_a_rate_limit() {
+        assert!(matches!(
+            bedrock_error(None, "ThrottlingException").ai_error_class(),
+            AiErrorClass::RateLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn test_5xx_status_is_transient_and_client_errors_are_fatal() {
+        assert!(matches!(
+            bedrock_error(Some(503), "unknown").ai_error_class(),
+            AiErrorClass::Transient { .. }
+        ));
+        assert!(matches!(
+            bedrock_error(Some(400), "ValidationException").ai_error_class(),
+            AiErrorClass::Fatal
+        ));
+    }
+
+    #[test]
+    fn test_classify_ai_error_sees_through_anyhow() {
+        // The reviewer classifies via anyhow::Error, so the downcast must work.
+        let err: anyhow::Error = bedrock_error(None, "ServiceUnavailableException").into();
+        assert!(matches!(
+            crate::ai::classify_ai_error(&err),
+            AiErrorClass::Transient { .. }
+        ));
+    }
 
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
         AiRequest {

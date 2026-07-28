@@ -326,6 +326,10 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
         return e.ai_error_class();
     }
+    #[cfg(feature = "bedrock")]
+    if let Some(e) = error.downcast_ref::<bedrock::BedrockError>() {
+        return e.ai_error_class();
+    }
     AiErrorClass::Fatal
 }
 

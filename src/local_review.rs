@@ -428,6 +428,7 @@ async fn review_single_patch(
 ) -> Result<Value> {
     let mut last_error = None;
     let mut prior_merge_usage = MergeUsageTotals::default();
+    let prompt_prefix_cache_sources = prompt_prefix_cache_sources();
     for attempt in 1..=3 {
         emit(
             progress,
@@ -482,6 +483,10 @@ async fn review_single_patch(
         };
         let provider = crate::ai::create_provider_from_ai(&effective_ai)
             .context("Failed to create AI provider")?;
+        let provider = crate::ai::with_prompt_prefix_cache_capability(
+            provider,
+            prompt_prefix_cache_sources.contains("main"),
+        );
         let retry_provider = build_retry_provider(&effective_ai);
         let additional_models = effective_ai
             .additional_models
@@ -509,6 +514,10 @@ async fn review_single_patch(
                             variant_ai.model.clone(),
                         ))
                     });
+                let provider = crate::ai::with_prompt_prefix_cache_capability(
+                    provider,
+                    prompt_prefix_cache_sources.contains(&model.name),
+                );
                 let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if is_stdio {
                     std::sync::Arc::new(crate::ai::model_experiment::RoutedProvider::new(
                         provider,
@@ -810,6 +819,29 @@ impl MergeUsageTotals {
             "budget_flags": self.budget_flags,
         })
     }
+}
+
+fn prompt_prefix_cache_sources() -> std::collections::HashSet<String> {
+    let Ok(raw) = std::env::var(crate::ai::model_experiment::PROMPT_PREFIX_CACHE_SOURCES_ENV)
+    else {
+        return std::collections::HashSet::new();
+    };
+    match parse_prompt_prefix_cache_sources(&raw) {
+        Ok(sources) => sources,
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring invalid prompt-prefix cache source metadata: {}",
+                error
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
+fn parse_prompt_prefix_cache_sources(
+    raw: &str,
+) -> serde_json::Result<std::collections::HashSet<String>> {
+    serde_json::from_str(raw)
 }
 
 struct PrivateReviewMetadata {
@@ -1497,6 +1529,15 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn prompt_prefix_cache_source_metadata_is_typed() {
+        let sources = parse_prompt_prefix_cache_sources(r#"["main","fable"]"#).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains("main"));
+        assert!(sources.contains("fable"));
+        assert!(parse_prompt_prefix_cache_sources(r#"{"main":true}"#).is_err());
+    }
 
     #[test]
     fn private_review_metadata_survives_patch_aggregation() {

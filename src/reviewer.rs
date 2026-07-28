@@ -1797,6 +1797,19 @@ async fn run_review_tool(
             }
         }
     }
+    let mut prompt_prefix_cache_sources = experiment_providers
+        .iter()
+        .filter_map(|(name, provider)| {
+            provider
+                .as_ref()
+                .is_some_and(|provider| provider.caches_prompt_prefix())
+                .then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
+    if provider.caches_prompt_prefix() {
+        prompt_prefix_cache_sources.push("main".to_string());
+    }
+    prompt_prefix_cache_sources.sort();
     let experiment_providers = Arc::new(experiment_providers);
     let mut cmd = if let Some(ref override_bin) = settings.review.review_tool_override {
         Command::new(override_bin)
@@ -1857,6 +1870,10 @@ async fn run_review_tool(
     cmd.env(
         "SASHIKO_EXPERIMENT_MAIN_PROVIDER",
         settings.ai.provider.as_str(),
+    );
+    cmd.env(
+        crate::ai::model_experiment::PROMPT_PREFIX_CACHE_SOURCES_ENV,
+        serde_json::to_string(&prompt_prefix_cache_sources)?,
     );
 
     if let Some(idx) = review_index {

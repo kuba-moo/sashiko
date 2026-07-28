@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const ROUTE_PREFIX: &str = "[model-route:";
+pub const PROMPT_PREFIX_CACHE_SOURCES_ENV: &str = "SASHIKO_PROMPT_PREFIX_CACHE_SOURCES";
 
 /// Makes review-level experiment cohort selection stable across retries and processes.
 pub fn sampled_for_review(probability: f64, review_id: i64, patch_id: i64, name: &str) -> bool {

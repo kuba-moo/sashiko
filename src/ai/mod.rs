@@ -410,6 +410,45 @@ pub trait AiProvider: Send + Sync {
     }
 }
 
+struct PromptPrefixCacheCapabilityProvider {
+    inner: Arc<dyn AiProvider>,
+}
+
+#[async_trait]
+impl AiProvider for PromptPrefixCacheCapabilityProvider {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        self.inner.generate_content(request).await
+    }
+
+    fn estimate_tokens(&self, request: &AiRequest) -> usize {
+        self.inner.estimate_tokens(request)
+    }
+
+    fn get_capabilities(&self) -> ProviderCapabilities {
+        self.inner.get_capabilities()
+    }
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        self.inner.cache_stats()
+    }
+
+    fn caches_prompt_prefix(&self) -> bool {
+        true
+    }
+}
+
+/// Restores a real provider's prompt-cache capability on an IPC proxy.
+pub(crate) fn with_prompt_prefix_cache_capability(
+    provider: Arc<dyn AiProvider>,
+    enabled: bool,
+) -> Arc<dyn AiProvider> {
+    if enabled && !provider.caches_prompt_prefix() {
+        Arc::new(PromptPrefixCacheCapabilityProvider { inner: provider })
+    } else {
+        provider
+    }
+}
+
 /// Creates an AI provider, optionally wrapping it with a local response cache.
 pub async fn create_provider_cached(
     settings: &Settings,
@@ -885,6 +924,20 @@ mod tests {
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;
     use serde_json::json;
+
+    #[test]
+    fn prompt_prefix_cache_capability_can_be_restored_on_a_proxy() {
+        let provider: Arc<dyn AiProvider> = Arc::new(model_experiment::UnavailableProvider::new(
+            "unused",
+            "proxy-model",
+        ));
+        assert!(!provider.caches_prompt_prefix());
+
+        let provider = with_prompt_prefix_cache_capability(provider, true);
+
+        assert!(provider.caches_prompt_prefix());
+        assert_eq!(provider.get_capabilities().model_name, "proxy-model");
+    }
 
     #[test]
     fn test_ai_request_contract() -> Result<()> {

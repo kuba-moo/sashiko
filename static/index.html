@@ -576,6 +576,26 @@
             color: var(--text-muted);
         }
 
+        /* Two-column layout for .kv rows. The left column carries the wide
+           values (author addresses reach ~75 chars, model IDs ~32) so it gets
+           roughly twice the width. Flex rather than grid so the columns wrap to
+           a single stack on narrow viewports without needing a media query. */
+        .kv-columns {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0 32px;
+        }
+
+        .kv-columns > .kv-col-main {
+            flex: 2 1 360px;
+            min-width: 0;
+        }
+
+        .kv-columns > .kv-col-side {
+            flex: 1 1 200px;
+            min-width: 0;
+        }
+
         /* Section containers */
         .section {
             margin-bottom: 16px;
@@ -2617,16 +2637,20 @@
                 ${failureHtml}
                 ${embargoHtml}
 
-                <div class="section">
-                    <div class="kv"><div class="label">Author:</div><div>${(() => {
-                        const a = parseAuthor(data.author);
-                        return escapeHtml(a.name ? `${a.name} <${a.email}>` : a.email);
-                    })()}</div></div>
-                    <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
-                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
-                    <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
-                    <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
-                    <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
+                <div class="section kv-columns">
+                    <div class="kv-col-main">
+                        <div class="kv"><div class="label">Author:</div><div>${(() => {
+                            const a = parseAuthor(data.author);
+                            return escapeHtml(a.name ? `${a.name} <${a.email}>` : a.email);
+                        })()}</div></div>
+                        <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
+                        <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
+                    </div>
+                    <div class="kv-col-side">
+                        <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                        <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
+                        <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
+                    </div>
                 </div>
                 
                 ${data.mr_url ? `<div class="section">

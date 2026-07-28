@@ -657,6 +657,17 @@ fn ai_for_attempt(ai: &AiSettings, _attempt: usize) -> AiSettings {
 
 #[cfg(feature = "bedrock")]
 fn build_retry_provider(ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai::AiProvider>> {
+    // retry_effort only means anything to the Bedrock provider. When the review
+    // runs as a child process the provider is overridden to a stdio transport
+    // (which proxies to the parent's real provider) while the [ai.bedrock]
+    // config stays in place, so this must key off the *effective* provider
+    // rather than the presence of a bedrock section. Building a second stdio
+    // client here would start a second stdin reader on the same pipe, and the
+    // two readers would steal each other's responses and split each other's
+    // lines.
+    if !ai.provider.eq_ignore_ascii_case("bedrock") {
+        return None;
+    }
     let bedrock = ai.bedrock.as_ref()?;
     let retry_effort = bedrock.retry_effort.as_ref()?;
     if bedrock.effort.as_ref() == Some(retry_effort) {
@@ -665,7 +676,13 @@ fn build_retry_provider(ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai:
     let mut retry_ai = ai.clone();
     retry_ai.bedrock.as_mut()?.effort = Some(retry_effort.clone());
     match crate::ai::create_provider_from_ai(&retry_ai) {
-        Ok(provider) => Some(provider),
+        Ok(provider) => {
+            info!(
+                "Retry provider ready (effort {:?}); will activate if review passes budget_warn_pct",
+                retry_effort
+            );
+            Some(provider)
+        }
         Err(error) => {
             tracing::warn!("Failed to build retry-effort provider: {}", error);
             None

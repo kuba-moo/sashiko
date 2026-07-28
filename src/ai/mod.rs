@@ -678,6 +678,43 @@ pub(crate) struct IpcRegistry {
     >,
 }
 
+/// Process-wide IPC state for the stdio protocol.
+///
+/// There is only one stdin/stdout pair per process, so the registry, the writer
+/// and the reader task must be shared by every stdio client. Giving each client
+/// its own registry would restart tx_ids at 1 and start a second reader on the
+/// same pipe; the two readers would then steal each other's responses and split
+/// each other's lines.
+static SHARED_IPC: std::sync::OnceLock<(
+    std::sync::Arc<IpcRegistry>,
+    std::sync::Arc<AtomicWriter>,
+)> = std::sync::OnceLock::new();
+
+fn shared_ipc() -> &'static (std::sync::Arc<IpcRegistry>, std::sync::Arc<AtomicWriter>) {
+    SHARED_IPC.get_or_init(|| {
+        (
+            std::sync::Arc::new(IpcRegistry::new()),
+            std::sync::Arc::new(AtomicWriter::new()),
+        )
+    })
+}
+
+pub(crate) fn shared_ipc_registry() -> std::sync::Arc<IpcRegistry> {
+    shared_ipc().0.clone()
+}
+
+pub(crate) fn shared_ipc_writer() -> std::sync::Arc<AtomicWriter> {
+    shared_ipc().1.clone()
+}
+
+/// Starts the shared stdin reader, at most once per process.
+pub(crate) fn ensure_stdin_reader(registry: &std::sync::Arc<IpcRegistry>) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        start_stdin_reader(std::sync::Arc::downgrade(registry));
+    }
+}
+
 impl IpcRegistry {
     pub fn new() -> Self {
         Self {
@@ -1202,5 +1239,21 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_stdio_clients_share_one_registry_and_tx_id_space() {
+        // Two stdio clients in one process must not restart tx_ids at 1, or
+        // their responses cross over on the single stdin pipe.
+        let a = shared_ipc_registry();
+        let b = shared_ipc_registry();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "registry must be shared");
+        assert!(
+            std::sync::Arc::ptr_eq(&shared_ipc_writer(), &shared_ipc_writer()),
+            "writer must be shared"
+        );
+        let first = a.next_id();
+        let second = b.next_id();
+        assert_ne!(first, second, "tx_ids must not repeat across clients");
     }
 }

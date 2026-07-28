@@ -697,18 +697,14 @@ impl AiProvider for ClaudeClient {
 pub struct StdioClaudeClient {
     registry: std::sync::Arc<crate::ai::IpcRegistry>,
     writer: std::sync::Arc<crate::ai::AtomicWriter>,
-    reader_started: std::sync::atomic::AtomicBool,
 }
 
 impl StdioClaudeClient {
     pub fn new() -> Self {
-        let registry = std::sync::Arc::new(crate::ai::IpcRegistry::new());
-        let writer = std::sync::Arc::new(crate::ai::AtomicWriter::new());
-
+        // Shared per process: stdin/stdout are a single pair.
         Self {
-            registry,
-            writer,
-            reader_started: std::sync::atomic::AtomicBool::new(false),
+            registry: crate::ai::shared_ipc_registry(),
+            writer: crate::ai::shared_ipc_writer(),
         }
     }
 }
@@ -722,12 +718,7 @@ impl Default for StdioClaudeClient {
 #[async_trait]
 impl AiProvider for StdioClaudeClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        if !self
-            .reader_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            crate::ai::start_stdin_reader(std::sync::Arc::downgrade(&self.registry));
-        }
+        crate::ai::ensure_stdin_reader(&self.registry);
 
         let tx_id = self.registry.next_id();
         let envelope = serde_json::json!({

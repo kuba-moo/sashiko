@@ -2505,6 +2505,20 @@
                 `;
             }
 
+            // Embargo banner. `embargo_until` is never redacted, so a live embargo is
+            // detectable whether or not a bypass token is in play — which is the case
+            // that matters, since with a token the status reads "Reviewed" and the
+            // review cards render in full with nothing marking them pre-disclosure.
+            let embargoHtml = '';
+            const embargoUntil = data.embargo_until;
+            if (embargoUntil && embargoUntil * 1000 > Date.now()) {
+                embargoHtml = `
+                    <div class="section" style="margin-bottom:16px; border-left:4px solid var(--status-embargoed);">
+                        <h3 style="margin:0; color:var(--status-embargoed);">🔒 Under embargo until ${formatDate(embargoUntil, true)}</h3>
+                    </div>
+                `;
+            }
+
             const modelName = data.model_name || '-';
             const providerModel = data.provider ? `${data.provider}/${modelName}` : modelName;
             const promptsHash = data.prompts_git_hash ? data.prompts_git_hash.substring(0, 8) : '-';
@@ -2601,6 +2615,7 @@
                 </h1>
                 
                 ${failureHtml}
+                ${embargoHtml}
 
                 <div class="section">
                     <div class="kv"><div class="label">Author:</div><div>${(() => {

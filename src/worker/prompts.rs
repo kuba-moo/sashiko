@@ -376,6 +376,8 @@ You are an automated review bot generating a report for the Linux Kernel Mailing
 
 CRITICAL RULE: If a finding is flagged as pre-existing (`\"preexisting\": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like \"This isn't a bug introduced by this patch, but...\" or \"This is a pre-existing issue, but...\" to start the comment.
 
+SOURCE ANNOTATION: Immediately after each finding's `[Severity: <level>]` line, place `[Sources: <names>]` on its own line. Copy the finding's `source_models` entries exactly, separated by comma and space, including `main`. Do not add model names that are not present in `source_models`.
+
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
 SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."
@@ -1634,7 +1636,10 @@ Example Output:
             let stage = 11;
             let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
             let system_prompt = shared_context.clone();
-            let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
+            let presentation_findings =
+                findings_with_main_source_label(&findings_json, &self.cohort.main.display_name);
+            let findings_str =
+                serde_json::to_string_pretty(&presentation_findings).unwrap_or_default();
             let user_prompt = format!(
                 "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
                 stage_prompt, findings_str
@@ -2727,6 +2732,22 @@ fn append_stage_items(
     }
 }
 
+fn findings_with_main_source_label(findings: &Value, main_source_name: &str) -> Value {
+    let mut labeled = findings.clone();
+    for source in labeled
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(|finding| finding["source_models"].as_array_mut())
+        .flatten()
+    {
+        if source.as_str() == Some("main") {
+            *source = Value::String(main_source_name.to_string());
+        }
+    }
+    labeled
+}
+
 fn append_stage_dismissed_concerns(
     target: &mut Vec<Value>,
     items: &[Value],
@@ -3009,6 +3030,7 @@ mod tests {
         crate::ai::model_experiment::ReviewCohort {
             main: crate::ai::model_experiment::SourceIdentity {
                 name: "main".to_string(),
+                display_name: "primary".to_string(),
                 provider: "test".to_string(),
                 model: "mock".to_string(),
             },
@@ -3023,12 +3045,40 @@ mod tests {
             .push(crate::ai::model_experiment::CohortMember {
                 source: crate::ai::model_experiment::SourceIdentity {
                     name: "variant".to_string(),
+                    display_name: "variant".to_string(),
                     provider: "test".to_string(),
                     model: "variant-model".to_string(),
                 },
                 selected: true,
             });
         cohort
+    }
+
+    #[tokio::test]
+    async fn stage_eleven_requires_source_annotations() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(temp.path().to_path_buf());
+
+        let (prompt, clean_prompt) = prompts.get_stage_prompt(11).await.unwrap();
+
+        for text in [prompt, clean_prompt] {
+            assert!(text.contains("[Sources: <names>]"));
+            assert!(text.contains("Copy the finding's `source_models` entries exactly"));
+        }
+    }
+
+    #[test]
+    fn presentation_sources_name_the_main_source() {
+        let findings = json!([
+            {"source_models": ["main"]},
+            {"source_models": ["fable", "main"]}
+        ]);
+
+        let labeled = findings_with_main_source_label(&findings, "opus-5");
+
+        assert_eq!(findings[0]["source_models"], json!(["main"]));
+        assert_eq!(labeled[0]["source_models"], json!(["opus-5"]));
+        assert_eq!(labeled[1]["source_models"], json!(["fable", "opus-5"]));
     }
 
     struct ConfirmationProvider {
@@ -3180,12 +3230,14 @@ mod tests {
                 cohort: crate::ai::model_experiment::ReviewCohort {
                     main: crate::ai::model_experiment::SourceIdentity {
                         name: "main".to_string(),
+                        display_name: "primary".to_string(),
                         provider: "test".to_string(),
                         model: "model-a".to_string(),
                     },
                     variants: vec![crate::ai::model_experiment::CohortMember {
                         source: crate::ai::model_experiment::SourceIdentity {
                             name: "variant".to_string(),
+                            display_name: "variant".to_string(),
                             provider: "test".to_string(),
                             model: "model-b".to_string(),
                         },

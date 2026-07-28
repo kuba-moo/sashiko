@@ -756,6 +756,13 @@
             border-left-color: var(--sev-low) !important;
         }
 
+        .ai-comment-source {
+            color: var(--text-muted);
+            font-size: 0.85em;
+            font-weight: 600;
+            padding-top: 2px;
+        }
+
         /* Thread tree */
         .thread-tree {
             font-size: 0.95em;
@@ -1712,7 +1719,7 @@
             if (e.key === 'Escape') closeAbout();
         });
 
-        function escapeHtml(text, highlightDiff = false, renderAiComments = false) {
+        function escapeHtml(text, highlightDiff = false, renderAiComments = false, mainSourceLabel = null) {
             if (!text) return '';
             const escaped = String(text)
                 .replace(/&/g, "&amp;")
@@ -1793,12 +1800,25 @@
 
                     // Parse severity if this is a potential comment candidate
                     let severity = null;
+                    let sources = [];
                     let displayLine = line;
                     if (type === 'TEXT' && renderAiComments) {
                         const severityMatch = line.match(/\[Severity:\s*(Critical|High|Medium|Low)\]/i);
                         if (severityMatch) {
                             severity = severityMatch[1].toLowerCase();
                             displayLine = line.replace(/\[Severity:\s*(Critical|High|Medium|Low)\]/i, '').trim();
+                        }
+                        const sourcesMatch = displayLine.match(/\[Sources:\s*([^\]]+)\]/i);
+                        if (sourcesMatch) {
+                            const parsedSources = sourcesMatch[1]
+                                .split(',')
+                                .map(source => source.trim())
+                                .filter(source => /^[A-Za-z0-9_-]+$/.test(source))
+                                .map(source => source === 'main' && mainSourceLabel ? mainSourceLabel : source);
+                            if (parsedSources.length > 0) {
+                                sources = [...new Set(parsedSources)];
+                                displayLine = displayLine.replace(sourcesMatch[0], '').trim();
+                            }
                         }
                     }
 
@@ -1810,7 +1830,7 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line: displayLine, type, cls, severity };
+                    return { line: displayLine, type, cls, severity, sources };
                 });
 
                 // Pass 2: Group into logical blocks and propagate severity
@@ -1835,12 +1855,15 @@
                             flushCurrentBlock();
                         }
                         if (!currentBlock) {
-                            currentBlock = { type: 'COMMENT', items: [], severity: null };
+                            currentBlock = { type: 'COMMENT', items: [], severity: null, sources: [] };
                             blocks.push(currentBlock);
                         }
                         currentBlock.items.push(item);
                         if (item.severity) {
                             currentBlock.severity = item.severity;
+                        }
+                        if (item.sources.length > 0) {
+                            currentBlock.sources = item.sources;
                         }
                     } else if (item.type === 'EMPTY') {
                         if (currentBlock) {
@@ -1866,8 +1889,12 @@
                 blocks.forEach(block => {
                     if (block.type === 'COMMENT') {
                         const sevClass = block.severity ? ` ai-comment-${block.severity}` : '';
+                        if (block.sources.length > 0) {
+                            const label = block.sources.length === 1 ? 'Source' : 'Sources';
+                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${label}: ${block.sources.join(', ')}</div>`;
+                        }
                         block.items.forEach(item => {
-                            if (item.line === "" && item.severity !== null) {
+                            if (item.line === "" && (item.severity !== null || item.sources.length > 0)) {
                                 return; // Skip the tag-only line
                             }
                             let c = item.cls;
@@ -2857,18 +2884,26 @@
             const reviewCost = estimateCost(r.model, r.tokens_in || 0, tokensOut, tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
             const budgetIndicators = formatBudgetFlags(r.budget_flags || 0);
+            const mainSourceName = outputJson?.model_experiment?.cohort?.main?.display_name || r.model || 'main';
 
             let findingsDetailHtml = '';
             if (parsedFindings && outputJson && Array.isArray(outputJson.findings) &&
-                outputJson.findings.some(f => Array.isArray(f.source_stages) && f.source_stages.length > 1)) {
+                outputJson.findings.some(f =>
+                    (Array.isArray(f.source_stages) && f.source_stages.length > 1) ||
+                    (Array.isArray(f.source_models) && f.source_models.some(source => source !== 'main')))) {
                 const rows = outputJson.findings.map(f => {
                     const severity = (f.severity || 'Low').toLowerCase();
                     const stages = Array.isArray(f.source_stages) && f.source_stages.length > 1
                         ? `stages ${f.source_stages.join(', ')}` : '';
+                    const sources = Array.isArray(f.source_models)
+                        ? [...new Set(f.source_models.filter(source => typeof source === 'string'))]
+                            .map(source => source === 'main' ? mainSourceName : source)
+                            .map(source => escapeHtml(source)).join(', ')
+                        : '';
                     const problem = escapeHtml((f.problem || '').substring(0, 120));
-                    return `<tr><td style="color:var(--sev-${severity});font-weight:bold;">${escapeHtml(f.severity || 'Low')}</td><td>${problem}</td><td>${stages}</td></tr>`;
+                    return `<tr><td style="color:var(--sev-${severity});font-weight:bold;">${escapeHtml(f.severity || 'Low')}</td><td>${problem}</td><td>${sources}</td><td>${stages}</td></tr>`;
                 });
-                findingsDetailHtml = `<div style="margin-top:8px;"><button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button><div id="findings-${uniqueId}" class="collapsible"><table style="width:100%;font-size:0.9em;"><thead><tr><th>Severity</th><th>Problem</th><th>Stages</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
+                findingsDetailHtml = `<div style="margin-top:8px;"><button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button><div id="findings-${uniqueId}" class="collapsible"><table style="width:100%;font-size:0.9em;"><thead><tr><th>Severity</th><th>Problem</th><th>Sources</th><th>Stages</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
             }
 
             let inlineHtml = '';
@@ -2882,7 +2917,7 @@
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true)}</div>
+                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true, escapeHtml(mainSourceName))}</div>
                         </div>
                     </div>
                 `;

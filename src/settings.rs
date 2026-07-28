@@ -136,6 +136,27 @@ fn default_max_input_tokens() -> usize {
     150_000
 }
 
+fn default_main_source_name() -> String {
+    "main".to_string()
+}
+
+fn deserialize_main_source_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(serde::de::Error::custom(
+            "main model name must contain only ASCII letters, digits, '_' or '-'",
+        ));
+    }
+    Ok(name)
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(unused)]
 pub struct ClaudeSettings {
@@ -488,6 +509,12 @@ impl AdditionalModelSettings {
 pub struct AiSettings {
     pub provider: String,
     pub model: String,
+    /// Stable presentation name for the main review source.
+    #[serde(
+        default = "default_main_source_name",
+        deserialize_with = "deserialize_main_source_name"
+    )]
+    pub name: String,
     #[serde(default = "default_max_input_tokens")]
     pub max_input_tokens: usize,
     #[serde(default = "default_max_interactions")]
@@ -967,6 +994,33 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn main_source_name_defaults_and_is_route_safe() {
+        let default: AiSettings = serde_json::from_value(serde_json::json!({
+            "provider": "test",
+            "model": "model"
+        }))
+        .unwrap();
+        assert_eq!(default.name, "main");
+
+        let named: AiSettings = serde_json::from_value(serde_json::json!({
+            "provider": "test",
+            "model": "model",
+            "name": "opus-5"
+        }))
+        .unwrap();
+        assert_eq!(named.name, "opus-5");
+
+        for name in ["", "has space", "bad]name"] {
+            let value = serde_json::json!({
+                "provider": "test",
+                "model": "model",
+                "name": name
+            });
+            assert!(serde_json::from_value::<AiSettings>(value).is_err());
+        }
     }
 
     #[test]

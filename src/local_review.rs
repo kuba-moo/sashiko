@@ -451,6 +451,7 @@ async fn review_single_patch(
         let cohort = crate::ai::model_experiment::ReviewCohort {
             main: crate::ai::model_experiment::SourceIdentity {
                 name: "main".to_string(),
+                display_name: effective_ai.name.clone(),
                 provider: main_provider_id.clone(),
                 model: effective_ai.model.clone(),
             },
@@ -462,6 +463,7 @@ async fn review_single_patch(
                     crate::ai::model_experiment::CohortMember {
                         source: crate::ai::model_experiment::SourceIdentity {
                             name: model.name.clone(),
+                            display_name: model.name.clone(),
                             provider: model
                                 .provider
                                 .clone()

@@ -28,6 +28,7 @@ pub fn sampled_for_review(probability: f64, review_id: i64, patch_id: i64, name:
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SourceIdentity {
     pub name: String,
+    pub display_name: String,
     pub provider: String,
     pub model: String,
 }
@@ -165,6 +166,7 @@ mod tests {
         let cohort = ReviewCohort {
             main: SourceIdentity {
                 name: "main".into(),
+                display_name: "primary".into(),
                 provider: "openai".into(),
                 model: "main-model".into(),
             },
@@ -172,6 +174,7 @@ mod tests {
                 CohortMember {
                     source: SourceIdentity {
                         name: "selected".into(),
+                        display_name: "selected".into(),
                         provider: "claude".into(),
                         model: "variant-a".into(),
                     },
@@ -180,6 +183,7 @@ mod tests {
                 CohortMember {
                     source: SourceIdentity {
                         name: "control".into(),
+                        display_name: "control".into(),
                         provider: "gemini".into(),
                         model: "variant-b".into(),
                     },

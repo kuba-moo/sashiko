@@ -188,6 +188,9 @@ When omitted it inherits `[ai.budget]`, preserving existing configurations.
 ## Configuration
 
 ```toml
+[ai]
+name = "opus"
+
 [[ai.additional_models]]
 name = "sonnet"
 probability = 0.10
@@ -237,6 +240,18 @@ Provider and model identity are both part of comparison identity.
 Comparison cost averages include only stage numbers completed successfully by
 both sources. Confirmation cost is reported separately and never folded into
 discovery cost. Unknown pricing produces a null cost rather than zero.
+
+## Finding Presentation
+
+Every generated inline comment carries a machine-readable source annotation
+copied from the canonical finding's `source_models` provenance. The web UI
+renders that annotation as a compact Source or Sources line. The internal
+`main` source sentinel is presented as the configured `[ai].name`, while
+variants use their configured experiment names. Main-only, variant-only, and
+shared discoveries are therefore distinguishable without opening the
+experiment statistics page. The structured findings provenance table applies
+the same mapping, which preserves visibility for stored reviews without inline
+annotations and for provenance added later by cross-instance reconciliation.
 
 ## Compatibility
 

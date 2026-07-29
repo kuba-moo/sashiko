@@ -19,7 +19,7 @@ use crate::{
     toolbox::ToolBox,
     worker::{
         PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
-        prompts::PromptRegistry,
+        prompts::{PromptRegistry, format_error_for_transport, is_budget_exhaustion_error},
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -777,11 +777,24 @@ async fn review_single_patch(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
-                if attempt == 3 {
+                // Budget exhaustion is the one failure a retry cannot fix. The
+                // `ReviewBudget`s above are rebuilt per attempt, so a fresh soft
+                // budget would allow an attempt that the parent's accumulating
+                // hard cap kills immediately — a full-cost review for nothing.
+                // Other failures still get their remaining attempts, which
+                // escalate effort via `ai_for_attempt`.
+                let exhausted = is_budget_exhaustion_error(&e);
+                if exhausted || attempt == 3 {
+                    if exhausted {
+                        error!(
+                            "Not retrying patch {} review, token budget is exhausted: {}",
+                            p.index, e
+                        );
+                    }
                     return Ok(json!({
                         "patch_index": p.index,
                         "review": null,
-                        "error": e.to_string(),
+                        "error": format_error_for_transport(&e),
                         "inline_review": null,
                         "input_context": "",
                         "history": [],

@@ -26,7 +26,7 @@ use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
-use crate::worker::prompts::ReviewError;
+use crate::worker::prompts::{ReviewError, is_fatal_review_error, transported_error_is_fatal};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1474,6 +1474,19 @@ impl Reviewer {
                                 )
                                 .await;
 
+                            // The review runs as a child process, so a typed
+                            // `ReviewError` arrives here as a plain string. The
+                            // child marks the fatal ones; retrying those re-runs
+                            // the whole review into the same wall at full cost.
+                            if transported_error_is_fatal(error_msg) {
+                                error!(
+                                    "Not retrying review for ps={} idx={}: error is fatal",
+                                    patchset_id, index
+                                );
+                                let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                return Ok(PatchResult::ReviewFailed);
+                            }
+
                             if retries < max_retries {
                                 retries += 1;
                                 continue;
@@ -1719,6 +1732,14 @@ impl Reviewer {
                                 None,
                             )
                             .await;
+                        if transported_error_is_fatal(error_msg) {
+                            error!(
+                                "Not retrying review for ps={} idx={}: error is fatal",
+                                patchset_id, index
+                            );
+                            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                            return Ok(PatchResult::ReviewFailed);
+                        }
                         if retries < max_retries {
                             retries += 1;
                             continue;
@@ -1729,6 +1750,11 @@ impl Reviewer {
                 }
                 Err(e) => {
                     error!("Review execution failed for {}: {}", patchset_id, e);
+                    // A `ReviewError` is classified `Fatal`: the budget is spent, the
+                    // interaction limit is reached, or the output failed validation.
+                    // Retrying re-runs the whole review and hits the same wall, so
+                    // fail fast instead of burning the budget `max_retries` times.
+                    let fatal = is_fatal_review_error(&e);
                     let _ = ctx
                         .db
                         .complete_review(
@@ -1742,7 +1768,7 @@ impl Reviewer {
                             None,
                         )
                         .await;
-                    if retries < max_retries {
+                    if !fatal && retries < max_retries {
                         retries += 1;
                         continue;
                     }

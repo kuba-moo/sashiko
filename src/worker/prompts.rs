@@ -52,6 +52,84 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
+/// Marker prefix stamped onto a review error before it crosses the parent/child
+/// process boundary.
+///
+/// The review runs as a child process and reports failures back as a plain
+/// string in the result JSON, which loses the concrete error type. Without a
+/// marker the parent cannot tell a `Fatal` budget kill from a retryable
+/// transient blip, so it retried everything — turning one exhausted budget into
+/// `max_retries` full-cost reviews.
+pub const FATAL_ERROR_MARKER: &str = "[fatal] ";
+
+/// Returns true when the review's token budget is used up.
+///
+/// Covers both budget-exhaustion paths: [`ReviewError::BudgetExceeded`], raised
+/// when the parent process trips its hard cap, and
+/// [`SessionBudgetError`](crate::ai::session::SessionBudgetError), raised when the
+/// worker trips its own review budget.
+///
+/// This is the one failure a *whole-review* retry can never recover from. Retry
+/// loops rebuild their [`crate::ai::review_budget::ReviewBudget`] per attempt, so
+/// a fresh soft budget happily permits an attempt that the parent's
+/// still-accumulating hard cap kills — each retry costs a full review and fails
+/// anyway.
+pub fn is_budget_exhaustion_error(error: &anyhow::Error) -> bool {
+    if matches!(
+        error.downcast_ref::<ReviewError>(),
+        Some(ReviewError::BudgetExceeded(_))
+    ) {
+        return true;
+    }
+    error
+        .downcast_ref::<crate::ai::session::SessionBudgetError>()
+        .is_some()
+}
+
+/// Returns true when `error` is a review failure that must not be retried.
+///
+/// Matches a `Fatal` [`ReviewError`] — spent budget, interaction cap, or output
+/// that already exhausted its in-stage format retries — plus the worker's own
+/// [`SessionBudgetError`](crate::ai::session::SessionBudgetError).
+///
+/// Intended for the *outermost* retry loop, which restarts the review child
+/// process from scratch. By the time an error reaches there the inner loop has
+/// already retried with escalated effort, so another full-cost pass adds nothing.
+///
+/// Deliberately narrow — plain `anyhow` errors stay retryable so genuinely
+/// transient failures keep their retries. This does not use
+/// [`crate::ai::classify_ai_error`], which defaults *unknown* errors to `Fatal`;
+/// that default is right for a single request but here it would strip retries
+/// from every unrecognized blip.
+pub fn is_fatal_review_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<ReviewError>()
+        .is_some_and(|err| err.ai_error_class() == AiErrorClass::Fatal)
+    {
+        return true;
+    }
+    is_budget_exhaustion_error(error)
+}
+
+/// Formats a review error for transport, stamping [`FATAL_ERROR_MARKER`] when
+/// the error must not be retried.
+///
+/// Uses [`is_fatal_review_error`] rather than the narrower budget check: the
+/// receiving loop respawns the review child process from scratch, so every fatal
+/// class is unrecoverable by the time it is read back.
+pub fn format_error_for_transport(error: &anyhow::Error) -> String {
+    if is_fatal_review_error(error) {
+        format!("{FATAL_ERROR_MARKER}{error}")
+    } else {
+        error.to_string()
+    }
+}
+
+/// Returns true when a transported error string was marked fatal by the child.
+pub fn transported_error_is_fatal(message: &str) -> bool {
+    message.contains(FATAL_ERROR_MARKER)
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -4125,6 +4203,107 @@ mod tests {
         assert!(
             err.downcast_ref::<ReviewError>().is_some(),
             "FormatRejection must downcast to ReviewError"
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_is_budget_exhaustion() {
+        let err: anyhow::Error = ReviewError::BudgetExceeded("over cap".to_string()).into();
+        assert!(
+            is_budget_exhaustion_error(&err),
+            "the parent's hard-cap kill must stop the per-attempt retry loop"
+        );
+    }
+
+    #[test]
+    fn session_budget_error_is_budget_exhaustion() {
+        let err: anyhow::Error = crate::ai::session::SessionBudgetError::for_test().into();
+        assert!(
+            is_budget_exhaustion_error(&err),
+            "the worker's own budget kill must stop the per-attempt retry loop"
+        );
+    }
+
+    #[test]
+    fn recoverable_failures_are_not_budget_exhaustion() {
+        // These keep their attempts: the inner loop escalates effort via
+        // `ai_for_attempt`, so a retry is a genuine second chance.
+        for err in [
+            anyhow::Error::from(ReviewError::FormatRejection("bad json".to_string())),
+            anyhow::Error::from(ReviewError::OutputTruncated),
+            anyhow::anyhow!("transient JSON parse failure"),
+        ] {
+            assert!(
+                !is_budget_exhaustion_error(&err),
+                "{err} must stay retryable within a review"
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_review_errors_stop_the_outer_retry_loop() {
+        for err in [
+            anyhow::Error::from(ReviewError::BudgetExceeded("over cap".to_string())),
+            anyhow::Error::from(ReviewError::LimitExceeded),
+            anyhow::Error::from(ReviewError::FormatRejection("bad json".to_string())),
+            anyhow::Error::from(ReviewError::OutputTruncated),
+            anyhow::Error::from(crate::ai::session::SessionBudgetError::for_test()),
+        ] {
+            assert!(
+                is_fatal_review_error(&err),
+                "{err} must not trigger a full re-review"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_errors_stay_retryable_in_the_outer_loop() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        assert!(
+            !is_fatal_review_error(&err),
+            "unrecognized errors must keep their retries"
+        );
+    }
+
+    #[test]
+    fn fatal_errors_are_marked_for_transport_and_read_back() {
+        let err: anyhow::Error = ReviewError::BudgetExceeded("over cap".to_string()).into();
+        let transported = format_error_for_transport(&err);
+
+        assert!(
+            transported_error_is_fatal(&transported),
+            "the fatal marker must survive the parent/child process boundary"
+        );
+        assert!(
+            transported.contains("over cap"),
+            "the original message must stay readable: {transported}"
+        );
+    }
+
+    #[test]
+    fn retryable_errors_are_not_marked_for_transport() {
+        let err = anyhow::anyhow!("connection reset by peer");
+        let transported = format_error_for_transport(&err);
+
+        assert!(!transported_error_is_fatal(&transported));
+        assert_eq!(transported, "connection reset by peer");
+    }
+
+    #[test]
+    fn fatal_marker_survives_aggregation_across_patches() {
+        // The child joins per-patch errors with "; " into one top-level string,
+        // so the parent's check must still see the marker.
+        let fatal: anyhow::Error = ReviewError::BudgetExceeded("over cap".to_string()).into();
+        let plain = anyhow::anyhow!("merge failed");
+        let joined = [
+            format_error_for_transport(&plain),
+            format_error_for_transport(&fatal),
+        ]
+        .join("; ");
+
+        assert!(
+            transported_error_is_fatal(&joined),
+            "a fatal error anywhere in the series must stop the retry: {joined}"
         );
     }
 

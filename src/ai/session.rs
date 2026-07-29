@@ -45,6 +45,20 @@ impl SessionBudgetError {
     pub fn usage(&self) -> &AiUsage {
         &self.usage
     }
+
+    /// Builds an error carrying no usage, for tests that only need the type.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            usage: AiUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cached_tokens: None,
+                cache_write_tokens: None,
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for SessionBudgetError {

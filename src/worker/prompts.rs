@@ -94,6 +94,12 @@ pub struct WorkerConfig {
     pub temperature: f32,
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
+    /// Baseline commit the series was applied on top of.
+    ///
+    /// Kept separate from `series_range` because that range is `None` when the
+    /// last patch of a series is under review, while the baseline is always
+    /// known and still belongs in the prompt's git metadata.
+    pub baseline_sha: Option<String>,
     pub stages: Option<Vec<u8>>,
     pub dump_conversation: Option<std::path::PathBuf>,
     pub budget: Option<ReviewBudget>,
@@ -512,6 +518,7 @@ pub struct Worker {
     max_interactions: usize,
     temperature: f32,
     series_range: Option<String>,
+    baseline_sha: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
     dump_conversation: Option<std::path::PathBuf>,
@@ -540,6 +547,7 @@ impl Worker {
             max_interactions: config.max_interactions,
             temperature: config.temperature,
             series_range: config.series_range,
+            baseline_sha: config.baseline_sha,
             context_tag: None,
             stages: config.stages,
             dump_conversation: config.dump_conversation,
@@ -604,13 +612,8 @@ impl Worker {
             }
         }
 
-        let mut baseline_sha = "unknown".to_string();
-        if let Some(ref range) = self.series_range {
-            let parts: Vec<&str> = range.split("..").collect();
-            if !parts.is_empty() {
-                baseline_sha = parts[0].to_string();
-            }
-        }
+        let baseline_sha =
+            resolve_baseline_sha(self.baseline_sha.as_deref(), self.series_range.as_deref());
 
         let mut target_commit_sha = "unknown".to_string();
         if let Some(patches) = patchset["patches"].as_array() {
@@ -2685,6 +2688,20 @@ struct ConfirmationTarget {
     compared_models: Vec<String>,
 }
 
+/// Resolves the baseline SHA reported in the prompt's git metadata.
+///
+/// Prefers the explicitly supplied baseline. Falls back to the head of
+/// `series_range` for callers that only set the range; that range is absent
+/// when the last patch of a series is under review, which is why the baseline
+/// is plumbed through separately.
+fn resolve_baseline_sha(baseline_sha: Option<&str>, series_range: Option<&str>) -> String {
+    baseline_sha
+        .or_else(|| series_range.and_then(|range| range.split("..").next()))
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 pub fn calculate_series_range(
     patches: &[PatchInput],
     patches_to_review: &[PatchInput],
@@ -3220,6 +3237,7 @@ mod tests {
                 temperature: 0.0,
                 custom_prompt: None,
                 series_range: None,
+                baseline_sha: None,
                 stages: None,
                 dump_conversation: None,
                 budget: None,
@@ -3297,6 +3315,7 @@ mod tests {
                 temperature: 0.0,
                 custom_prompt: None,
                 series_range: None,
+                baseline_sha: None,
                 stages: None,
                 dump_conversation: None,
                 budget: None,
@@ -3500,6 +3519,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_baseline_sha() {
+        // Explicit baseline wins.
+        assert_eq!(
+            resolve_baseline_sha(Some("base"), Some("other..tip")),
+            "base"
+        );
+        // Last patch of a series: no range, but the baseline is still known.
+        assert_eq!(resolve_baseline_sha(Some("base"), None), "base");
+        // Legacy callers that only set a range.
+        assert_eq!(resolve_baseline_sha(None, Some("base..tip")), "base");
+        assert_eq!(resolve_baseline_sha(None, None), "unknown");
+    }
+
+    #[test]
     fn test_calculate_series_range_single_patch() {
         let p = PatchInput {
             index: 1,
@@ -3647,6 +3680,7 @@ mod tests {
             max_interactions: 3,
             temperature: 0.0,
             series_range: None,
+            baseline_sha: None,
             custom_prompt: None,
             stages: None,
             dump_conversation: None,
@@ -4010,6 +4044,7 @@ mod tests {
             max_interactions: 3,
             temperature: 0.0,
             series_range: None,
+            baseline_sha: None,
             custom_prompt: None,
             stages: Some(vec![1]),
             dump_conversation: None,

@@ -17,7 +17,10 @@ use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, SemcodeSettings, Settings},
     toolbox::ToolBox,
-    worker::{PatchInput, ReviewInput, Worker, WorkerConfig, prompts::PromptRegistry},
+    worker::{
+        PatchInput, ReviewInput, Worker, WorkerConfig, calculate_series_range,
+        prompts::PromptRegistry,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use futures::stream::StreamExt;
@@ -419,6 +422,9 @@ async fn review_single_patch(
     patchset_id: i64,
     subject: &str,
     p: &PatchInput,
+    // Every patch in the series, including ones not being reviewed. Needed to
+    // find the tail of the series for the series range.
+    series: &[PatchInput],
     rich_patches: &[Value],
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
@@ -580,9 +586,18 @@ async fn review_single_patch(
         }
 
         let prompts = PromptRegistry::new(options.prompts.clone());
-        let series_range = patch_shas
-            .get(&p.index)
-            .map(|sha| format!("{}..{}", baseline_sha, sha));
+        // The range must end at the LAST patch of the series, not at the patch
+        // under review: the stage-6 series validation rule asks whether a
+        // concern is resolved by a *subsequent* patch, which is unanswerable if
+        // the range stops here.
+        let series_range =
+            calculate_series_range(series, std::slice::from_ref(p), patch_shas, baseline_sha);
+        info!(
+            "Series range for patch {} of {}: {}",
+            p.index,
+            series.len(),
+            series_range.as_deref().unwrap_or("none (last patch)")
+        );
 
         let discovery_budget = ReviewBudget::new(ai.discovery_budget_config());
         let merge_budget = ReviewBudget::new(ai.merge_budget_config());
@@ -598,6 +613,7 @@ async fn review_single_patch(
                 temperature: ai.temperature,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
+                baseline_sha: Some(baseline_sha.to_string()),
                 stages: options.stages.clone(),
                 dump_conversation: ai.dump_conversation.as_ref().map(PathBuf::from),
                 budget: Some(discovery_budget),
@@ -1169,6 +1185,7 @@ async fn run_worker_in_worktree(
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
+        let series = &patches;
         let options = &options;
         let subject_clone = subject.clone();
         async move {
@@ -1178,6 +1195,7 @@ async fn run_worker_in_worktree(
                 patchset_id,
                 &subject_clone,
                 p,
+                series,
                 &rich_patches,
                 patch_shas,
                 options,
@@ -1588,6 +1606,58 @@ mod tests {
         assert_eq!(metadata.merge_usage.tokens_cached, 4);
         assert_eq!(metadata.merge_usage.budget_flags, 6);
         assert_eq!(metadata.errors, ["merge failed"]);
+    }
+
+    fn series_patch(index: i64, commit_id: Option<&str>) -> PatchInput {
+        PatchInput {
+            index,
+            diff: String::new(),
+            subject: Some(format!("patch {}", index)),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: commit_id.map(|s| s.to_string()),
+        }
+    }
+
+    /// Reviewing patch 1 of a 5-patch series must still range over the whole
+    /// series, otherwise stage 6 cannot tell whether a later patch resolves a
+    /// concern and every "no first user for this op" check answers no.
+    #[test]
+    fn test_series_range_spans_whole_series_for_first_patch() {
+        let series: Vec<PatchInput> = (1..=5)
+            .map(|i| series_patch(i, Some(&format!("sha{}", i))))
+            .collect();
+
+        let range = calculate_series_range(
+            &series,
+            std::slice::from_ref(&series[0]),
+            &HashMap::new(),
+            "base",
+        );
+
+        assert_eq!(range, Some("base..sha5".to_string()));
+    }
+
+    /// The daemon path passes `--review-commit`, so `patch_shas` only ever
+    /// holds the reviewed index; the tail SHA has to come from the patches
+    /// slice, which the reviewer populates for every patch.
+    #[test]
+    fn test_series_range_uses_series_tail_when_patch_shas_is_sparse() {
+        let series: Vec<PatchInput> = (1..=5)
+            .map(|i| series_patch(i, Some(&format!("sha{}", i))))
+            .collect();
+        let mut patch_shas = HashMap::new();
+        patch_shas.insert(1, "sha1".to_string());
+
+        let range = calculate_series_range(
+            &series,
+            std::slice::from_ref(&series[0]),
+            &patch_shas,
+            "base",
+        );
+
+        assert_eq!(range, Some("base..sha5".to_string()));
     }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {

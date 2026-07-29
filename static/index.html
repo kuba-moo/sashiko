@@ -659,6 +659,18 @@
             margin: 4px 0;
         }
 
+        .review-source-summary {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: 0.88em;
+            line-height: 1.5;
+        }
+
+        .review-source-summary strong {
+            color: var(--text);
+            font-weight: 600;
+        }
+
         /* Collapsible sections */
         .toggle-btn {
             cursor: pointer;
@@ -1719,7 +1731,116 @@
             if (e.key === 'Escape') closeAbout();
         });
 
-        function escapeHtml(text, highlightDiff = false, renderAiComments = false, mainSourceLabel = null) {
+        function buildReviewSourcePresentation(outputJson, crossReview) {
+            const experiment = outputJson?.model_experiment || {};
+            let localSources = Array.isArray(experiment.sources) ? [...experiment.sources] : [];
+            if (localSources.length === 0 && experiment.cohort) {
+                const runs = Array.isArray(experiment.runs) ? experiment.runs : [];
+                const sourceStatus = (name, selected) => {
+                    if (!selected) return 'not_sampled';
+                    const matches = runs.filter(run => run && run.model === name);
+                    return matches.length > 0 && matches.every(run => run.status === 'completed')
+                        ? 'completed' : 'incomplete';
+                };
+                const main = experiment.cohort.main;
+                if (main) {
+                    localSources.push({
+                        name: main.name || 'main',
+                        display_name: main.display_name || main.model || 'main',
+                        kind: 'model',
+                        is_main: true,
+                        status: sourceStatus(main.name || 'main', true)
+                    });
+                }
+                const variants = Array.isArray(experiment.cohort.variants)
+                    ? experiment.cohort.variants : [];
+                variants.forEach(member => {
+                    if (!member?.source) return;
+                    localSources.push({
+                        name: member.source.name,
+                        display_name: member.source.display_name || member.source.name,
+                        kind: 'model',
+                        is_main: false,
+                        status: sourceStatus(member.source.name, !!member.selected)
+                    });
+                });
+            }
+
+            const crossSources = Array.isArray(crossReview?.sources)
+                ? crossReview.sources.map(source => ({
+                    ...source,
+                    kind: 'cross_review',
+                    status: source.status === 'complete' ? 'completed'
+                        : (source.status === 'pending' || source.status === 'processing')
+                            ? 'pending' : 'incomplete'
+                })) : [];
+            const sources = [...localSources, ...crossSources].filter(source => source?.name);
+            const byName = new Map();
+            sources.forEach(source => {
+                if (!byName.has(source.name)) byName.set(source.name, source);
+            });
+            const findingsById = new Map();
+            const findings = Array.isArray(outputJson?.findings) ? outputJson.findings : [];
+            findings.forEach(finding => {
+                if (!Array.isArray(finding.finding_ids)) return;
+                finding.finding_ids.forEach(id => {
+                    if (typeof id === 'string') findingsById.set(id, finding);
+                });
+            });
+            const confirmations = new Map();
+            const comparisons = Array.isArray(experiment.comparisons) ? experiment.comparisons : [];
+            comparisons.forEach(comparison => {
+                if (typeof comparison?.finding_id === 'string' &&
+                    typeof comparison?.confirmed_by === 'string') {
+                    confirmations.set(comparison.finding_id, comparison.confirmed_by);
+                }
+            });
+
+            const displayName = name => byName.get(name)?.display_name || name;
+            const resolveName = value => {
+                if (byName.has(value)) return value;
+                const source = sources.find(item => item.display_name === value);
+                return source?.name || value;
+            };
+            return {
+                sources,
+                completed: sources.filter(source => source.status === 'completed'),
+                notSampled: sources.filter(source => source.status === 'not_sampled'),
+                pending: sources.filter(source => source.status === 'pending'),
+                incomplete: sources.filter(source => source.status === 'incomplete'),
+                findingsById,
+                confirmations,
+                displayName,
+                resolveName,
+                showSummary: sources.length > 1 || sources.some(source => source.status !== 'completed')
+            };
+        }
+
+        function renderReviewSourceSummary(presentation) {
+            if (!presentation?.showSummary) return '';
+            const format = (sources, includeKind = false) => sources.map(source => {
+                let label = source.display_name || source.name;
+                if (source.is_main) label += ' (main)';
+                if (includeKind && source.kind === 'cross_review') label += ' (cross-review)';
+                return escapeHtml(label);
+            }).join(', ');
+            const rows = [];
+            if (presentation.completed.length > 0) {
+                rows.push(`<div><strong>Review sources:</strong> ${format(presentation.completed, true)}</div>`);
+            }
+            if (presentation.notSampled.length > 0) {
+                rows.push(`<div><strong>Not sampled:</strong> ${format(presentation.notSampled)}</div>`);
+            }
+            if (presentation.pending.length > 0) {
+                rows.push(`<div><strong>Cross-review pending:</strong> ${format(presentation.pending)}</div>`);
+            }
+            if (presentation.incomplete.length > 0) {
+                rows.push(`<div><strong>Incomplete:</strong> ${format(presentation.incomplete, true)}</div>`);
+            }
+            return `<div class="review-source-summary">${rows.join('')}</div>`;
+        }
+
+        function escapeHtml(text, highlightDiff = false, renderAiComments = false, sourcePresentation = null) {
             if (!text) return '';
             const escaped = String(text)
                 .replace(/&/g, "&amp;")
@@ -1801,6 +1922,7 @@
                     // Parse severity if this is a potential comment candidate
                     let severity = null;
                     let sources = [];
+                    let findingId = null;
                     let displayLine = line;
                     if (type === 'TEXT' && renderAiComments) {
                         const severityMatch = line.match(/\[Severity:\s*(Critical|High|Medium|Low)\]/i);
@@ -1813,12 +1935,16 @@
                             const parsedSources = sourcesMatch[1]
                                 .split(',')
                                 .map(source => source.trim())
-                                .filter(source => /^[A-Za-z0-9_-]+$/.test(source))
-                                .map(source => source === 'main' && mainSourceLabel ? mainSourceLabel : source);
+                                .filter(source => /^[A-Za-z0-9_-]+$/.test(source));
                             if (parsedSources.length > 0) {
                                 sources = [...new Set(parsedSources)];
                                 displayLine = displayLine.replace(sourcesMatch[0], '').trim();
                             }
+                        }
+                        const findingMatch = displayLine.match(/\[Finding:\s*([^\]]+)\]/i);
+                        if (findingMatch) {
+                            findingId = findingMatch[1].trim();
+                            displayLine = displayLine.replace(findingMatch[0], '').trim();
                         }
                     }
 
@@ -1830,7 +1956,7 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line: displayLine, type, cls, severity, sources };
+                    return { line: displayLine, type, cls, severity, sources, findingId };
                 });
 
                 // Pass 2: Group into logical blocks and propagate severity
@@ -1855,7 +1981,10 @@
                             flushCurrentBlock();
                         }
                         if (!currentBlock) {
-                            currentBlock = { type: 'COMMENT', items: [], severity: null, sources: [] };
+                            currentBlock = {
+                                type: 'COMMENT', items: [], severity: null,
+                                sources: [], findingId: null
+                            };
                             blocks.push(currentBlock);
                         }
                         currentBlock.items.push(item);
@@ -1864,6 +1993,9 @@
                         }
                         if (item.sources.length > 0) {
                             currentBlock.sources = item.sources;
+                        }
+                        if (item.findingId) {
+                            currentBlock.findingId = item.findingId;
                         }
                     } else if (item.type === 'EMPTY') {
                         if (currentBlock) {
@@ -1889,12 +2021,43 @@
                 blocks.forEach(block => {
                     if (block.type === 'COMMENT') {
                         const sevClass = block.severity ? ` ai-comment-${block.severity}` : '';
-                        if (block.sources.length > 0) {
-                            const label = block.sources.length === 1 ? 'Source' : 'Sources';
-                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${label}: ${block.sources.join(', ')}</div>`;
+                        let discovered = block.sources.map(source =>
+                            sourcePresentation?.resolveName(source) || source);
+                        let confirmedBy = null;
+                        const finding = block.findingId
+                            ? sourcePresentation?.findingsById.get(block.findingId) : null;
+                        if (finding && Array.isArray(finding.source_models)) {
+                            discovered = [...new Set(finding.source_models.filter(source =>
+                                typeof source === 'string'))];
+                            confirmedBy = typeof finding.confirmed_by === 'string'
+                                ? finding.confirmed_by : null;
+                        }
+                        if (!confirmedBy && block.findingId) {
+                            confirmedBy = sourcePresentation?.confirmations.get(block.findingId) || null;
+                        }
+                        const hasParticipation = (sourcePresentation?.sources.length || 0) > 0;
+                        const completed = (sourcePresentation?.completed || []).filter(source =>
+                            block.findingId || source.kind !== 'cross_review');
+                        const missed = completed.filter(source => !discovered.includes(source.name));
+                        if (hasParticipation && discovered.length > 0 && missed.length > 0) {
+                            const discoveredText = discovered
+                                .map(source => escapeHtml(sourcePresentation.displayName(source)))
+                                .join(', ');
+                            const missedText = missed
+                                .map(source => escapeHtml(source.display_name || source.name))
+                                .join(', ');
+                            let annotation = `Discovered by: ${discoveredText} · Missed by: ${missedText}`;
+                            if (confirmedBy) {
+                                annotation += ` · Confirmed by: ${escapeHtml(sourcePresentation.displayName(confirmedBy))}`;
+                            }
+                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${annotation}</div>`;
+                        } else if (!hasParticipation && discovered.length > 0) {
+                            const label = discovered.length === 1 ? 'Source' : 'Sources';
+                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${label}: ${discovered.join(', ')}</div>`;
                         }
                         block.items.forEach(item => {
-                            if (item.line === "" && (item.severity !== null || item.sources.length > 0)) {
+                            if (item.line === "" &&
+                                (item.severity !== null || item.sources.length > 0 || item.findingId)) {
                                 return; // Skip the tag-only line
                             }
                             let c = item.cls;
@@ -2342,7 +2505,7 @@
             }
 
             let reviewsHtml = '';
-            const renderReviewList = (reviews, emailHtml = '', patchStatus = null) => {
+            const renderReviewList = (reviews, emailHtml = '', patchStatus = null, crossReview = null) => {
                 if (!reviews || reviews.length === 0) {
                     const statusToCheck = patchStatus || data.status;
                     if (statusToCheck === 'Embargoed' && data.embargo_until) {
@@ -2350,7 +2513,20 @@
                     }
                     return `<p class="status-placeholder">No reviews yet.</p>`;
                 }
-                return reviews.map((r, i) => renderReviewCard(r, i === reviews.length - 1 ? emailHtml : '')).join('');
+                let activeCrossReviewIndex = -1;
+                if (crossReview && crossReview.status !== 'disabled') {
+                    for (let i = reviews.length - 1; i >= 0; i--) {
+                        if ((reviews[i].status || '').toLowerCase() === 'reviewed') {
+                            activeCrossReviewIndex = i;
+                            break;
+                        }
+                    }
+                }
+                return reviews.map((r, i) => renderReviewCard(
+                    r,
+                    i === reviews.length - 1 ? emailHtml : '',
+                    i === activeCrossReviewIndex ? crossReview : null
+                )).join('');
             };
 
             const generalReviews = reviewsByPatch.get(null) || [];
@@ -2425,7 +2601,9 @@
                     const reason = reviews[0].result || 'Skipped.';
                     listHtml = `<p class="status-placeholder">${escapeHtml(reason)}</p>`;
                 } else {
-                    listHtml = renderReviewList(reviews, emailHtml, patch ? patch.status : null);
+                    listHtml = renderReviewList(
+                        reviews, emailHtml, patch ? patch.status : null, data.cross_review
+                    );
                 }
 
                 reviewsHtml += `
@@ -2772,7 +2950,7 @@
             `;
         }
 
-        function renderReviewCard(r, emailHtml = '') {
+        function renderReviewCard(r, emailHtml = '', crossReview = null) {
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
             let displayResult = '';
@@ -2885,6 +3063,8 @@
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
             const budgetIndicators = formatBudgetFlags(r.budget_flags || 0);
             const mainSourceName = outputJson?.model_experiment?.cohort?.main?.display_name || r.model || 'main';
+            const sourcePresentation = buildReviewSourcePresentation(outputJson, crossReview);
+            const sourceSummaryHtml = renderReviewSourceSummary(sourcePresentation);
 
             let findingsDetailHtml = '';
             if (parsedFindings && outputJson && Array.isArray(outputJson.findings) &&
@@ -2917,7 +3097,7 @@
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true, escapeHtml(mainSourceName))}</div>
+                            <div class="log-inline-block">${escapeHtml(r.inline_review, true, true, sourcePresentation)}</div>
                         </div>
                     </div>
                 `;
@@ -2942,6 +3122,7 @@
                         `}
                     </div>
                     ${showDetails ? `
+                    ${sourceSummaryHtml}
                     ${inlineHtml}
                     ${findingsDetailHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">

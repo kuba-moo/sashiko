@@ -382,7 +382,7 @@ You are an automated review bot generating a report for the Linux Kernel Mailing
 
 CRITICAL RULE: If a finding is flagged as pre-existing (`\"preexisting\": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like \"This isn't a bug introduced by this patch, but...\" or \"This is a pre-existing issue, but...\" to start the comment.
 
-SOURCE ANNOTATION: Immediately after each finding's `[Severity: <level>]` line, place `[Sources: <names>]` on its own line. Copy the finding's `source_models` entries exactly, separated by comma and space, including `main`. Do not add model names that are not present in `source_models`.
+SOURCE ANNOTATION: Immediately after each finding's `[Severity: <level>]` line, place `[Finding: <id>]` and `[Sources: <names>]` on separate lines. Copy `<id>` from the first entry in the finding's `finding_ids` array. Copy the finding's `source_models` entries exactly, separated by comma and space, including `main`. Do not add IDs or model names that are not present in the finding.
 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
@@ -1085,6 +1085,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 ,"dedup_stats": dedup_stats(0, &json!([]))
                 ,"model_experiment": {
                     "cohort": &self.cohort,
+                    "sources": review_source_manifest(&self.cohort, &experiment_runs),
                     "runs": experiment_runs,
                     "comparisons": []
                 }
@@ -1256,6 +1257,7 @@ Preserve the most precise location details from the input. Do not invent line nu
                 "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
                 ,"model_experiment": {
                     "cohort": &self.cohort,
+                    "sources": review_source_manifest(&self.cohort, &experiment_runs),
                     "runs": experiment_runs,
                     "comparisons": comparisons,
                     "confirmation_runs": confirmation_runs
@@ -1434,6 +1436,7 @@ Example Output:
                 "dedup_stats": dedup_stats(all_concerns.len(), &json!([]))
                 ,"model_experiment": {
                     "cohort": &self.cohort,
+                    "sources": review_source_manifest(&self.cohort, &experiment_runs),
                     "runs": experiment_runs,
                     "comparisons": comparisons,
                     "confirmation_runs": confirmation_runs
@@ -1611,6 +1614,7 @@ Example Output:
                 ,"canonical_candidates": canonical_candidates
                 ,"model_experiment": {
                     "cohort": &self.cohort,
+                    "sources": review_source_manifest(&self.cohort, &experiment_runs),
                     "runs": experiment_runs,
                     "comparisons": comparisons,
                     "confirmation_runs": confirmation_runs
@@ -1708,6 +1712,7 @@ Example Output:
             ,"canonical_candidates": canonical_candidates
             ,"model_experiment": {
                 "cohort": &self.cohort,
+                "sources": review_source_manifest(&self.cohort, &experiment_runs),
                 "runs": experiment_runs,
                 "comparisons": comparisons,
                 "confirmation_runs": confirmation_runs
@@ -2772,6 +2777,71 @@ fn findings_with_main_source_label(findings: &Value, main_source_name: &str) -> 
     labeled
 }
 
+fn review_source_manifest(
+    cohort: &crate::ai::model_experiment::ReviewCohort,
+    runs: &[Value],
+) -> Value {
+    fn source_entry(
+        source: &crate::ai::model_experiment::SourceIdentity,
+        selected: bool,
+        is_main: bool,
+        runs: &[Value],
+        expected_stages: &std::collections::BTreeSet<u64>,
+    ) -> Value {
+        let source_runs: Vec<&Value> = runs
+            .iter()
+            .filter(|run| run["model"].as_str() == Some(source.name.as_str()))
+            .collect();
+        let source_stages: std::collections::BTreeSet<u64> = source_runs
+            .iter()
+            .filter_map(|run| run["stage"].as_u64())
+            .collect();
+        let status = if !selected {
+            "not_sampled"
+        } else if source_runs.is_empty()
+            || source_stages != *expected_stages
+            || source_runs
+                .iter()
+                .any(|run| run["status"].as_str() != Some("completed"))
+        {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        json!({
+            "name": source.name,
+            "display_name": source.display_name,
+            "kind": "model",
+            "is_main": is_main,
+            "status": status,
+            "error": source_runs.iter().find_map(|run| run["error"].as_str()),
+        })
+    }
+
+    let expected_stages: std::collections::BTreeSet<u64> = runs
+        .iter()
+        .filter(|run| run["model"].as_str() == Some(cohort.main.name.as_str()))
+        .filter_map(|run| run["stage"].as_u64())
+        .collect();
+    let mut sources = vec![source_entry(
+        &cohort.main,
+        true,
+        true,
+        runs,
+        &expected_stages,
+    )];
+    sources.extend(cohort.variants.iter().map(|member| {
+        source_entry(
+            &member.source,
+            member.selected,
+            false,
+            runs,
+            &expected_stages,
+        )
+    }));
+    json!(sources)
+}
+
 fn append_stage_dismissed_concerns(
     target: &mut Vec<Value>,
     items: &[Value],
@@ -3086,9 +3156,38 @@ mod tests {
         let (prompt, clean_prompt) = prompts.get_stage_prompt(11).await.unwrap();
 
         for text in [prompt, clean_prompt] {
+            assert!(text.contains("[Finding: <id>]"));
             assert!(text.contains("[Sources: <names>]"));
-            assert!(text.contains("Copy the finding's `source_models` entries exactly"));
+            assert!(text.contains("first entry in the finding's `finding_ids` array"));
         }
+    }
+
+    #[test]
+    fn review_source_manifest_distinguishes_participation_states() {
+        let mut cohort = test_variant_cohort();
+        cohort
+            .variants
+            .push(crate::ai::model_experiment::CohortMember {
+                source: crate::ai::model_experiment::SourceIdentity {
+                    name: "unsampled".to_string(),
+                    display_name: "unsampled".to_string(),
+                    provider: "test".to_string(),
+                    model: "other-model".to_string(),
+                },
+                selected: false,
+            });
+        let runs = vec![
+            json!({"model": "main", "stage": 1, "status": "completed"}),
+            json!({"model": "variant", "stage": 1, "status": "failed", "error": "boom"}),
+        ];
+
+        let sources = review_source_manifest(&cohort, &runs);
+
+        assert_eq!(sources[0]["display_name"], "primary");
+        assert_eq!(sources[0]["status"], "completed");
+        assert_eq!(sources[1]["status"], "incomplete");
+        assert_eq!(sources[1]["error"], "boom");
+        assert_eq!(sources[2]["status"], "not_sampled");
     }
 
     #[test]

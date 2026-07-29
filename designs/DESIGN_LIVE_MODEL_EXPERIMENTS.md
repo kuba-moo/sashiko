@@ -243,15 +243,28 @@ discovery cost. Unknown pricing produces a null cost rather than zero.
 
 ## Finding Presentation
 
-Every generated inline comment carries a machine-readable source annotation
-copied from the canonical finding's `source_models` provenance. The web UI
-renders that annotation as a compact Source or Sources line. The internal
-`main` source sentinel is presented as the configured `[ai].name`, while
-variants use their configured experiment names. Main-only, variant-only, and
-shared discoveries are therefore distinguishable without opening the
-experiment statistics page. The structured findings provenance table applies
-the same mapping, which preserves visibility for stored reviews without inline
-annotations and for provenance added later by cross-instance reconciliation.
+Every generated inline comment carries machine-readable finding-ID and source
+annotations copied from the canonical finding's `finding_ids` and
+`source_models` provenance. They are an association mechanism, not the final
+presentation authority. Rust derives a source-participation manifest from the
+cohort and completed discovery runs, and the web UI joins each comment to the
+latest structured finding by ID.
+
+The review header lists completed sources, unsampled variants, and incomplete
+sources. A finding-level annotation is hidden when every completed source
+discovered the finding. On disagreement it identifies the discovering and
+missing completed sources, plus the confirming source when confirmation was
+required. Unsampled and incomplete sources never count as misses. The internal
+`main` sentinel is presented as the configured `[ai].name`; variants use their
+configured experiment names.
+
+The same presentation manifest accepts completed cross-instance sources. This
+keeps comments accurate when cross-review adds findings or provenance after
+Stage 11 originally rendered the local review. Older comments without a
+finding-ID annotation retain their stored local source annotation as a
+compatibility fallback. Cross-instance sources are excluded from their
+finding-level miss calculation because no stable association exists, while the
+review-level cross-source status remains visible.
 
 ## Compatibility
 

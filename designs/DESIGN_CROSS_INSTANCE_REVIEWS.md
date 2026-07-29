@@ -301,6 +301,24 @@ Rows are horizontally stacked by critical, high, medium, and low severity.
 Remote cost rows are omitted. A local hallucination row is also omitted because
 the immutable remote cannot confirm local-only findings.
 
+## Review Source Presentation
+
+Cross-review instances participate in the same presentation manifest as local
+model sources, using their configured instance names because the origin/main
+API does not guarantee remote model identity. A completed remote counts as a
+comparison participant even when it returned no findings. Pending, processing,
+errored, and expired remotes are displayed separately and never count as
+having missed a finding.
+
+The patchset API exposes current-generation job status per configured remote.
+The UI combines those records with the local cohort manifest only for the
+newest review shown for a patch. Before all remotes arrive, the review header
+shows the pending sources. After each fenced integration transaction completes,
+the existing structured finding provenance is authoritative: matched findings
+include the remote source and confirmed remote-only findings are published with
+that source. Stable finding-ID annotations associate inline comments with this
+updated provenance without rerunning Stage 11.
+
 ## Failure Isolation
 
 Cross-review begins only after normal publication and never changes the result

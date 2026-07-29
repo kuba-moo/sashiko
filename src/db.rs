@@ -1885,6 +1885,7 @@ impl Database {
                     "finding_ids": [finding.finding_id],
                     "cross_review_source": job.source_name,
                     "cross_review_finding_id": finding.finding_id,
+                    "confirmed_by": "main",
                 }));
                 connection
                     .execute(
@@ -1904,10 +1905,12 @@ impl Database {
             .contains(&marker)
         {
             let rendered = format!(
-                "{}\n\n{}:\n- [{}] {}",
+                "{}\n\n{}:\n[Severity: {}]\n[Finding: {}]\n[Sources: {}]\n{}",
                 inline_review.unwrap_or_default(),
                 marker,
                 finding.severity,
+                finding.finding_id,
+                job.source_name,
                 finding.problem,
             );
             connection
@@ -2489,9 +2492,40 @@ impl Database {
         let Some(row) = rows.next().await? else {
             return Ok(serde_json::Value::Null);
         };
+        let status = row
+            .get::<String>(0)
+            .unwrap_or_else(|_| "disabled".to_string());
+        let completed_at = row.get::<Option<i64>>(1).ok().flatten();
+        drop(rows);
+
+        let mut source_rows = self
+            .conn
+            .query(
+                "SELECT j.source_name, j.status, j.remote_model,
+                        j.remote_provider
+                 FROM cross_review_jobs j
+                 JOIN patchsets p ON p.id = j.patchset_id
+                 WHERE j.patchset_id = ?
+                   AND j.generation = p.cross_review_generation
+                 ORDER BY j.source_name",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut sources = Vec::new();
+        while let Some(source) = source_rows.next().await? {
+            sources.push(json!({
+                "name": source.get::<String>(0)?,
+                "display_name": source.get::<String>(0)?,
+                "kind": "cross_review",
+                "status": source.get::<String>(1)?,
+                "model": source.get::<Option<String>>(2).ok().flatten(),
+                "provider": source.get::<Option<String>>(3).ok().flatten(),
+            }));
+        }
         Ok(json!({
-            "status": row.get::<String>(0).unwrap_or_else(|_| "disabled".to_string()),
-            "completed_at": row.get::<Option<i64>>(1).ok().flatten(),
+            "status": status,
+            "completed_at": completed_at,
+            "sources": sources,
         }))
     }
 
@@ -9328,6 +9362,16 @@ mod tests {
             .unwrap();
         let output: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert!(output.contains("remote problem"));
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["review"]["findings"][0]["confirmed_by"], "main");
+        let mut rows = db
+            .conn
+            .query("SELECT inline_review FROM reviews WHERE id = 20", ())
+            .await
+            .unwrap();
+        let inline: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(inline.contains("[Finding: remote]"));
+        assert!(inline.contains("[Sources: peer]"));
         let stats = db.get_cross_review_stats().await.unwrap();
         assert_eq!(stats["outcomes"][0]["outcome"], "remote_only");
         assert_eq!(stats["outcomes"][0]["local_model"], "local-model");
@@ -9686,9 +9730,17 @@ mod tests {
         db.finish_cross_review_job(&jobs[0], "complete", 1100, None)
             .await
             .unwrap();
+        let status = db.get_cross_review_status(1).await.unwrap();
+        assert_eq!(status["status"], "pending");
+        assert_eq!(status["sources"].as_array().unwrap().len(), 2);
         assert_eq!(
-            db.get_cross_review_status(1).await.unwrap()["status"],
-            "pending"
+            status["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|source| source["status"] == "complete")
+                .count(),
+            1
         );
         let second = db
             .claim_due_cross_reviews(1101, 10)
@@ -9699,9 +9751,14 @@ mod tests {
         db.finish_cross_review_job(&second, "complete", 1200, None)
             .await
             .unwrap();
-        assert_eq!(
-            db.get_cross_review_status(1).await.unwrap()["status"],
-            "complete"
+        let status = db.get_cross_review_status(1).await.unwrap();
+        assert_eq!(status["status"], "complete");
+        assert!(
+            status["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|source| source["status"] == "complete")
         );
     }
 

@@ -455,7 +455,11 @@ impl<'a> SessionRunner<'a> {
             }
 
             if resp.truncated {
-                anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
+                // Typed, so this classifies as `Fatal` and short-circuits the
+                // retry loops. A plain `anyhow` error here would be treated as a
+                // transient blip and re-run the whole review, which hits the same
+                // output limit again at full cost.
+                return Err(crate::worker::prompts::ReviewError::OutputTruncated.into());
             }
 
             let mut budget_level = None;
@@ -806,5 +810,61 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 11);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.cached_tokens, Some(3));
+    }
+
+    struct TruncatingProvider;
+
+    #[async_trait]
+    impl AiProvider for TruncatingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            // A partial JSON review report, cut off mid-string exactly as a
+            // max_tokens stop leaves it.
+            Ok(AiResponse {
+                content: Some("{\"concerns\": [{\"type\": \"NULL deref".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: None,
+                truncated: true,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            10
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "truncating-provider".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_response_reports_truncation_not_a_schema_violation() {
+        let result = SessionRunner::new(&TruncatingProvider)
+            .run(&mut TestSession)
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("a truncated response must not be accepted"),
+            Err(error) => error,
+        };
+
+        // Must be the typed error so the retry loops classify it `Fatal`, and must
+        // not be reported as whatever the missing tail would have contained.
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::worker::prompts::ReviewError>(),
+                Some(crate::worker::prompts::ReviewError::OutputTruncated)
+            ),
+            "expected ReviewError::OutputTruncated, got: {error}"
+        );
+        assert!(
+            crate::worker::prompts::is_fatal_review_error(&error),
+            "truncation must not be retried as a transient failure"
+        );
     }
 }

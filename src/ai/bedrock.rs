@@ -23,7 +23,7 @@ use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::error::ProvideErrorMetadata;
 use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ConversationRole, InferenceConfiguration,
-    Message, ReasoningContentBlock, ReasoningTextBlock, SystemContentBlock, Tool,
+    Message, ReasoningContentBlock, ReasoningTextBlock, StopReason, SystemContentBlock, Tool,
     ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
     ToolUseBlock,
 };
@@ -518,6 +518,19 @@ fn translate_response(
         }
     });
 
+    // `MaxTokens` means the model was cut off mid-answer, so whatever arrived is
+    // an incomplete prefix. Reporting it lets callers name the failure instead of
+    // handing the fragment to a validator, which then rejects it for whatever the
+    // missing tail would have contained -- a JSON review report truncated inside a
+    // string gets diagnosed as a schema violation.
+    let truncated = matches!(output.stop_reason(), StopReason::MaxTokens);
+    if truncated {
+        tracing::warn!(
+            "{}Bedrock response truncated due to max_tokens.",
+            crate::ai::get_log_prefix()
+        );
+    }
+
     Ok(AiResponse {
         content: if text_parts.is_empty() {
             None
@@ -537,7 +550,7 @@ fn translate_response(
             Some(tool_calls)
         },
         usage,
-        truncated: false,
+        truncated,
     })
 }
 
@@ -1195,6 +1208,57 @@ mod tests {
             other => panic!("expected ReasoningBlock::Text, got {:?}", other),
         }
         assert_eq!(resp.tool_calls.unwrap().len(), 1);
+        assert!(!resp.truncated, "ToolUse is a normal stop, not truncation");
+        Ok(())
+    }
+
+    /// Builds a minimal text response carrying `stop_reason`.
+    #[cfg(test)]
+    fn response_with_stop_reason(
+        stop_reason: aws_sdk_bedrockruntime::types::StopReason,
+    ) -> Result<AiResponse> {
+        use aws_sdk_bedrockruntime::operation::converse::ConverseOutput;
+        use aws_sdk_bedrockruntime::types::ConverseOutput as ConverseOutputPayload;
+
+        let msg = Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text(
+                "{\"concerns\": [{\"type\": \"NULL deref".to_string(),
+            ))
+            .build()?;
+        let out = ConverseOutput::builder()
+            .output(ConverseOutputPayload::Message(msg))
+            .stop_reason(stop_reason)
+            .build()?;
+        translate_response(&out)
+    }
+
+    #[test]
+    fn test_max_tokens_stop_reason_marks_response_truncated() -> Result<()> {
+        let resp = response_with_stop_reason(StopReason::MaxTokens)?;
+
+        // Without this the partial JSON above reaches the stage validator, which
+        // rejects it for a missing key rather than naming the truncation.
+        assert!(
+            resp.truncated,
+            "a max_tokens stop must be reported as truncation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_normal_stop_reasons_do_not_mark_response_truncated() -> Result<()> {
+        for stop_reason in [
+            StopReason::EndTurn,
+            StopReason::StopSequence,
+            StopReason::ToolUse,
+        ] {
+            let resp = response_with_stop_reason(stop_reason.clone())?;
+            assert!(
+                !resp.truncated,
+                "{stop_reason:?} is a complete response, not truncation"
+            );
+        }
         Ok(())
     }
 

@@ -2391,7 +2391,7 @@ impl Database {
 
         let mut paired_cost = Vec::new();
         let mut rows = self.conn.query(
-            "SELECT v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id, avg(m.tokens_in), avg(m.tokens_out), avg(m.tokens_cached), avg(v.tokens_in), avg(v.tokens_out), avg(v.tokens_cached), count(*) FROM model_experiment_runs m JOIN model_experiment_runs v ON m.review_id = v.review_id AND m.stage = v.stage WHERE m.experiment_name = 'main' AND v.experiment_name != 'main' AND m.status = 'completed' AND v.status = 'completed' GROUP BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id ORDER BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id",
+            "SELECT v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id, avg(m.tokens_in), avg(m.tokens_out), avg(m.tokens_cached), avg(v.tokens_in), avg(v.tokens_out), avg(v.tokens_cached), count(*), count(DISTINCT COALESCE(r.patch_id, -r.id)) FROM model_experiment_runs m JOIN model_experiment_runs v ON m.review_id = v.review_id AND m.stage = v.stage JOIN reviews r ON r.id = m.review_id WHERE m.experiment_name = 'main' AND v.experiment_name != 'main' AND m.status = 'completed' AND v.status = 'completed' GROUP BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id ORDER BY v.experiment_name, m.provider_id, m.model_id, v.provider_id, v.model_id",
             (),
         ).await?;
         while let Ok(Some(row)) = rows.next().await {
@@ -2400,6 +2400,7 @@ impl Database {
                 "main": {"provider": row.get::<String>(1).unwrap_or_default(), "model": row.get::<String>(2).unwrap_or_default(), "tokens_in": row.get::<f64>(5).unwrap_or(0.0), "tokens_out": row.get::<f64>(6).unwrap_or(0.0), "tokens_cached": row.get::<f64>(7).unwrap_or(0.0)},
                 "additional": {"provider": row.get::<String>(3).unwrap_or_default(), "model": row.get::<String>(4).unwrap_or_default(), "tokens_in": row.get::<f64>(8).unwrap_or(0.0), "tokens_out": row.get::<f64>(9).unwrap_or(0.0), "tokens_cached": row.get::<f64>(10).unwrap_or(0.0)},
                 "paired_stages": row.get::<i64>(11).unwrap_or(0),
+                "compared_patches": row.get::<i64>(12).unwrap_or(0),
             }));
         }
         drop(rows);
@@ -9351,6 +9352,8 @@ mod tests {
             "runs": [
                 {"model": "main", "provider_id": "openai", "model_id": "model-a", "stage": 3, "status": "completed", "tokens_in": 100, "tokens_out": 10, "tokens_cached": 20},
                 {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 3, "status": "completed", "tokens_in": 80, "tokens_out": 8, "tokens_cached": 10},
+                {"model": "main", "provider_id": "openai", "model_id": "model-a", "stage": 5, "status": "completed", "tokens_in": 60, "tokens_out": 6, "tokens_cached": 10},
+                {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 5, "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 5},
                 {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 4, "status": "failed", "error": "provider unavailable", "tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
             ],
             "comparisons": [
@@ -9369,7 +9372,8 @@ mod tests {
         assert_eq!(stats["paired_cost"][0]["main"]["model"], "model-a");
         assert_eq!(stats["paired_cost"][0]["main"]["provider"], "openai");
         assert_eq!(stats["outcomes"][0]["additional_provider_id"], "claude");
-        assert_eq!(stats["paired_cost"][0]["paired_stages"], 1);
+        assert_eq!(stats["paired_cost"][0]["paired_stages"], 2);
+        assert_eq!(stats["paired_cost"][0]["compared_patches"], 1);
         assert_eq!(stats["confirmation_cost"][0]["model"], "model-a");
         assert!(
             stats["run_status"]
@@ -9423,7 +9427,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-            3
+            5
         );
     }
 

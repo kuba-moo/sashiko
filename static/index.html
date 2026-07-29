@@ -3634,6 +3634,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     failure: '#ee6666',
                     text: themeText
                 };
+                const comparisonSeverityColors = {
+                    critical: '#b71c1c',
+                    high: '#e64a19',
+                    medium: '#f9a825',
+                    low: '#2e7d32'
+                };
 
                 // HTML Structure
                 let html = '<h2>Activity Timeline</h2><div class="chart-section"><div id="chart-timeline" class="chart-container"></div></div>';
@@ -3727,6 +3733,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         html += '<h3>' + escapeHtml(pair.main.model || 'Main model') + ' (main) vs ' + escapeHtml(pair.additional.model || pair.additional_model) + '</h3>';
                         html += '<div class="chart-section"><div id="chart-model-pair-' + index + '" style="width:100%; height:270px;"></div></div>';
                         html += '<div class="stat-card-grid">';
+                        html += renderStatCard('Compared patches', pair.compared_patches || 0);
                         html += renderStatCard((pair.main.model || 'Main model') + ' avg cost', mainCost === null ? '-' : '$' + mainCost.toFixed(3));
                         html += renderStatCard((pair.additional.model || pair.additional_model) + ' avg cost', additionalCost === null ? '-' : '$' + additionalCost.toFixed(3));
                         html += '</div>';
@@ -3766,7 +3773,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     const severityOrder = ['critical', 'high', 'medium', 'low'];
                     const outcomeOrder = ['both', 'main_only', 'additional_only', 'main_hallucination', 'additional_hallucination'];
                     const outcomeLabels = ['Both', 'Main model', 'Additional model', 'Main hallucination', 'Additional hallucination'];
-                    const severityColors = { critical: '#b71c1c', high: '#e64a19', medium: '#f9a825', low: '#2e7d32' };
                     experimentPairs.forEach((pair, index) => {
                         const rows = (modelExperiments.outcomes || []).filter(row =>
                             row.additional_model === pair.additional_model &&
@@ -3816,7 +3822,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             yAxis: { type: 'category', data: outcomeLabelsWithPercentages },
                             series: severityOrder.map(severity => ({
                                 name: severity.charAt(0).toUpperCase() + severity.slice(1),
-                                type: 'bar', stack: 'findings', itemStyle: { color: severityColors[severity] },
+                                type: 'bar', stack: 'findings', itemStyle: { color: comparisonSeverityColors[severity] },
                                 data: outcomeOrder.map(outcome => findingCount(outcome, severity))
                             }))
                         });
@@ -3848,7 +3854,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
                 if (crossPairs.length) {
                     const severityOrder = ['critical', 'high', 'medium', 'low'];
-                    const severityColors = { critical: '#b71c1c', high: '#e64a19', medium: '#f9a825', low: '#2e7d32' };
                     const outcomeOrder = ['both', 'local_only', 'remote_only', 'remote_hallucination'];
                     const outcomeLabels = ['Both', 'Local instance', 'Remote instance', 'Remote hallucination'];
                     crossPairs.forEach((pair, index) => {
@@ -3868,7 +3873,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             yAxis: { type: 'category', data: outcomeLabels },
                             series: severityOrder.map(severity => ({
                                 name: severity.charAt(0).toUpperCase() + severity.slice(1),
-                                type: 'bar', stack: 'findings', itemStyle: { color: severityColors[severity] },
+                                type: 'bar', stack: 'findings', itemStyle: { color: comparisonSeverityColors[severity] },
                                 data: outcomeOrder.map(outcome => rows.find(row =>
                                     row.outcome === outcome && row.severity === severity)?.count || 0)
                             }))
@@ -4101,13 +4106,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     const chart = echarts.init(document.getElementById('chart-findings-stage-severity'), isDark ? 'dark' : null);
                     const stageFindings = timeline.findings_by_stage;
                     const severityOrder = ['critical', 'high', 'medium', 'low'];
-                    const computedStyle = getComputedStyle(document.body);
-                    const severityColors = {
-                        critical: computedStyle.getPropertyValue('--sev-critical').trim() || '#B71C1C',
-                        high: computedStyle.getPropertyValue('--sev-high').trim() || '#FF5722',
-                        medium: computedStyle.getPropertyValue('--sev-medium').trim() || '#FF9800',
-                        low: computedStyle.getPropertyValue('--sev-low').trim() || '#FBC02D'
-                    };
                     const findingsPerRun = (findings, runs) => runs ? findings / runs : 0;
                     const formatRate = value => Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
                     chart.setOption({
@@ -4136,7 +4134,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             name: severity.charAt(0).toUpperCase() + severity.slice(1),
                             type: 'bar',
                             stack: 'severity',
-                            itemStyle: { color: severityColors[severity] },
+                            itemStyle: { color: comparisonSeverityColors[severity] },
                             data: stageFindings.map(row => findingsPerRun(row.unique_by_severity?.[severity] || 0, row.engagements))
                         }))
                     });

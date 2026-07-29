@@ -240,6 +240,10 @@ Provider and model identity are both part of comparison identity.
 Comparison cost averages include only stage numbers completed successfully by
 both sources. Confirmation cost is reported separately and never folded into
 discovery cost. Unknown pricing produces a null cost rather than zero.
+Each comparison also reports the number of distinct patches with at least one
+successfully paired stage; multiple paired stages or reviews from the same
+patch count once. Legacy rows without a patch ID fall back to review identity.
+The UI displays this sample size beside the models' average costs.
 
 The live comparison charts group canonical findings into outcome buckets and
 stack each bucket by severity. Each tooltip count includes its share of all

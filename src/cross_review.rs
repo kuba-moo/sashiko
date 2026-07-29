@@ -464,18 +464,33 @@ async fn deduplicate_remote(
         serde_json::to_string_pretty(&local_payload)?,
         serde_json::to_string_pretty(remote)?,
     );
-    let response = request_json(provider, prompt, budget, usage).await?;
-    let object = response
-        .as_object()
-        .context("deduplication response is not an object")?;
-    let expected: std::collections::HashSet<&str> = remote
+    let remote_ids: Vec<&str> = remote
         .iter()
         .map(|finding| finding.finding_id.as_str())
         .collect();
-    let actual: std::collections::HashSet<&str> = object.keys().map(String::as_str).collect();
-    if actual != expected {
-        anyhow::bail!("deduplication response does not exactly map remote findings");
-    }
+    let expected: std::collections::HashSet<&str> = remote_ids.iter().copied().collect();
+    let response = request_json(
+        provider,
+        prompt,
+        id_map_schema(&remote_ids, serde_json::json!({"type": ["string", "null"]})),
+        budget,
+        usage,
+        |value| {
+            let object = value
+                .as_object()
+                .context("deduplication response is not an object")?;
+            let actual: std::collections::HashSet<&str> =
+                object.keys().map(String::as_str).collect();
+            if actual != expected {
+                anyhow::bail!("deduplication response does not exactly map remote findings");
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let object = response
+        .as_object()
+        .context("deduplication response is not an object")?;
     let valid_local: std::collections::HashSet<&str> = local
         .iter()
         .map(|finding| finding.finding_id.as_str())
@@ -526,29 +541,60 @@ async fn confirm_remote(
         "{patch_context}\n\nIndependently verify every remote finding against the patch and supplied code context. Return only a JSON object mapping every finding_id to true when the issue is real and actionable or false when it is unsupported.\n\nRemote findings:\n{}",
         serde_json::to_string_pretty(findings)?,
     );
-    let response = request_json(provider, prompt, budget, usage).await?;
-    let object = response
-        .as_object()
-        .context("confirmation response is not an object")?;
-    let expected: std::collections::HashSet<&str> = findings
+    let finding_ids: Vec<&str> = findings
         .iter()
         .map(|finding| finding.finding_id.as_str())
         .collect();
-    let actual: std::collections::HashSet<&str> = object.keys().map(String::as_str).collect();
-    if actual != expected || object.values().any(|value| !value.is_boolean()) {
-        anyhow::bail!("confirmation response must exactly map findings to booleans");
-    }
+    let expected: std::collections::HashSet<&str> = finding_ids.iter().copied().collect();
+    let response = request_json(
+        provider,
+        prompt,
+        id_map_schema(&finding_ids, serde_json::json!({"type": "boolean"})),
+        budget,
+        usage,
+        |value| {
+            let object = value
+                .as_object()
+                .context("confirmation response is not an object")?;
+            let actual: std::collections::HashSet<&str> =
+                object.keys().map(String::as_str).collect();
+            if actual != expected || object.values().any(|value| !value.is_boolean()) {
+                anyhow::bail!("confirmation response must exactly map findings to booleans");
+            }
+            Ok(())
+        },
+    )
+    .await?;
+    let object = response
+        .as_object()
+        .context("confirmation response is not an object")?;
     Ok(object
         .iter()
         .map(|(id, value)| (id.clone(), value.as_bool().unwrap_or(false)))
         .collect())
 }
 
+/// Builds the schema for a response mapping every id to `value_schema`.
+fn id_map_schema(ids: &[&str], value_schema: Value) -> Value {
+    let properties: serde_json::Map<String, Value> = ids
+        .iter()
+        .map(|id| ((*id).to_string(), value_schema.clone()))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": ids,
+        "additionalProperties": false,
+    })
+}
+
 async fn request_json(
     provider: &dyn AiProvider,
     prompt: String,
+    schema: Value,
     budget: Option<&ReviewBudget>,
     usage: &mut CrossReviewUsage,
+    validate: impl Fn(&Value) -> Result<()>,
 ) -> Result<Value> {
     let request = AiRequest {
         system: Some(
@@ -566,9 +612,48 @@ async fn request_json(
         }],
         tools: None,
         temperature: Some(0.0),
-        response_format: Some(AiResponseFormat::Json { schema: None }),
+        response_format: Some(AiResponseFormat::Json {
+            schema: Some(schema.clone()),
+        }),
         context_tag: Some("cross-review".to_string()),
     };
+
+    let mut last_error = None;
+    // Retry once with the parse failure restated; resending the identical prompt
+    // just reproduces the same malformed reply.
+    for attempt in 0..2 {
+        let mut request = request.clone();
+        if let Some(error) = &last_error
+            && let Some(message) = request.messages.last_mut()
+            && let Some(content) = message.content.as_mut()
+        {
+            content.push_str(&format!(
+                "\n\nYour previous reply could not be used ({error}). Respond with ONLY a raw JSON object conforming to this schema, with no commentary, markdown, or code fences:\n{}",
+                serde_json::to_string_pretty(&schema).unwrap_or_default()
+            ));
+        }
+        match request_json_once(provider, request, budget, usage).await {
+            Ok(value) => match validate(&value) {
+                Ok(()) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            },
+            // Budget refusals are terminal; retrying cannot make room.
+            Err(error) if error.to_string().contains("merge budget") => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt == 1 {
+            break;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("cross-review request failed")))
+}
+
+async fn request_json_once(
+    provider: &dyn AiProvider,
+    request: AiRequest,
+    budget: Option<&ReviewBudget>,
+    usage: &mut CrossReviewUsage,
+) -> Result<Value> {
     let estimated_input = provider.estimate_tokens(&request);
     if budget.is_some_and(|budget| !budget.allows_request_input(estimated_input, estimated_input)) {
         anyhow::bail!("cross-review request exceeds the merge budget");
@@ -605,9 +690,15 @@ async fn request_json(
         .content
         .as_deref()
         .context("empty model response")?;
-    Ok(serde_json::from_str(&crate::utils::clean_json_string(
-        content,
-    ))?)
+    if let Ok(value) = serde_json::from_str(&crate::utils::clean_json_string(content)) {
+        return Ok(value);
+    }
+    // Fall back to the salvage the review stages use, so a reply wrapped in prose
+    // or code fences still yields its JSON object.
+    crate::worker::stage::find_json_candidates(content)
+        .into_iter()
+        .next_back()
+        .context("model response contained no JSON object")
 }
 
 fn parse_remote_response(payload: Value, source: &str) -> PollResult {
@@ -1034,6 +1125,104 @@ mod tests {
         );
         assert_eq!(usage.tokens_in, 2);
         assert_eq!(usage.tokens_out, 2);
+    }
+
+    /// Emits verbatim text so tests can model replies that are not bare JSON.
+    struct RawTextProvider {
+        responses: Mutex<VecDeque<String>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for RawTextProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.prompts
+                .lock()
+                .await
+                .push(request.messages[0].content.clone().unwrap_or_default());
+            let response = self.responses.lock().await.pop_front().unwrap();
+            Ok(AiResponse {
+                content: Some(response),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "raw-text".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn single_remote_finding() -> Vec<RemoteFinding> {
+        vec![RemoteFinding {
+            finding_id: "remote-new".to_string(),
+            patch_message_id: "patch@example".to_string(),
+            severity: "Low".to_string(),
+            problem: "new issue".to_string(),
+            reasoning: String::new(),
+            locations: json!([]),
+        }]
+    }
+
+    #[tokio::test]
+    async fn cross_review_salvages_prose_wrapped_json() {
+        let remote = single_remote_finding();
+        // Both steps answer with fenced JSON preceded by commentary.
+        let provider = RawTextProvider {
+            responses: Mutex::new(VecDeque::from([
+                "Here is the mapping:\n```json\n{\"remote-new\": null}\n```".to_string(),
+                "My verdict:\n```json\n{\"remote-new\": true}\n```".to_string(),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        };
+
+        let mut usage = CrossReviewUsage::default();
+        let analysis = analyze_remote_result(&provider, "patch", &[], &remote, None, &mut usage)
+            .await
+            .unwrap();
+
+        assert_eq!(analysis.accepted_remote.len(), 1);
+        // Salvage means no retry was needed.
+        assert_eq!(provider.prompts.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cross_review_retry_restates_the_schema() {
+        let remote = single_remote_finding();
+        let provider = RawTextProvider {
+            responses: Mutex::new(VecDeque::from([
+                // Truncated JSON that no salvage can recover.
+                "{".to_string(),
+                json!({"remote-new": null}).to_string(),
+                json!({"remote-new": true}).to_string(),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        };
+
+        let mut usage = CrossReviewUsage::default();
+        let analysis = analyze_remote_result(&provider, "patch", &[], &remote, None, &mut usage)
+            .await
+            .unwrap();
+
+        assert_eq!(analysis.accepted_remote.len(), 1);
+        let prompts = provider.prompts.lock().await;
+        assert_eq!(prompts.len(), 3);
+        assert!(!prompts[0].contains("could not be used"));
+        // The retry must restate both the failure and the concrete schema.
+        assert!(prompts[1].contains("could not be used"));
+        assert!(prompts[1].contains("\"remote-new\""));
+        assert!(prompts[1].contains("additionalProperties"));
     }
 
     #[tokio::test]

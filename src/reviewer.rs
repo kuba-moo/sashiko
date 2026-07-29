@@ -3233,7 +3233,9 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        // Three integration attempts, each of which retries the malformed reply
+        // once with the schema restated.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
         let mut rows = db
             .conn
             .query(
@@ -3245,9 +3247,9 @@ mod tests {
             .await?;
         let row = rows.next().await?.expect("cross-review job disappeared");
         assert_eq!(row.get::<String>(0)?, "error");
-        assert_eq!(row.get::<i64>(1)?, 6);
-        assert_eq!(row.get::<i64>(2)?, 3);
-        assert_eq!(row.get::<i64>(3)?, 3);
+        assert_eq!(row.get::<i64>(1)?, 12);
+        assert_eq!(row.get::<i64>(2)?, 6);
+        assert_eq!(row.get::<i64>(3)?, 6);
         drop(rows);
         assert!(
             db.claim_due_cross_reviews(now + 60 * 60, 1)

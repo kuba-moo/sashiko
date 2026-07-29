@@ -3733,6 +3733,13 @@ impl Database {
         // Fallback for single-patch git imports where placeholder is sha@sashiko.local
         // but the actual cover letter becomes the sha itself.
         clid_candidates.push(format!("{}@sashiko.local", message_id));
+        // A series sent without a cover letter has 1/N as its thread root, so a
+        // thread-fetch placeholder was created under 1/N's own message-id. Such a
+        // patch has no In-Reply-To to derive a cover letter from, so match on self.
+        // Singletons already get this via the total == 1 case in the caller.
+        if part_index == 1 && total_parts > 1 {
+            clid_candidates.push(message_id.to_string());
+        }
 
         for clid in clid_candidates {
             let mut rows = self
@@ -3850,7 +3857,9 @@ impl Database {
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let existing_date: i64 = row.get(1)?;
-            let existing_author: String = row.get(2)?;
+            // Placeholder rows from create_fetching_patchset leave author NULL, so a
+            // strict get() here would abort the whole scan and discard the patch.
+            let existing_author: String = row.get(2).unwrap_or_default();
             let existing_subject: String = row.get(3)?;
             let existing_subject_index: u32 = row.get(4).unwrap_or(9999);
             let existing_total: u32 = row.get(5).unwrap_or(1);
@@ -6278,6 +6287,249 @@ mod tests {
                 {"stage": 2, "unique": 0, "duplicates": 2},
                 {"stage": 3, "unique": 0, "duplicates": 2},
             ])
+        );
+    }
+
+    /// A series sent without a cover letter has 1/N as its thread root, so a
+    /// thread-fetch placeholder gets created under 1/N's own message-id with a
+    /// NULL author. Ingesting 1/N first used to abort on that NULL and silently
+    /// discard the patch, leaving the series stuck at Incomplete forever.
+    #[tokio::test]
+    async fn cover_letterless_series_adopts_placeholder_when_first_patch_leads() {
+        let db = setup_db().await;
+
+        // The placeholder the thread-fetch API creates before any message arrives.
+        let ps_placeholder = db
+            .create_fetching_patchset(
+                "root-1@example.com",
+                "Fetching thread root-1@example.com...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let author = "\"Real Author\" <real@example.com>";
+        let thread_id = db
+            .ensure_thread_for_message("root-1@example.com", 1000)
+            .await
+            .unwrap();
+
+        // Patch 1/2 is the thread root: no In-Reply-To, so no cover letter to
+        // derive a clid from. This is the message that used to be dropped.
+        db.create_message(
+            "root-1@example.com",
+            thread_id,
+            None,
+            author,
+            "[PATCH 1/2] first",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                None,
+                "root-1@example.com",
+                "[PATCH 1/2] first",
+                author,
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("1/2 must not be dropped");
+        assert_eq!(
+            ps1, ps_placeholder,
+            "1/2 should adopt the placeholder created under its own message-id"
+        );
+        db.create_patch(ps1, "root-1@example.com", 1, "diff --git a/a b/a\n")
+            .await
+            .unwrap();
+
+        // Patch 2/2 replies to 1/2, so it resolves via the normal cover-letter path.
+        db.create_message(
+            "root-2@example.com",
+            thread_id,
+            Some("root-1@example.com"),
+            author,
+            "[PATCH 2/2] second",
+            1001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps2 = db
+            .create_patchset(
+                thread_id,
+                Some("root-1@example.com"),
+                "root-2@example.com",
+                "[PATCH 2/2] second",
+                author,
+                1001,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("2/2 must resolve");
+        assert_eq!(ps2, ps1, "both parts belong to one patchset");
+        db.create_patch(ps2, "root-2@example.com", 2, "diff --git a/b b/b\n")
+            .await
+            .unwrap();
+
+        // Both parts present means the series becomes reviewable rather than
+        // sitting at Incomplete with a lost patch.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT received_parts, total_parts, status, author FROM patchsets WHERE id = ?",
+                libsql::params![ps1],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let received: u32 = row.get(0).unwrap();
+        let total: u32 = row.get(1).unwrap();
+        let status: String = row.get(2).unwrap();
+        let stored_author: String = row.get(3).unwrap();
+
+        assert_eq!(received, 2, "both parts recorded");
+        assert_eq!(total, 2);
+        assert_eq!(status, "Pending", "complete series must leave Incomplete");
+        assert_eq!(
+            stored_author, author,
+            "placeholder NULL author is filled in"
+        );
+
+        // And exactly one patchset owns the thread — no duplicate split.
+        let mut count_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE thread_id = ?",
+                libsql::params![thread_id],
+            )
+            .await
+            .unwrap();
+        let n: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1, "series must not split into multiple patchsets");
+    }
+
+    /// A patch whose cover-letter candidates miss the placeholder falls through
+    /// to the author/thread scan. With git send-email --thread=deep, 3/3 replies
+    /// to 2/3 rather than to the root, so if it is ingested first the scan is the
+    /// only path available and must survive the placeholder's NULL author.
+    #[tokio::test]
+    async fn patchset_scan_tolerates_placeholder_with_null_author() {
+        let db = setup_db().await;
+
+        let ps_placeholder = db
+            .create_fetching_patchset(
+                "deep-1@example.com",
+                "Fetching thread deep-1@example.com...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let author = "\"Deep Author\" <deep@example.com>";
+        let thread_id = db
+            .ensure_thread_for_message("deep-1@example.com", 2000)
+            .await
+            .unwrap();
+
+        // 3/3 arrives first and replies to 2/3, so neither clid candidate matches
+        // the placeholder created under 1/3's message-id.
+        for (msgid, subject, date) in [
+            ("deep-2@example.com", "[PATCH 2/3] second", 2001),
+            ("deep-3@example.com", "[PATCH 3/3] third", 2002),
+        ] {
+            db.create_message(
+                msgid, thread_id, None, author, subject, date, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps3 = db
+            .create_patchset(
+                thread_id,
+                Some("deep-2@example.com"),
+                "deep-3@example.com",
+                "[PATCH 3/3] third",
+                author,
+                2002,
+                3,
+                1,
+                "to",
+                "cc",
+                None,
+                3,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("NULL author on a placeholder must not abort the scan")
+            .expect("3/3 must not be dropped");
+
+        // The scan does not adopt the placeholder here: an empty author cannot
+        // satisfy strict_author matching, so 3/3 correctly starts its own
+        // patchset. What matters is that the diff survives at all.
+        db.create_patch(ps3, "deep-3@example.com", 3, "diff --git a/c b/c\n")
+            .await
+            .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE message_id = ?",
+                libsql::params!["deep-3@example.com"],
+            )
+            .await
+            .unwrap();
+        let saved: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(saved, 1, "3/3's diff must be persisted, not discarded");
+        assert_ne!(
+            ps3, ps_placeholder,
+            "sanity: this path forks rather than adopting, unlike the 1/N case"
         );
     }
 

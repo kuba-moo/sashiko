@@ -2613,9 +2613,16 @@ struct StageExecutionConfig {
 
 /// Upper bound on how long a stage waits for a sibling to warm the shared prompt
 /// prefix.  Only a failsafe: the gate is normally opened by the first response, and
-/// unconditionally on drop.  Waiting longer than this is never cheaper than just
-/// paying for a second cache write.
-const PREFIX_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// unconditionally on drop.
+///
+/// Providers commit the cache entry when the response completes, not when they
+/// ingest the prompt, so this has to cover a whole first turn.  That is not one
+/// generation: a format violation retries in place (`turns` is decremented), so the
+/// first turn can span up to `max_validation_attempts` responses.  Measured first
+/// turns reach ~325s (median 22s, p95 172s), and 300s clipped exactly that tail,
+/// making slow openers lose the saving for every sibling.  Keep this well under
+/// `review.timeout_seconds` so a wedged gate can never be what fails a review.
+const PREFIX_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Opens a prompt-prefix gate, releasing stages that share the prefix.
 ///

@@ -136,11 +136,9 @@ impl Reviewer {
         let cross_review_client =
             CrossReviewClient::new().expect("Failed to create cross-review HTTP client");
 
-        // Mathematically derived from Sashiko's review pipeline stage composition:
-        // Stages 1-7 run in parallel (7 slots), while Stages 8-11 run sequentially (1 slot).
-        // On average, an active patch review consumes ~3 LLM slots over its execution lifetime.
-        // Thus, the global LLM request semaphore is scaled to (concurrency * 3) to fully
-        // saturate LLM capacity while gating local processes/worktrees strictly to `concurrency`.
+        // Allow headroom for configurations that run multiple analysis stages or
+        // experiment models concurrently within one patch review. The worker's
+        // analysis_stage_parallelism setting provides the tighter per-review bound.
         let llm_concurrency = if concurrency < 2 {
             1
         } else {

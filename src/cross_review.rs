@@ -570,7 +570,7 @@ async fn request_json(
         context_tag: Some("cross-review".to_string()),
     };
     let estimated_input = provider.estimate_tokens(&request);
-    if budget.is_some_and(|budget| !budget.allows_request_input(estimated_input)) {
+    if budget.is_some_and(|budget| !budget.allows_request_input(estimated_input, estimated_input)) {
         anyhow::bail!("cross-review request exceeds the merge budget");
     }
     let response = provider.generate_content(request).await?;

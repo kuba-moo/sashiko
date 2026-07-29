@@ -360,6 +360,6 @@ Use `SessionRunner` in `benchmark.rs` to run this evaluation, removing the manua
 
 *   **Behavioral Equivalence**: The validation prompts and error feedback strings injected into the LLM context must remain identical or equivalent to the existing logic to ensure LLM behavior is not altered.
 *   **Stage History**: The `SessionRunner` will return the conversation history, which is appended to `Worker::global_history` just like before. We must ensure the structure of `global_history` remains exactly the same.
-*   **Parallel Accounting**: Per-review token totals must be shared across parallel stages; per-stage warning state must remain local to its session, and dump labels must keep concurrent stage output distinct.
+*   **Bounded Accounting**: Per-review token totals are shared across stages. Discovery stages run in ordered, configurable batches so completed usage can steer later batches; per-stage warning state remains local to its session, and dump labels keep concurrent stage output distinct when parallelism is greater than one.
 *   **Complete Transcripts**: Dumps must be emitted at the runner boundary so every provider exchange, including pre-screening and planning, is available to offline analysis.
 *   **Clippy & Formatting**: Run `make check-pr` before any commit to ensure style guide compliance.

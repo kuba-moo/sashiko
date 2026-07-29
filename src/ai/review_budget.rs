@@ -39,6 +39,7 @@ pub struct ReviewBudget {
     flags: Arc<AtomicU8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetLevel {
     Warn,
     Severe,
@@ -72,6 +73,17 @@ impl ReviewBudget {
         self.flags() & (REVIEW_INPUT_WARN | REVIEW_OUTPUT_WARN) != 0
     }
 
+    pub fn review_level(&self) -> Option<BudgetLevel> {
+        let flags = self.flags();
+        if flags & (REVIEW_INPUT_SEVERE | REVIEW_OUTPUT_SEVERE) != 0 {
+            Some(BudgetLevel::Severe)
+        } else if flags & (REVIEW_INPUT_WARN | REVIEW_OUTPUT_WARN) != 0 {
+            Some(BudgetLevel::Warn)
+        } else {
+            None
+        }
+    }
+
     pub fn allows(&self, stage_input: usize, stage_output: usize) -> bool {
         let snapshot = self.snapshot();
         let review_input_limit = self.review_input_limit();
@@ -84,10 +96,14 @@ impl ReviewBudget {
                 || snapshot.output.saturating_add(stage_output) <= review_output_limit)
     }
 
-    pub fn allows_request_input(&self, stage_input: usize) -> bool {
-        !self.config.enforce_hard_limits
-            || self.config.stage_input == 0
-            || stage_input <= self.config.stage_input
+    pub fn allows_request_input(&self, stage_input: usize, request_input: usize) -> bool {
+        if !self.config.enforce_hard_limits {
+            return true;
+        }
+        let snapshot = self.snapshot();
+        (self.config.stage_input == 0 || stage_input <= self.config.stage_input)
+            && (self.review_input_limit() == 0
+                || snapshot.input.saturating_add(request_input) <= self.review_input_limit())
     }
 
     pub fn hard_limit_exceeded(&self, stage_input: usize, stage_output: usize) -> bool {
@@ -348,10 +364,12 @@ mod tests {
             review_multiplier: 0.0,
             enforce_hard_limits: true,
         });
-        assert!(budget.allows_request_input(80));
-        assert!(!budget.allows_request_input(101));
+        assert!(budget.allows_request_input(80, 80));
+        assert!(!budget.allows_request_input(101, 101));
         let mut flags = 0;
         budget.record_and_check(&mut flags, 80, 30, 80, 30, 0);
+        assert!(budget.allows_request_input(70, 70));
+        assert!(!budget.allows_request_input(71, 71));
         assert!(!budget.hard_limit_exceeded(80, 30));
         budget.record_and_check(&mut flags, 80, 50, 80, 20, 0);
         assert!(budget.hard_limit_exceeded(80, 50));

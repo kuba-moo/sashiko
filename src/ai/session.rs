@@ -285,9 +285,26 @@ impl<'a> SessionRunner<'a> {
     where
         S: LlmSession,
     {
+        let inherited_budget_level = self.budget.as_ref().and_then(ReviewBudget::review_level);
+        let inherited_budget_warning = match inherited_budget_level {
+            Some(BudgetLevel::Severe) => Some(
+                "[SYSTEM - TOKEN BUDGET]\nThe shared review token budget is already severely consumed. Conclude with the information available and do not perform broad investigation or optional tool calls.",
+            ),
+            Some(BudgetLevel::Warn) => Some(
+                "[SYSTEM - TOKEN BUDGET]\nA significant portion of the shared review token budget was consumed by earlier stages. Be selective and investigate only remaining critical concerns.",
+            ),
+            None => None,
+        };
+        let initial_prompt = |mut prompt: String| {
+            if let Some(warning) = inherited_budget_warning {
+                prompt.push_str("\n\n");
+                prompt.push_str(warning);
+            }
+            prompt
+        };
         let mut history = vec![AiMessage {
             role: AiRole::User,
-            content: Some(session.initial_user_prompt()),
+            content: Some(initial_prompt(session.initial_user_prompt())),
             thought: None,
             thought_signature: None,
             reasoning: None,
@@ -297,7 +314,7 @@ impl<'a> SessionRunner<'a> {
 
         let mut log_history = vec![AiMessage {
             role: AiRole::User,
-            content: Some(session.log_user_prompt()),
+            content: Some(initial_prompt(session.log_user_prompt())),
             thought: None,
             thought_signature: None,
             reasoning: None,
@@ -312,7 +329,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens: usize = 0;
         let mut total_completion_tokens: usize = 0;
         let mut total_cached_tokens: usize = 0;
-        let mut severe_seen = false;
+        let mut severe_seen = inherited_budget_level == Some(BudgetLevel::Severe);
         let mut force_conclude = false;
         let mut stage_budget_flags = 0;
 
@@ -335,9 +352,12 @@ impl<'a> SessionRunner<'a> {
             };
             let estimated_input = self.provider.estimate_tokens(&request);
             if self.budget.as_ref().is_some_and(|budget| {
-                !budget.allows_request_input(total_prompt_tokens.saturating_add(estimated_input))
+                !budget.allows_request_input(
+                    total_prompt_tokens.saturating_add(estimated_input),
+                    estimated_input,
+                )
             }) {
-                anyhow::bail!("request input exceeds the source-owned stage token limit");
+                anyhow::bail!("request input exceeds the source-owned stage or review token limit");
             }
 
             if let Some((dump, label)) = &self.conversation_dump
@@ -653,6 +673,98 @@ mod tests {
                     .unwrap_or_default(),
             )
         }
+    }
+
+    struct CapturingProvider {
+        prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for CapturingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            *self.prompt.lock().unwrap() = request
+                .messages
+                .first()
+                .and_then(|message| message.content.clone());
+            Ok(AiResponse {
+                content: Some("{}".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "capturing-provider".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_inherits_shared_review_warning() {
+        let budget = ReviewBudget::new(BudgetConfig {
+            stage_input: 1000,
+            stage_output: 1000,
+            review_input: 100,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+            enforce_hard_limits: false,
+        });
+        let mut stage_flags = 0;
+        budget.record_and_check(&mut stage_flags, 60, 0, 60, 0, 0);
+        assert_eq!(budget.review_level(), Some(BudgetLevel::Warn));
+
+        let provider = CapturingProvider {
+            prompt: std::sync::Mutex::new(None),
+        };
+        SessionRunner::new(&provider)
+            .with_budget(Some(budget))
+            .run(&mut TestSession)
+            .await
+            .unwrap();
+
+        let prompt = provider.prompt.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("consumed by earlier stages"));
+    }
+
+    #[tokio::test]
+    async fn new_session_inherits_shared_review_severe_warning() {
+        let budget = ReviewBudget::new(BudgetConfig {
+            stage_input: 1000,
+            stage_output: 1000,
+            review_input: 100,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+            enforce_hard_limits: false,
+        });
+        let mut stage_flags = 0;
+        budget.record_and_check(&mut stage_flags, 95, 0, 95, 0, 0);
+        assert_eq!(budget.review_level(), Some(BudgetLevel::Severe));
+
+        let provider = CapturingProvider {
+            prompt: std::sync::Mutex::new(None),
+        };
+        SessionRunner::new(&provider)
+            .with_budget(Some(budget))
+            .run(&mut TestSession)
+            .await
+            .unwrap();
+
+        let prompt = provider.prompt.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("already severely consumed"));
     }
 
     #[tokio::test]

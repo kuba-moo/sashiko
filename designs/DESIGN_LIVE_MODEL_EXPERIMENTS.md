@@ -169,14 +169,14 @@ merge attempts return a structured ledger snapshot as well; a later successful
 retry accumulates prior attempt usage, while a terminal failure persists the
 snapshot on the failed review.
 
-Each request checks its input estimate against the source's stage limit before
-dispatch. Completion atomically records actual input and output usage, then
-checks stage and review limits. Review-wide enforcement uses actual totals, so
-parallel stage scheduling cannot reject work merely because another request has
-temporarily reserved estimated capacity. A source can exhaust only its own
-ledger. Variant exhaustion fails or cancels that variant's work; validation
-exhaustion produces an unavailable decision; neither changes the main discovery
-ledger.
+Each request checks its input estimate against both the source's stage limit and
+the remaining review input limit before dispatch. Completion atomically records
+actual input and output usage, then checks stage and review limits. Discovery
+stages run in ordered batches controlled by `analysis_stage_parallelism`, so
+completed usage and warning state steer the next batch. A source can exhaust
+only its own ledger. Variant exhaustion fails or cancels that variant's work;
+validation exhaustion produces an unavailable decision; neither changes the
+main discovery ledger.
 
 Existing flat budget settings remain accepted. New nested source budget values
 map directly to stage and review input/output limits. Explicit review limits

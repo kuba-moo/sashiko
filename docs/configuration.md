@@ -76,6 +76,7 @@ Core AI settings that apply to all providers.
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
+| `analysis_stage_parallelism` | integer | `1` | Maximum discovery stages (1–7) run concurrently. `1` lets each stage's usage trigger warnings, hard limits, and reduced effort before the next stage starts. |
 | `temperature` | float | `1.0` | Sampling temperature. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |

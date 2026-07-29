@@ -519,6 +519,11 @@ pub struct AiSettings {
     pub max_input_tokens: usize,
     #[serde(default = "default_max_interactions")]
     pub max_interactions: usize,
+    /// Maximum number of discovery stage numbers (1-7) run concurrently.
+    /// Keeping this at one lets each completed stage steer the token budget,
+    /// warning level, and retry-effort provider used by the next stage.
+    #[serde(default = "default_analysis_stage_parallelism")]
+    pub analysis_stage_parallelism: usize,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     #[serde(default = "default_api_timeout_secs")]
@@ -619,6 +624,10 @@ fn default_temperature() -> f32 {
 
 fn default_max_interactions() -> usize {
     100
+}
+
+fn default_analysis_stage_parallelism() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1021,6 +1030,24 @@ mod tests {
             });
             assert!(serde_json::from_value::<AiSettings>(value).is_err());
         }
+    }
+
+    #[test]
+    fn analysis_stage_parallelism_defaults_to_one_and_can_be_overridden() {
+        let default: AiSettings = serde_json::from_value(serde_json::json!({
+            "provider": "test",
+            "model": "model"
+        }))
+        .unwrap();
+        assert_eq!(default.analysis_stage_parallelism, 1);
+
+        let configured: AiSettings = serde_json::from_value(serde_json::json!({
+            "provider": "test",
+            "model": "model",
+            "analysis_stage_parallelism": 3
+        }))
+        .unwrap();
+        assert_eq!(configured.analysis_stage_parallelism, 3);
     }
 
     #[test]

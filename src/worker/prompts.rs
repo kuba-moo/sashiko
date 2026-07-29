@@ -91,6 +91,7 @@ pub struct WorkerConfig {
     pub main_model: String,
     pub max_input_tokens: usize,
     pub max_interactions: usize,
+    pub analysis_stage_parallelism: usize,
     pub temperature: f32,
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
@@ -211,7 +212,7 @@ impl PromptRegistry {
         );
 
         let preamble = format!(
-            "{}You are an expert Linux kernel maintainer. You are ONE AGENT in a multi-stage automated review pipeline. Other specialized agents handle different aspects of this patch in parallel — you must focus strictly on YOUR stage's scope and not duplicate their work. A later consolidation stage (Stage 8) will merge all findings, so do not attempt a comprehensive review yourself.\n\nTOOL USAGE: Use tools only to verify concerns within your stage's scope. Do not broadly explore the codebase or trace execution paths outside your assigned focus area. When you do use tools, batch parallel or independent calls into a single response to minimize turns. If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.\n\n",
+            "{}You are an expert Linux kernel maintainer. You are ONE AGENT in a multi-stage automated review pipeline. Other specialized stages handle different aspects of this patch — you must focus strictly on YOUR stage's scope and not duplicate their work. A later consolidation stage (Stage 8) will merge all findings, so do not attempt a comprehensive review yourself.\n\nTOOL USAGE: Use tools only to verify concerns within your stage's scope. Do not broadly explore the codebase or trace execution paths outside your assigned focus area. When you do use tools, batch parallel or independent calls into a single response to minimize turns. If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.\n\n",
             date_fact
         );
         content.push_str(&preamble);
@@ -516,6 +517,7 @@ pub struct Worker {
     prompts: PromptRegistry,
     global_history: Vec<AiMessage>,
     max_interactions: usize,
+    analysis_stage_parallelism: usize,
     temperature: f32,
     series_range: Option<String>,
     baseline_sha: Option<String>,
@@ -545,6 +547,7 @@ impl Worker {
             prompts,
             global_history: Vec::new(),
             max_interactions: config.max_interactions,
+            analysis_stage_parallelism: config.analysis_stage_parallelism.clamp(1, 7),
             temperature: config.temperature,
             series_range: config.series_range,
             baseline_sha: config.baseline_sha,
@@ -930,18 +933,10 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             });
         }
 
-        // Stages 1-7 run concurrently but share a prompt prefix per (model, log
-        // variant): stages 1, 2 and 7 carry the log context, stages 3-6 do not.  Firing
-        // them all at once makes every one write the provider's prefix cache and none
-        // read it.  Elect the first stage of each group to warm the cache and hold the
-        // rest until it has done so; they then read the entry back at a fraction of the
-        // write price.  Gates are keyed per model so an experiment cohort with its own
-        // provider does not wait on the main model.
-        let mut prefix_gates: std::collections::HashMap<(String, bool), PrefixGate> =
-            std::collections::HashMap::new();
-
-        // Construct futures for Stages 1-7
-        let mut stage_futures = Vec::new();
+        // Select discovery stages in their canonical order. They execute in bounded
+        // batches so usage completed by one batch can trigger warnings, hard limits,
+        // and the lower-effort provider before the next batch is constructed.
+        let mut analysis_stages = Vec::new();
         for stage_num in 1..=7 {
             if let Some(ref selected_stages) = self.stages {
                 if !selected_stages.contains(&stage_num) {
@@ -953,84 +948,98 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 info!("Skipping stage {} based on planning phase", stage_num);
                 continue;
             }
+            analysis_stages.push(stage_num);
+        }
 
-            let stage = create_stage(stage_num);
-            let use_log = stage.use_log_in_context();
-            let system_prompt = if use_log {
-                shared_context.clone()
-            } else {
-                shared_context_no_log.clone()
-            };
-            let clean_system_prompt = if use_log {
-                clean_shared_context.clone()
-            } else {
-                clean_shared_context_no_log.clone()
-            };
+        let mut stage_results = Vec::new();
+        for stage_batch in analysis_stages.chunks(self.analysis_stage_parallelism) {
+            // Concurrent stages in a batch share a prompt prefix per (model, log
+            // variant). Elect one opener so siblings wait for its cache write. A new
+            // batch starts only after the previous one is complete, so its prefixes
+            // are already warm and need no cross-batch gate.
+            let mut prefix_gates: std::collections::HashMap<(String, bool), PrefixGate> =
+                std::collections::HashMap::new();
+            let mut stage_futures = Vec::new();
 
-            let main_provider = self.provider_for_budget(self.budget.as_ref());
-            let (main_opener, main_waiter) = claim_prefix_gate(
-                &mut prefix_gates,
-                "main",
-                use_log,
-                main_provider.caches_prompt_prefix(),
-            );
+            for &stage_num in stage_batch {
+                let stage = create_stage(stage_num);
+                let use_log = stage.use_log_in_context();
+                let system_prompt = if use_log {
+                    shared_context.clone()
+                } else {
+                    shared_context_no_log.clone()
+                };
+                let clean_system_prompt = if use_log {
+                    clean_shared_context.clone()
+                } else {
+                    clean_shared_context_no_log.clone()
+                };
 
-            stage_futures.push(self.execute_stage(
-                stage,
-                system_prompt.clone(),
-                clean_system_prompt.clone(),
-                progress,
-                StageExecutionConfig {
-                    provider: main_provider,
-                    name: "main".to_string(),
-                    temperature: self.temperature,
-                    max_interactions: self.max_interactions,
-                    model_id: self.main_model.clone(),
-                    provider_id: self.cohort.main.provider.clone(),
-                    budget: self.budget.clone(),
-                    prefix_opener: main_opener,
-                    wait_for_prefix: main_waiter,
-                },
-            ));
-
-            for model in &self.additional_models {
-                let variant_stage = create_stage(stage_num);
-                let (opener, waiter) = claim_prefix_gate(
+                let main_provider = self.provider_for_budget(self.budget.as_ref());
+                let (main_opener, main_waiter) = claim_prefix_gate(
                     &mut prefix_gates,
-                    &model.name,
+                    "main",
                     use_log,
-                    model.provider.caches_prompt_prefix(),
+                    main_provider.caches_prompt_prefix(),
                 );
+
                 stage_futures.push(self.execute_stage(
-                    variant_stage,
+                    stage,
                     system_prompt.clone(),
                     clean_system_prompt.clone(),
                     progress,
                     StageExecutionConfig {
-                        provider: model.provider.clone(),
-                        name: model.name.clone(),
-                        temperature: model.temperature,
-                        max_interactions: model.max_interactions,
-                        model_id: model.model_id.clone(),
-                        provider_id: model.provider_id.clone(),
-                        budget: model.budget.clone(),
-                        prefix_opener: opener,
-                        wait_for_prefix: waiter,
+                        provider: main_provider,
+                        name: "main".to_string(),
+                        temperature: self.temperature,
+                        max_interactions: self.max_interactions,
+                        model_id: self.main_model.clone(),
+                        provider_id: self.cohort.main.provider.clone(),
+                        budget: self.budget.clone(),
+                        prefix_opener: main_opener,
+                        wait_for_prefix: main_waiter,
                     },
                 ));
-            }
-        }
 
-        // Run planned stages concurrently
-        info!(
-            "Running {} planned stages concurrently ({} prompt-prefix gate(s))",
-            stage_futures.len(),
-            prefix_gates.len()
-        );
-        let stage_results = futures::future::try_join_all(stage_futures).await?;
+                for model in &self.additional_models {
+                    let variant_stage = create_stage(stage_num);
+                    let (opener, waiter) = claim_prefix_gate(
+                        &mut prefix_gates,
+                        &model.name,
+                        use_log,
+                        model.provider.caches_prompt_prefix(),
+                    );
+                    stage_futures.push(self.execute_stage(
+                        variant_stage,
+                        system_prompt.clone(),
+                        clean_system_prompt.clone(),
+                        progress,
+                        StageExecutionConfig {
+                            provider: model.provider.clone(),
+                            name: model.name.clone(),
+                            temperature: model.temperature,
+                            max_interactions: model.max_interactions,
+                            model_id: model.model_id.clone(),
+                            provider_id: model.provider_id.clone(),
+                            budget: model.budget.clone(),
+                            prefix_opener: opener,
+                            wait_for_prefix: waiter,
+                        },
+                    ));
+                }
+            }
+
+            info!(
+                "Running analysis stage batch {:?}: {} model invocation(s), {} prompt-prefix gate(s)",
+                stage_batch,
+                stage_futures.len(),
+                prefix_gates.len()
+            );
+            stage_results.extend(futures::future::try_join_all(stage_futures).await?);
+        }
         let mut experiment_runs = Vec::new();
 
-        // Consolidate results in deterministic order (already preserved by try_join_all)
+        // Consolidate results in deterministic stage/model order.
         for res in stage_results {
             if res.model == "main" {
                 total_tokens_in += res.tokens_in;
@@ -3343,6 +3352,7 @@ mod tests {
                 main_model: "model-a".to_string(),
                 max_input_tokens: 1000,
                 max_interactions: 2,
+                analysis_stage_parallelism: 1,
                 temperature: 0.0,
                 custom_prompt: None,
                 series_range: None,
@@ -3421,6 +3431,7 @@ mod tests {
                 main_model: "model-a".to_string(),
                 max_input_tokens: 1000,
                 max_interactions: 2,
+                analysis_stage_parallelism: 1,
                 temperature: 0.0,
                 custom_prompt: None,
                 series_range: None,
@@ -3834,6 +3845,184 @@ mod tests {
         }
     }
 
+    struct BudgetUsageProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for BudgetUsageProvider {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ai::AiResponse {
+                content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 60,
+                    completion_tokens: 1,
+                    total_tokens: 61,
+                    cached_tokens: Some(0),
+                    cache_write_tokens: None,
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "budget-usage".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_analysis_stages_switch_provider_after_review_warning() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = Arc::new(BudgetUsageProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let retry_provider = Arc::new(BudgetUsageProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let budget = ReviewBudget::new(crate::ai::review_budget::BudgetConfig {
+            stage_input: 1000,
+            stage_output: 1000,
+            review_input: 100,
+            review_output: 100,
+            warn_pct: 0.5,
+            severe_pct: 0.9,
+            review_multiplier: 0.0,
+            enforce_hard_limits: false,
+        });
+        let config = WorkerConfig {
+            main_model: "main".to_string(),
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            analysis_stage_parallelism: 1,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec![1, 2]),
+            dump_conversation: None,
+            budget: Some(budget),
+            merge_budget: None,
+            retry_provider: Some(retry_provider.clone()),
+            additional_models: Vec::new(),
+            cohort: test_cohort(),
+            validation_budget: None,
+        };
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let mut worker = Worker::new(provider.clone(), Arc::new(tools), prompts, config);
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        worker.run(patchset, None).await.unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retry_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct ConcurrentStageProvider {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for ConcurrentStageProvider {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::ai::AiResponse {
+                content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "concurrent-stage".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn analysis_stage_parallelism_bounds_in_flight_stages() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let provider = Arc::new(ConcurrentStageProvider {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        let config = WorkerConfig {
+            main_model: "main".to_string(),
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            analysis_stage_parallelism: 2,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec![1, 2, 3]),
+            dump_conversation: None,
+            budget: None,
+            merge_budget: None,
+            retry_provider: None,
+            additional_models: Vec::new(),
+            cohort: test_cohort(),
+            validation_budget: None,
+        };
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let mut worker = Worker::new(provider.clone(), Arc::new(tools), prompts, config);
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        worker.run(patchset, None).await.unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.max_active.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn test_stage_failure_aborts_review() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3847,6 +4036,7 @@ mod tests {
             main_model: "mock".to_string(),
             max_input_tokens: 10000,
             max_interactions: 3,
+            analysis_stage_parallelism: 1,
             temperature: 0.0,
             series_range: None,
             baseline_sha: None,
@@ -4211,6 +4401,7 @@ mod tests {
             main_model: "mock".to_string(),
             max_input_tokens: 10000,
             max_interactions: 3,
+            analysis_stage_parallelism: 1,
             temperature: 0.0,
             series_range: None,
             baseline_sha: None,

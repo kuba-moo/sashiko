@@ -610,6 +610,7 @@ async fn review_single_patch(
                 main_model: effective_ai.model.clone(),
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
+                analysis_stage_parallelism: ai.analysis_stage_parallelism,
                 temperature: ai.temperature,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,

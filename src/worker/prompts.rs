@@ -2422,6 +2422,9 @@ Example:
     }
 }
 
+/// Attribution label for confirmation decode failures.
+const CONFIRMATION_SOURCE: &str = "confirmation";
+
 /// Pins the confirmation reply to the flat `{"<finding id>": bool}` shape the
 /// validator requires; without it models wrap decisions in their own envelope.
 fn confirmation_schema(expected_ids: &[&str]) -> Value {
@@ -2455,22 +2458,39 @@ fn confirmation_format_instruction(expected_ids: &[&str]) -> String {
 fn parse_confirmation_response(content: &str, expected_ids: &[&str]) -> Result<Value> {
     let cleaned = crate::utils::clean_json_string(content);
     let mut candidates = Vec::new();
-    if let Ok(value) = serde_json::from_str::<Value>(&cleaned) {
+    let direct = serde_json::from_str::<Value>(&cleaned);
+    // A reply needing salvage still signals contract drift, even when it works.
+    let salvage_reason = direct.as_ref().err().map(ToString::to_string);
+    if let Ok(value) = direct {
         candidates.push(value);
     }
     candidates.extend(crate::worker::stage::find_json_candidates(content));
 
     let mut last_error = None;
     for candidate in candidates {
+        let mut recovered = None;
         match validate_confirmation_decisions(&candidate, expected_ids) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => recovered = Some(candidate.clone()),
             Err(error) => last_error = Some(error),
         }
         // Unwrap a single-key envelope such as {"decisions": {...}}.
-        for nested in candidate.as_object().into_iter().flatten().map(|(_, v)| v) {
-            if validate_confirmation_decisions(nested, expected_ids).is_ok() {
-                return Ok(nested.clone());
+        if recovered.is_none() {
+            for nested in candidate.as_object().into_iter().flatten().map(|(_, v)| v) {
+                if validate_confirmation_decisions(nested, expected_ids).is_ok() {
+                    recovered = Some(nested.clone());
+                    break;
+                }
             }
+        }
+        if let Some(value) = recovered {
+            if let Some(reason) = &salvage_reason {
+                crate::json_health::record(
+                    CONFIRMATION_SOURCE,
+                    crate::json_health::JsonDecodeOutcome::Salvaged,
+                    reason,
+                );
+            }
+            return Ok(value);
         }
     }
     Err(last_error
@@ -2483,7 +2503,7 @@ async fn request_confirmation(
     expected_ids: &[&str],
     budget: Option<&ReviewBudget>,
 ) -> (Result<Value>, (usize, usize, usize)) {
-    let mut last_error = None;
+    let mut last_error: Option<anyhow::Error> = None;
     let mut tokens = (0, 0, 0);
     let mut request = request;
     for attempt in 0..2 {
@@ -2544,17 +2564,31 @@ async fn request_confirmation(
                 }
                 let content = response.content.as_deref().unwrap_or("{}");
                 match parse_confirmation_response(content, expected_ids) {
-                    Ok(decisions) => return (Ok(decisions), tokens),
+                    Ok(decisions) => {
+                        if attempt > 0 {
+                            crate::json_health::record(
+                                CONFIRMATION_SOURCE,
+                                crate::json_health::JsonDecodeOutcome::RecoveredOnRetry,
+                                &last_error
+                                    .map(|error| error.to_string())
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        return (Ok(decisions), tokens);
+                    }
                     Err(error) => last_error = Some(error),
                 }
             }
-            Err(error) => last_error = Some(error),
+            Err(error) => return (Err(error), tokens),
         }
     }
-    (
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("confirmation request failed"))),
-        tokens,
-    )
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("confirmation request failed"));
+    crate::json_health::record(
+        CONFIRMATION_SOURCE,
+        crate::json_health::JsonDecodeOutcome::Fatal,
+        &error.to_string(),
+    );
+    (Err(error), tokens)
 }
 
 fn validate_confirmation_decisions(decisions: &Value, expected_ids: &[&str]) -> Result<()> {
@@ -3072,6 +3106,7 @@ struct ReviewStageSession {
     required_baseline_ids: Option<std::collections::BTreeSet<String>>,
     required_provenance: Option<(Vec<Value>, bool, &'static str)>,
     required_experiment_findings: Option<Value>,
+    pending_json_decode_error: Option<String>,
 }
 
 impl ReviewStageSession {
@@ -3105,6 +3140,7 @@ impl ReviewStageSession {
             required_baseline_ids: None,
             required_provenance: None,
             required_experiment_findings: None,
+            pending_json_decode_error: None,
         }
     }
 
@@ -3123,6 +3159,22 @@ impl ReviewStageSession {
 
     fn require_experiment_findings(&mut self, inputs: Value) {
         self.required_experiment_findings = Some(inputs);
+    }
+
+    fn finish_json_decode(&mut self, outcome: crate::json_health::JsonDecodeOutcome) {
+        if let Some(error) = self.pending_json_decode_error.take() {
+            crate::json_health::record(
+                crate::json_health::stage_source(self.stage.number()),
+                outcome,
+                &error,
+            );
+        }
+    }
+}
+
+impl Drop for ReviewStageSession {
+    fn drop(&mut self) {
+        self.finish_json_decode(crate::json_health::JsonDecodeOutcome::Fatal);
     }
 }
 
@@ -3238,43 +3290,58 @@ impl LlmSession for ReviewStageSession {
     }
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
-        let output = self.stage.validate(response)?;
-        if let Some(expected) = &self.required_baseline_ids {
-            let decisions = output
-                .get("baseline_decisions")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    ValidationError::FormatViolation(
-                        "missing baseline_decisions object".to_string(),
-                    )
-                })?;
-            let actual: std::collections::BTreeSet<String> = decisions.keys().cloned().collect();
-            if &actual != expected || decisions.values().any(|decision| !decision.is_boolean()) {
-                return Err(ValidationError::FormatViolation(
-                    "baseline_decisions must contain one boolean for every input concern"
-                        .to_string(),
-                ));
+        if self.stage.number() <= 10
+            && let Some(error) = crate::worker::stage::unrecoverable_json_error(response)
+        {
+            self.pending_json_decode_error.get_or_insert(error);
+        }
+
+        let result = (|| {
+            let output = self.stage.validate(response)?;
+            if let Some(expected) = &self.required_baseline_ids {
+                let decisions = output
+                    .get("baseline_decisions")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ValidationError::FormatViolation(
+                            "missing baseline_decisions object".to_string(),
+                        )
+                    })?;
+                let actual: std::collections::BTreeSet<String> =
+                    decisions.keys().cloned().collect();
+                if &actual != expected || decisions.values().any(|decision| !decision.is_boolean())
+                {
+                    return Err(ValidationError::FormatViolation(
+                        "baseline_decisions must contain one boolean for every input concern"
+                            .to_string(),
+                    ));
+                }
             }
+            if let Some((inputs, require_all, output_key)) = &self.required_provenance {
+                let outputs = output.get(*output_key).ok_or_else(|| {
+                    ValidationError::FormatViolation(format!("missing {output_key} output"))
+                })?;
+                validate_provenance(inputs, outputs, *require_all).map_err(|error| {
+                    ValidationError::FormatViolation(format!("invalid finding provenance: {error}"))
+                })?;
+            }
+            if let Some(inputs) = &self.required_experiment_findings {
+                let outputs = output.get("findings").ok_or_else(|| {
+                    ValidationError::FormatViolation("missing findings output".to_string())
+                })?;
+                validate_required_experiment_findings(inputs, outputs).map_err(|error| {
+                    ValidationError::FormatViolation(format!(
+                        "missing required experiment finding: {error}"
+                    ))
+                })?;
+            }
+            Ok(output)
+        })();
+
+        if result.is_ok() {
+            self.finish_json_decode(crate::json_health::JsonDecodeOutcome::RecoveredOnRetry);
         }
-        if let Some((inputs, require_all, output_key)) = &self.required_provenance {
-            let outputs = output.get(*output_key).ok_or_else(|| {
-                ValidationError::FormatViolation(format!("missing {output_key} output"))
-            })?;
-            validate_provenance(inputs, outputs, *require_all).map_err(|error| {
-                ValidationError::FormatViolation(format!("invalid finding provenance: {error}"))
-            })?;
-        }
-        if let Some(inputs) = &self.required_experiment_findings {
-            let outputs = output.get("findings").ok_or_else(|| {
-                ValidationError::FormatViolation("missing findings output".to_string())
-            })?;
-            validate_required_experiment_findings(inputs, outputs).map_err(|error| {
-                ValidationError::FormatViolation(format!(
-                    "missing required experiment finding: {error}"
-                ))
-            })?;
-        }
-        Ok(output)
+        result
     }
 
     fn handle_provider_error(&mut self, error: &anyhow::Error, _attempt: usize) -> ErrorAction {
@@ -3391,6 +3458,79 @@ mod tests {
         assert_eq!(labeled[1]["source_models"], json!(["fable", "opus-5"]));
     }
 
+    fn stage_test_response(content: &str) -> AiResponse {
+        AiResponse {
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            reasoning: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn stage_decode_retry_is_recorded_as_recovered() {
+        let _guard = crate::json_health::TEST_GUARD.blocking_lock();
+        crate::json_health::drain();
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = ReviewStageSession::new(
+            create_stage(1),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            0.0,
+            None,
+        );
+
+        assert!(session.validate(&stage_test_response("not JSON")).is_err());
+        assert!(
+            session
+                .validate(&stage_test_response(
+                    r#"{"concerns": [], "dismissed_concerns": []}"#,
+                ))
+                .is_ok()
+        );
+        drop(session);
+
+        let events = crate::json_health::drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "stage:1");
+        assert_eq!(
+            events[0].outcome,
+            crate::json_health::JsonDecodeOutcome::RecoveredOnRetry
+        );
+    }
+
+    #[test]
+    fn abandoned_stage_decode_is_recorded_as_fatal() {
+        let _guard = crate::json_health::TEST_GUARD.blocking_lock();
+        crate::json_health::drain();
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = ReviewStageSession::new(
+            create_stage(1),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            0.0,
+            None,
+        );
+
+        assert!(session.validate(&stage_test_response("not JSON")).is_err());
+        drop(session);
+
+        let events = crate::json_health::drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "stage:1");
+        assert_eq!(
+            events[0].outcome,
+            crate::json_health::JsonDecodeOutcome::Fatal
+        );
+    }
+
     struct ConfirmationProvider {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -3454,6 +3594,8 @@ mod tests {
 
     #[tokio::test]
     async fn confirmation_retries_incomplete_mappings() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         let provider = ConfirmationProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -3469,10 +3611,13 @@ mod tests {
         let decisions = decisions.unwrap();
         assert_eq!(decisions["b"], false);
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        crate::json_health::drain();
     }
 
     #[tokio::test]
     async fn confirmation_retry_restates_the_required_format() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         /// Records the prompt of every call so we can assert the retry differs.
         struct PromptRecorder {
             prompts: std::sync::Mutex<Vec<String>>,
@@ -3540,6 +3685,54 @@ mod tests {
         assert!(!prompts[0].contains("could not be parsed"));
         assert!(prompts[1].contains("could not be parsed"));
         assert!(prompts[1].contains("RESPONSE FORMAT"));
+        drop(prompts);
+        crate::json_health::drain();
+    }
+
+    #[tokio::test]
+    async fn confirmation_does_not_retry_or_record_provider_errors() {
+        struct FailingProvider {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl AiProvider for FailingProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("provider unavailable")
+            }
+
+            fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+                0
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "failing-provider".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
+        let provider = FailingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = AiRequest {
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let (result, _) = request_confirmation(&provider, request, &["a"], None).await;
+
+        assert!(result.is_err());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::json_health::drain().is_empty());
     }
 
     #[tokio::test]
@@ -3843,6 +4036,8 @@ mod tests {
 
     #[test]
     fn confirmation_response_is_salvaged_from_wrapped_replies() {
+        let _guard = crate::json_health::TEST_GUARD.blocking_lock();
+        crate::json_health::drain();
         let ids = ["main-1-0", "variant-2-1"];
         let expected = json!({"main-1-0": true, "variant-2-1": false});
 
@@ -3874,6 +4069,7 @@ mod tests {
         assert!(parse_confirmation_response(r#"{"main-1-0": true}"#, &ids).is_err());
         // Prose with no JSON at all is a failure.
         assert!(parse_confirmation_response("I could not verify these.", &ids).is_err());
+        crate::json_health::drain();
     }
 
     #[test]

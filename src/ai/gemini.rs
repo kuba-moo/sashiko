@@ -1250,4 +1250,15 @@ mod tests {
             "INTEGER"
         );
     }
+
+    #[test]
+    fn test_normalize_nullable_schema() {
+        let normalized = normalize_schema(json!({
+            "type": "string",
+            "nullable": true
+        }));
+
+        assert_eq!(normalized["type"], "STRING");
+        assert_eq!(normalized["nullable"], true);
+    }
 }

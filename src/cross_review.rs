@@ -471,8 +471,14 @@ async fn deduplicate_remote(
     let expected: std::collections::HashSet<&str> = remote_ids.iter().copied().collect();
     let response = request_json(
         provider,
+        "cross-review:dedup",
         prompt,
-        id_map_schema(&remote_ids, serde_json::json!({"type": ["string", "null"]})),
+        // Gemini's response schema uses OpenAPI's nullable keyword rather than
+        // JSON Schema's array-of-types representation.
+        id_map_schema(
+            &remote_ids,
+            serde_json::json!({"type": "string", "nullable": true}),
+        ),
         budget,
         usage,
         |value| {
@@ -548,6 +554,7 @@ async fn confirm_remote(
     let expected: std::collections::HashSet<&str> = finding_ids.iter().copied().collect();
     let response = request_json(
         provider,
+        "cross-review:confirm",
         prompt,
         id_map_schema(&finding_ids, serde_json::json!({"type": "boolean"})),
         budget,
@@ -590,6 +597,7 @@ fn id_map_schema(ids: &[&str], value_schema: Value) -> Value {
 
 async fn request_json(
     provider: &dyn AiProvider,
+    source: &str,
     prompt: String,
     schema: Value,
     budget: Option<&ReviewBudget>,
@@ -618,7 +626,7 @@ async fn request_json(
         context_tag: Some("cross-review".to_string()),
     };
 
-    let mut last_error = None;
+    let mut last_error: Option<anyhow::Error> = None;
     // Retry once with the parse failure restated; resending the identical prompt
     // just reproduces the same malformed reply.
     for attempt in 0..2 {
@@ -633,19 +641,66 @@ async fn request_json(
             ));
         }
         match request_json_once(provider, request, budget, usage).await {
-            Ok(value) => match validate(&value) {
-                Ok(()) => return Ok(value),
-                Err(error) => last_error = Some(error),
-            },
-            // Budget refusals are terminal; retrying cannot make room.
-            Err(error) if error.to_string().contains("merge budget") => return Err(error),
-            Err(error) => last_error = Some(error),
+            Ok(JsonCandidates {
+                values,
+                salvage_detail,
+            }) => {
+                let mut candidate_error = None;
+                for value in values {
+                    match validate(&value) {
+                        Ok(()) => {
+                            if let Some(detail) = &salvage_detail {
+                                crate::json_health::record(
+                                    source,
+                                    crate::json_health::JsonDecodeOutcome::Salvaged,
+                                    detail,
+                                );
+                            }
+                            if attempt > 0 {
+                                crate::json_health::record(
+                                    source,
+                                    crate::json_health::JsonDecodeOutcome::RecoveredOnRetry,
+                                    &last_error
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_default(),
+                                );
+                            }
+                            return Ok(value);
+                        }
+                        Err(error) => candidate_error = Some(error),
+                    }
+                }
+                last_error = candidate_error.or_else(|| {
+                    Some(anyhow::anyhow!(
+                        "model response contained no usable JSON object"
+                    ))
+                });
+            }
+            Err(JsonAttemptError::Invalid(error)) => last_error = Some(error),
+            Err(JsonAttemptError::Terminal(error)) => return Err(error),
         }
         if attempt == 1 {
             break;
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("cross-review request failed")))
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("cross-review request failed"));
+    crate::json_health::record(
+        source,
+        crate::json_health::JsonDecodeOutcome::Fatal,
+        &error.to_string(),
+    );
+    Err(error)
+}
+
+struct JsonCandidates {
+    values: Vec<Value>,
+    salvage_detail: Option<String>,
+}
+
+enum JsonAttemptError {
+    Invalid(anyhow::Error),
+    Terminal(anyhow::Error),
 }
 
 async fn request_json_once(
@@ -653,12 +708,17 @@ async fn request_json_once(
     request: AiRequest,
     budget: Option<&ReviewBudget>,
     usage: &mut CrossReviewUsage,
-) -> Result<Value> {
+) -> std::result::Result<JsonCandidates, JsonAttemptError> {
     let estimated_input = provider.estimate_tokens(&request);
     if budget.is_some_and(|budget| !budget.allows_request_input(estimated_input, estimated_input)) {
-        anyhow::bail!("cross-review request exceeds the merge budget");
+        return Err(JsonAttemptError::Terminal(anyhow::anyhow!(
+            "cross-review request exceeds the merge budget"
+        )));
     }
-    let response = provider.generate_content(request).await?;
+    let response = provider
+        .generate_content(request)
+        .await
+        .map_err(JsonAttemptError::Terminal)?;
     if let Some(response_usage) = &response.usage {
         usage.tokens_in = usage.tokens_in.saturating_add(response_usage.prompt_tokens);
         usage.tokens_out = usage
@@ -682,23 +742,38 @@ async fn request_json_once(
                 response_usage.prompt_tokens,
                 response_usage.completion_tokens,
             ) {
-                anyhow::bail!("cross-review response exceeds the merge budget");
+                return Err(JsonAttemptError::Terminal(anyhow::anyhow!(
+                    "cross-review response exceeds the merge budget"
+                )));
             }
         }
     }
     let content = response
         .content
         .as_deref()
-        .context("empty model response")?;
-    if let Ok(value) = serde_json::from_str(&crate::utils::clean_json_string(content)) {
-        return Ok(value);
-    }
+        .ok_or_else(|| JsonAttemptError::Invalid(anyhow::anyhow!("empty model response")))?;
+    let direct = serde_json::from_str(&crate::utils::clean_json_string(content));
+    let salvage_reason = match direct {
+        Ok(value) => {
+            return Ok(JsonCandidates {
+                values: vec![value],
+                salvage_detail: None,
+            });
+        }
+        Err(error) => error.to_string(),
+    };
     // Fall back to the salvage the review stages use, so a reply wrapped in prose
     // or code fences still yields its JSON object.
-    crate::worker::stage::find_json_candidates(content)
-        .into_iter()
-        .next_back()
-        .context("model response contained no JSON object")
+    let values = crate::worker::stage::find_json_candidates(content);
+    if values.is_empty() {
+        return Err(JsonAttemptError::Invalid(anyhow::anyhow!(
+            "model response contained no JSON object: {salvage_reason}"
+        )));
+    }
+    Ok(JsonCandidates {
+        values,
+        salvage_detail: Some(salvage_reason),
+    })
 }
 
 fn parse_remote_response(payload: Value, source: &str) -> PollResult {
@@ -1177,6 +1252,8 @@ mod tests {
 
     #[tokio::test]
     async fn cross_review_salvages_prose_wrapped_json() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         let remote = single_remote_finding();
         // Both steps answer with fenced JSON preceded by commentary.
         let provider = RawTextProvider {
@@ -1195,10 +1272,13 @@ mod tests {
         assert_eq!(analysis.accepted_remote.len(), 1);
         // Salvage means no retry was needed.
         assert_eq!(provider.prompts.lock().await.len(), 2);
+        crate::json_health::drain();
     }
 
     #[tokio::test]
     async fn cross_review_retry_restates_the_schema() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         let remote = single_remote_finding();
         let provider = RawTextProvider {
             responses: Mutex::new(VecDeque::from([
@@ -1223,6 +1303,81 @@ mod tests {
         assert!(prompts[1].contains("could not be used"));
         assert!(prompts[1].contains("\"remote-new\""));
         assert!(prompts[1].contains("additionalProperties"));
+        drop(prompts);
+        crate::json_health::drain();
+    }
+
+    #[tokio::test]
+    async fn cross_review_selects_the_candidate_that_matches_the_schema() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
+        let remote = single_remote_finding();
+        let provider = RawTextProvider {
+            responses: Mutex::new(VecDeque::from([
+                "{\"remote-new\": null}\nTrailing metadata: {\"note\": \"done\"}".to_string(),
+                json!({"remote-new": true}).to_string(),
+            ])),
+            prompts: Mutex::new(Vec::new()),
+        };
+
+        let mut usage = CrossReviewUsage::default();
+        let analysis = analyze_remote_result(&provider, "patch", &[], &remote, None, &mut usage)
+            .await
+            .unwrap();
+
+        assert_eq!(analysis.accepted_remote.len(), 1);
+        assert_eq!(provider.prompts.lock().await.len(), 2);
+        crate::json_health::drain();
+    }
+
+    #[tokio::test]
+    async fn cross_review_does_not_retry_or_record_provider_errors() {
+        struct FailingProvider {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl AiProvider for FailingProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("provider unavailable")
+            }
+
+            fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+                0
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "failing-provider".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
+        let remote = single_remote_finding();
+        let provider = FailingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut usage = CrossReviewUsage::default();
+
+        assert!(
+            analyze_remote_result(&provider, "patch", &[], &remote, None, &mut usage)
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::json_health::drain().is_empty());
+    }
+
+    #[test]
+    fn deduplication_schema_uses_gemini_compatible_nullable_values() {
+        let schema = id_map_schema(&["finding"], json!({"type": "string", "nullable": true}));
+
+        assert_eq!(schema["properties"]["finding"]["type"], "string");
+        assert_eq!(schema["properties"]["finding"]["nullable"], true);
     }
 
     #[tokio::test]

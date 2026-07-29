@@ -425,3 +425,13 @@ CREATE TABLE IF NOT EXISTS patchwork_outbox (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
+
+CREATE TABLE IF NOT EXISTS json_decode_events (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER,
+    source TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_json_decode_events_day ON json_decode_events(created_at);

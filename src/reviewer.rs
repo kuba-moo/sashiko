@@ -487,6 +487,15 @@ impl Reviewer {
             .await;
             usage.budget_flags |= merge_budget.flags();
             total_usage.add(usage);
+            // Cross-review runs in-process, so decode failures are persisted per
+            // attempt rather than travelling through a result payload.
+            let decode_events = crate::json_health::drain();
+            if !decode_events.is_empty() {
+                let now = chrono::Utc::now().timestamp();
+                if let Err(error) = db.save_json_decode_events(None, &decode_events, now).await {
+                    warn!("Failed to save JSON decode events: {}", error);
+                }
+            }
 
             let result = match result {
                 Ok(analysis) => {
@@ -1746,6 +1755,19 @@ impl Reviewer {
                                         ctx.db.save_review_merge_run(review_id, usage).await
                                 {
                                     error!("Failed to save merge usage: {}", error);
+                                }
+                                if let Some(events) = review_content.get("json_decode_events") {
+                                    let events = crate::json_health::from_json(events);
+                                    if !events.is_empty() {
+                                        let now = chrono::Utc::now().timestamp();
+                                        if let Err(error) = ctx
+                                            .db
+                                            .save_json_decode_events(Some(review_id), &events, now)
+                                            .await
+                                        {
+                                            error!("Failed to save JSON decode events: {}", error);
+                                        }
+                                    }
                                 }
 
                                 let mut db_success = true;
@@ -3175,6 +3197,8 @@ mod tests {
 
     #[tokio::test]
     async fn cross_review_integration_stops_after_three_immediate_attempts() -> Result<()> {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         let db = Arc::new(Database::new(&settings.database).await?);

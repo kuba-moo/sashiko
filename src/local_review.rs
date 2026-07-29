@@ -762,6 +762,7 @@ async fn review_single_patch(
                 return Ok(json!({
                     "patch_index": p.index,
                     "review": result.output,
+                    "json_decode_events": crate::json_health::drain_to_json(),
                     "error": result.error,
                     "inline_review": inline_content,
                     "input_context": result.input_context,
@@ -794,6 +795,7 @@ async fn review_single_patch(
                     return Ok(json!({
                         "patch_index": p.index,
                         "review": null,
+                        "json_decode_events": crate::json_health::drain_to_json(),
                         "error": format_error_for_transport(&e),
                         "inline_review": null,
                         "input_context": "",
@@ -878,6 +880,7 @@ struct PrivateReviewMetadata {
     canonical_candidates: Vec<Value>,
     model_experiment: Option<Value>,
     merge_usage: MergeUsageTotals,
+    json_decode_events: Vec<Value>,
     errors: Vec<String>,
 }
 
@@ -889,6 +892,7 @@ fn collect_private_review_metadata(
         canonical_candidates: Vec::new(),
         model_experiment: None,
         merge_usage: MergeUsageTotals::default(),
+        json_decode_events: Vec::new(),
         errors: Vec::new(),
     };
     for result in results {
@@ -920,6 +924,13 @@ fn collect_private_review_metadata(
         {
             metadata.merge_usage.add_json(usage);
         }
+        metadata.json_decode_events.extend(
+            result["json_decode_events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
         if let Some(error) = result.get("error").and_then(Value::as_str) {
             metadata.errors.push(error.to_string());
         }
@@ -1324,6 +1335,7 @@ async fn run_worker_in_worktree(
         ,"budget_flags": budget_flags,
         "canonical_candidates": private_metadata.canonical_candidates,
         "merge_usage": private_metadata.merge_usage.to_json(),
+        "json_decode_events": private_metadata.json_decode_events,
         "model_experiment": private_metadata.model_experiment,
         "dedup_stats": {
             "total_concerns": total_concerns_count,
@@ -1594,7 +1606,12 @@ mod tests {
                         "tokens_cached": 3,
                         "budget_flags": 2
                     }
-                }
+                },
+                "json_decode_events": [{
+                    "source": "stage:10",
+                    "outcome": "salvaged",
+                    "detail": "trailing prose"
+                }]
             }),
             json!({
                 "patch_index": 3,
@@ -1605,7 +1622,12 @@ mod tests {
                     "tokens_out": 2,
                     "tokens_cached": 1,
                     "budget_flags": 4
-                }
+                },
+                "json_decode_events": [{
+                    "source": "confirmation",
+                    "outcome": "fatal",
+                    "detail": "no object"
+                }]
             }),
         ];
 
@@ -1619,6 +1641,9 @@ mod tests {
         assert_eq!(metadata.merge_usage.tokens_in, 15);
         assert_eq!(metadata.merge_usage.tokens_cached, 4);
         assert_eq!(metadata.merge_usage.budget_flags, 6);
+        assert_eq!(metadata.json_decode_events.len(), 2);
+        assert_eq!(metadata.json_decode_events[0]["source"], "stage:10");
+        assert_eq!(metadata.json_decode_events[1]["source"], "confirmation");
         assert_eq!(metadata.errors, ["merge failed"]);
     }
 

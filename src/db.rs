@@ -567,6 +567,8 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS local_canonical_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, finding_id TEXT NOT NULL, finding_json TEXT NOT NULL, accepted INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id), UNIQUE(review_id, finding_id))",
             "CREATE INDEX IF NOT EXISTS idx_local_canonical_findings_review ON local_canonical_findings(review_id)",
             "CREATE TABLE IF NOT EXISTS review_merge_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL UNIQUE, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE TABLE IF NOT EXISTS json_decode_events (id INTEGER PRIMARY KEY, review_id INTEGER, source TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_json_decode_events_day ON json_decode_events(created_at)",
         ] {
             let _ = self.conn.execute(sql, ()).await;
         }
@@ -1538,6 +1540,89 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    /// Persists JSON decode failures so silent malformed replies stay visible.
+    /// `review_id` is None for work that runs outside a review (cross-review).
+    pub async fn save_json_decode_events(
+        &self,
+        review_id: Option<i64>,
+        events: &[crate::json_health::JsonDecodeEvent],
+        now: i64,
+    ) -> Result<()> {
+        for event in events {
+            self.conn
+                .execute(
+                    "INSERT INTO json_decode_events
+                     (review_id, source, outcome, detail, created_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                    libsql::params![
+                        review_id,
+                        event.source.as_str(),
+                        event.outcome.as_str(),
+                        event.detail.as_str(),
+                        now,
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Daily JSON decode failures by source and outcome over the trailing two
+    /// weeks, plus a per-source roll-up for the summary table.
+    pub async fn get_json_decode_stats(&self) -> Result<serde_json::Value> {
+        let mut daily = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch') AS day,
+                        source, outcome, count(*)
+                 FROM json_decode_events
+                 WHERE created_at >= unixepoch('now', '-13 days', 'start of day')
+                 GROUP BY day, source, outcome
+                 ORDER BY day, source, outcome",
+                (),
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            daily.push(json!({
+                "day": row.get::<String>(0)?,
+                "source": row.get::<String>(1)?,
+                "outcome": row.get::<String>(2)?,
+                "count": row.get::<i64>(3)?,
+            }));
+        }
+        drop(rows);
+
+        let mut by_source = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT source,
+                        sum(CASE WHEN outcome = 'salvaged' THEN 1 ELSE 0 END),
+                        sum(CASE WHEN outcome = 'recovered_on_retry' THEN 1 ELSE 0 END),
+                        sum(CASE WHEN outcome = 'fatal' THEN 1 ELSE 0 END),
+                        count(*),
+                        max(detail)
+                 FROM json_decode_events
+                 WHERE created_at >= unixepoch('now', '-13 days', 'start of day')
+                 GROUP BY source
+                 ORDER BY sum(CASE WHEN outcome = 'fatal' THEN 1 ELSE 0 END) DESC, count(*) DESC",
+                (),
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            by_source.push(json!({
+                "source": row.get::<String>(0)?,
+                "salvaged": row.get::<i64>(1).unwrap_or(0),
+                "recovered_on_retry": row.get::<i64>(2).unwrap_or(0),
+                "fatal": row.get::<i64>(3).unwrap_or(0),
+                "total": row.get::<i64>(4).unwrap_or(0),
+                "sample_detail": row.get::<String>(5).unwrap_or_default(),
+            }));
+        }
+        Ok(json!({"daily": daily, "by_source": by_source}))
     }
 
     pub async fn load_cross_review_inputs(
@@ -9329,6 +9414,82 @@ mod tests {
         assert_eq!(cross_review["tokens_in"], 30);
         assert_eq!(cross_review["tokens_out"], 3);
         assert_eq!(cross_review["tokens_cached"], 2);
+    }
+
+    #[tokio::test]
+    async fn json_decode_stats_group_by_source_and_outcome() {
+        use crate::json_health::{JsonDecodeEvent, JsonDecodeOutcome};
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("decode.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let event = |source: &str, outcome: JsonDecodeOutcome, detail: &str| JsonDecodeEvent {
+            source: source.to_string(),
+            outcome,
+            detail: detail.to_string(),
+        };
+        db.save_json_decode_events(
+            Some(1),
+            &[
+                event("stage:10", JsonDecodeOutcome::Salvaged, "trailing comma"),
+                event("stage:10", JsonDecodeOutcome::Fatal, "expected value"),
+                event("confirmation", JsonDecodeOutcome::Fatal, "no object"),
+                event("confirmation", JsonDecodeOutcome::Fatal, "no object"),
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+        // Cross-review has no review to attribute to.
+        db.save_json_decode_events(
+            None,
+            &[event(
+                "cross-review:dedup",
+                JsonDecodeOutcome::RecoveredOnRetry,
+                "unterminated",
+            )],
+            now,
+        )
+        .await
+        .unwrap();
+        // Outside the 14-day window, so it must not appear.
+        db.save_json_decode_events(
+            None,
+            &[event("stage:3", JsonDecodeOutcome::Fatal, "ancient")],
+            now - 60 * 60 * 24 * 30,
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_json_decode_stats().await.unwrap();
+        let by_source = stats["by_source"].as_array().unwrap();
+        assert!(by_source.iter().all(|row| row["source"] != "stage:3"));
+
+        let find = |source: &str| {
+            by_source
+                .iter()
+                .find(|row| row["source"] == source)
+                .unwrap_or_else(|| panic!("missing {source}"))
+                .clone()
+        };
+        // Ordered by fatal count, so confirmation leads.
+        assert_eq!(by_source[0]["source"], "confirmation");
+        assert_eq!(find("confirmation")["fatal"], 2);
+        assert_eq!(find("stage:10")["salvaged"], 1);
+        assert_eq!(find("stage:10")["fatal"], 1);
+        assert_eq!(find("stage:10")["total"], 2);
+        assert_eq!(find("cross-review:dedup")["recovered_on_retry"], 1);
+
+        let daily = stats["daily"].as_array().unwrap();
+        assert!(daily.iter().all(|row| row["source"] != "stage:3"));
+        assert!(daily.iter().any(|row| row["source"] == "stage:10"
+            && row["outcome"] == "salvaged"
+            && row["count"] == 1));
     }
 
     #[tokio::test]

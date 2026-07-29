@@ -3602,18 +3602,19 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 if (!state.statsData) {
-                    const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews] = await Promise.all([
+                    const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode] = await Promise.all([
                         apiFetch('api/stats/timeline').then(r => r.json()),
                         apiFetch('api/stats/reviews').then(r => r.json()),
                         apiFetch('api/stats/tools').then(r => r.json()),
                         apiFetch('api/stats/cost').then(r => r.json()),
                         apiFetch('api/stats/model-experiments').then(r => r.json()),
-                        apiFetch('api/stats/cross-reviews').then(r => r.json())
+                        apiFetch('api/stats/cross-reviews').then(r => r.json()),
+                        apiFetch('api/stats/json-decode').then(r => r.json())
                     ]);
-                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews };
+                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode };
                 }
 
-                const { timeline, reviewsData, tools, cost, modelExperiments, crossReviews } = state.statsData;
+                const { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode } = state.statsData;
                 const reviews = reviewsData.reviews;
                 const historicalTotal = reviewsData.total_reviews;
                 const historicalFailed = reviewsData.total_failures;
@@ -3744,14 +3745,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     if (health.length) {
                         const byModel = new Map();
                         health.forEach(row => {
-                            const entry = byModel.get(row.model) ||
-                                { total: 0, failed: 0, error: '' };
+                            const key = [row.model, row.provider, row.model_id].join('\0');
+                            const identity = (row.model_id || 'unknown') + ' (' +
+                                (row.provider || 'unknown') + ', ' + (row.model || 'unknown') + ')';
+                            const entry = byModel.get(key) ||
+                                { identity, total: 0, failed: 0, error: '' };
                             entry.total += row.count || 0;
                             if (row.status !== 'completed') {
                                 entry.failed += row.count || 0;
                                 if (!entry.error && row.sample_error) entry.error = row.sample_error;
                             }
-                            byModel.set(row.model, entry);
+                            byModel.set(key, entry);
                         });
                         const totals = [...byModel.values()].reduce((acc, entry) => ({
                             total: acc.total + entry.total, failed: acc.failed + entry.failed
@@ -3766,10 +3770,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             (totals.total ? ' (' + (totals.failed / totals.total * 100).toFixed(0) + '%)' : ''));
                         html += '</div>';
                         html += '<table style="font-size:0.9em;"><thead><tr><th>Confirmer</th><th>Runs</th>' +
-                            '<th>Failed</th><th>Failure rate</th><th>Last error</th></tr></thead><tbody>';
-                        [...byModel.entries()].sort((a, b) => b[1].failed - a[1].failed).forEach(([model, entry]) => {
+                            '<th>Failed</th><th>Failure rate</th><th>Sample error</th></tr></thead><tbody>';
+                        [...byModel.values()].sort((a, b) => b.failed - a.failed).forEach(entry => {
                             const rate = entry.total ? (entry.failed / entry.total * 100).toFixed(0) + '%' : '-';
-                            html += '<tr><td>' + escapeHtml(model) + '</td><td>' + entry.total + '</td><td>' +
+                            html += '<tr><td>' + escapeHtml(entry.identity) + '</td><td>' + entry.total + '</td><td>' +
                                 entry.failed + '</td><td>' + rate + '</td><td>' +
                                 escapeHtml(entry.error ? entry.error.slice(0, 120) : '') + '</td></tr>';
                         });
@@ -3797,6 +3801,39 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         html += '<div class="chart-section"><div id="chart-cross-pair-' + index +
                             '" style="width:100%; height:250px;"></div></div>';
                     });
+                }
+
+                const decodeDaily = (jsonDecode && jsonDecode.daily) || [];
+                const decodeBySource = (jsonDecode && jsonDecode.by_source) || [];
+                html += '<h2>JSON Decode Failures (last 14 days)</h2>';
+                if (decodeDaily.length) {
+                    const decodeTotals = decodeBySource.reduce((acc, row) => ({
+                        salvaged: acc.salvaged + (row.salvaged || 0),
+                        recovered: acc.recovered + (row.recovered_on_retry || 0),
+                        fatal: acc.fatal + (row.fatal || 0)
+                    }), { salvaged: 0, recovered: 0, fatal: 0 });
+                    html += '<p style="opacity:0.8; font-size:0.9em;">Replies the models returned that were not' +
+                        ' decodable as the requested JSON. Salvaged means an embedded object was recovered without' +
+                        ' another call; recovered on retry means restating the schema worked; fatal means the request' +
+                        ' was abandoned and its result silently lost.</p>';
+                    html += '<div class="stat-card-grid">';
+                    html += renderStatCard('Salvaged', decodeTotals.salvaged);
+                    html += renderStatCard('Recovered on retry', decodeTotals.recovered);
+                    html += renderStatCard('Fatal', decodeTotals.fatal);
+                    html += '</div>';
+                    html += '<div class="chart-section"><div id="chart-json-decode" style="width:100%; height:320px;"></div></div>';
+                    html += '<table style="font-size:0.9em;"><thead><tr><th>Source</th><th>Salvaged</th>' +
+                        '<th>Recovered on retry</th><th>Fatal</th><th>Total</th><th>Sample error</th>' +
+                        '</tr></thead><tbody>';
+                    decodeBySource.forEach(row => {
+                        html += '<tr><td>' + escapeHtml(row.source) + '</td><td>' + (row.salvaged || 0) +
+                            '</td><td>' + (row.recovered_on_retry || 0) + '</td><td>' + (row.fatal || 0) +
+                            '</td><td>' + (row.total || 0) + '</td><td>' +
+                            escapeHtml((row.sample_detail || '').slice(0, 120)) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                } else {
+                    html += '<p class="loading">No JSON decode failures recorded.</p>';
                 }
 
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
@@ -3995,6 +4032,52 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     state.activeCharts.push(chart);
                 } else {
                      document.getElementById('chart-review-outcomes').innerHTML = '<p class="loading">No review history available.</p>';
+                }
+
+                // --- 2.7 JSON decode failures, stacked by source per day ---
+                if (decodeDaily.length) {
+                    const decodeDays = [...new Set(decodeDaily.map(row => row.day))].sort();
+                    // Order sources by volume so the biggest offender reads first.
+                    const decodeSources = decodeBySource.length
+                        ? decodeBySource.map(row => row.source)
+                        : [...new Set(decodeDaily.map(row => row.source))].sort();
+                    // Fatal failures lose data outright, so keep them visually distinct
+                    // from the recoverable outcomes via opacity per outcome.
+                    const outcomeOpacity = { fatal: 1, recovered_on_retry: 0.65, salvaged: 0.35 };
+                    const decodePalette = ['#5470c6', '#91cc75', '#fac858', '#ee6666',
+                        '#73c0de', '#3ba272', '#fc8452', '#9a60b4'];
+                    const series = [];
+                    decodeSources.forEach((source, sourceIndex) => {
+                        ['fatal', 'recovered_on_retry', 'salvaged'].forEach(outcome => {
+                            const data = decodeDays.map(day => {
+                                const row = decodeDaily.find(item => item.day === day &&
+                                    item.source === source && item.outcome === outcome);
+                                return row ? row.count : 0;
+                            });
+                            if (!data.some(value => value > 0)) return;
+                            series.push({
+                                name: source + ' · ' + outcome.replace(/_/g, ' '),
+                                type: 'bar',
+                                stack: 'decode',
+                                itemStyle: {
+                                    color: decodePalette[sourceIndex % decodePalette.length],
+                                    opacity: outcomeOpacity[outcome]
+                                },
+                                data
+                            });
+                        });
+                    });
+                    const chart = echarts.init(document.getElementById('chart-json-decode'), isDark ? 'dark' : null);
+                    chart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                        legend: { type: 'scroll', bottom: 0, textStyle: { fontSize: 10 } },
+                        grid: { left: '3%', right: '4%', bottom: '22%', top: '8%', containLabel: true },
+                        xAxis: { type: 'category', data: decodeDays },
+                        yAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
+                        series
+                    });
+                    state.activeCharts.push(chart);
                 }
 
                 // --- 3. Tool Usage Chart ---

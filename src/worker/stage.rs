@@ -60,7 +60,7 @@ macro_rules! define_standard_stage {
                 !((3..=6).contains(&$num))
             }
             fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-                validate_stages_1_to_7(response)
+                validate_stages_1_to_7(response, $num)
             }
             fn format_validation_feedback(&self, violation: &str) -> String {
                 format_validation_feedback_stages_1_to_8(violation)
@@ -86,7 +86,7 @@ impl ReviewStage for Stage8 {
         "Deduplication and Consolidation"
     }
     fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-        let parsed = parse_json_response(response)?;
+        let parsed = parse_json_response(response, 8)?;
         if let Some(c) = parsed.get("concerns") {
             if !c.is_array() {
                 return Err(ValidationError::FormatViolation(
@@ -127,7 +127,7 @@ impl ReviewStage for Stage9 {
         "Concern/dismissed-concern conflict resolution"
     }
     fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-        let parsed = parse_json_response(response)?;
+        let parsed = parse_json_response(response, 9)?;
         if let Some(c) = parsed.get("concerns") {
             if !c.is_array() {
                 return Err(ValidationError::FormatViolation(
@@ -160,7 +160,7 @@ impl ReviewStage for Stage10 {
         "Verification and severity estimation"
     }
     fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-        let parsed = parse_json_response(response)?;
+        let parsed = parse_json_response(response, 10)?;
         if let Some(f) = parsed.get("findings") {
             if !f.is_array() {
                 return Err(ValidationError::FormatViolation(
@@ -256,8 +256,8 @@ pub fn create_stage(stage: u8) -> Box<dyn ReviewStage> {
 
 // Helper functions moved from prompts.rs
 
-fn validate_stages_1_to_7(response: &AiResponse) -> Result<Value, ValidationError> {
-    let parsed = parse_json_response(response)?;
+fn validate_stages_1_to_7(response: &AiResponse, stage: u8) -> Result<Value, ValidationError> {
+    let parsed = parse_json_response(response, stage)?;
     match required_stage_arrays(&parsed) {
         Ok(_) => Ok(parsed),
         Err(violation) => Err(ValidationError::FormatViolation(violation)),
@@ -356,14 +356,48 @@ fn validate_model_provenance(value: &Value, item_name: &str) -> Result<(), Valid
     Ok(())
 }
 
-fn parse_json_response(response: &AiResponse) -> Result<serde_json::Value, ValidationError> {
+fn parse_json_response(
+    response: &AiResponse,
+    stage: u8,
+) -> Result<serde_json::Value, ValidationError> {
     let raw_text = response.content.as_deref().unwrap_or("");
     let cleaned = crate::utils::clean_json_string(raw_text);
-    let parsed: serde_json::Value = serde_json::from_str(&cleaned).unwrap_or_else(|_| {
-        let cands = find_json_candidates(raw_text);
-        cands.into_iter().last().unwrap_or(serde_json::json!({}))
-    });
+    let parsed: serde_json::Value = match serde_json::from_str(&cleaned) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // A reply that only parses after salvage still signals a model that
+            // is drifting from the contract, so record it either way.
+            let source = crate::json_health::stage_source(stage);
+            match find_json_candidates(raw_text).into_iter().next_back() {
+                Some(candidate) => {
+                    crate::json_health::record(
+                        source,
+                        crate::json_health::JsonDecodeOutcome::Salvaged,
+                        &error.to_string(),
+                    );
+                    candidate
+                }
+                None => {
+                    // Returning {} here lets the caller's field checks produce a
+                    // FormatViolation, which drives the schema-restating retry.
+                    serde_json::json!({})
+                }
+            }
+        }
+    };
     Ok(parsed)
+}
+
+/// Returns the parse error when a response contains no recoverable JSON object.
+/// The session owns final outcome classification because validation may retry.
+pub(crate) fn unrecoverable_json_error(response: &AiResponse) -> Option<String> {
+    let raw_text = response.content.as_deref().unwrap_or("");
+    let cleaned = crate::utils::clean_json_string(raw_text);
+    match serde_json::from_str::<Value>(&cleaned) {
+        Ok(_) => None,
+        Err(error) if find_json_candidates(raw_text).is_empty() => Some(error.to_string()),
+        Err(_) => None,
+    }
 }
 
 /// Recovers embedded JSON objects from prose- or fence-wrapped model output.
@@ -422,7 +456,67 @@ fn find_matching_brace(chars: &[char], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json_health::{self, JsonDecodeOutcome};
     use serde_json::json;
+
+    fn response(content: &str) -> AiResponse {
+        AiResponse {
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            reasoning: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    // The recorder is process-global; serialize the tests that read it.
+    #[test]
+    fn stage_salvage_is_recorded_against_its_stage() {
+        let _guard = json_health::TEST_GUARD.blocking_lock();
+        json_health::drain();
+
+        // Fenced JSON only parses via salvage.
+        let parsed = parse_json_response(
+            &response("```json\n{\"concerns\": [], \"dismissed_concerns\": []}\n```"),
+            8,
+        )
+        .unwrap();
+        assert!(parsed["concerns"].is_array());
+
+        let events = json_health::drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, "stage:8");
+        assert_eq!(events[0].outcome, JsonDecodeOutcome::Salvaged);
+    }
+
+    #[test]
+    fn unrecoverable_stage_output_is_deferred_to_the_session() {
+        let _guard = json_health::TEST_GUARD.blocking_lock();
+        json_health::drain();
+
+        let parsed = parse_json_response(&response("I cannot answer that."), 10).unwrap();
+        // An empty object lets the caller's field checks drive the retry.
+        assert_eq!(parsed, json!({}));
+
+        assert!(json_health::drain().is_empty());
+        assert!(unrecoverable_json_error(&response("I cannot answer that.")).is_some());
+    }
+
+    #[test]
+    fn clean_stage_output_records_nothing() {
+        let _guard = json_health::TEST_GUARD.blocking_lock();
+        json_health::drain();
+
+        parse_json_response(
+            &response("{\"concerns\": [], \"dismissed_concerns\": []}"),
+            3,
+        )
+        .unwrap();
+
+        assert!(json_health::drain().is_empty());
+    }
 
     #[test]
     fn test_required_stage_arrays_accepts_empty_arrays() {

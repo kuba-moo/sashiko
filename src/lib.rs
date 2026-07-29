@@ -25,6 +25,7 @@ pub mod fetcher;
 pub mod forge;
 pub mod git_ops;
 pub mod ingestor;
+pub mod json_health;
 pub mod local_review;
 pub mod nntp;
 pub mod patch;

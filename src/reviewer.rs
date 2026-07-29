@@ -31,12 +31,14 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
 
 #[derive(Clone)]
@@ -54,6 +56,50 @@ struct ReviewContext {
 enum PatchResult {
     Success,
     ReviewFailed,
+}
+
+#[derive(Default)]
+struct ReviewTasks {
+    tasks: JoinSet<()>,
+}
+
+impl ReviewTasks {
+    fn spawn_unless_shutdown<F>(&mut self, shutdown: &watch::Receiver<bool>, task: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Holding the watch borrow through spawn prevents the sender from
+        // publishing shutdown between the check and task registration.
+        let shutdown_requested = shutdown.borrow();
+        if *shutdown_requested {
+            return false;
+        }
+
+        self.tasks.spawn(task);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn reap_finished(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            Self::log_result(result);
+        }
+    }
+
+    async fn join_next(&mut self) {
+        if let Some(result) = self.tasks.join_next().await {
+            Self::log_result(result);
+        }
+    }
+
+    fn log_result(result: std::result::Result<(), JoinError>) {
+        if let Err(error) = result {
+            error!("Patchset review task failed: {}", error);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -162,6 +208,13 @@ impl Reviewer {
     /// This method runs indefinitely, polling the database for pending patchsets
     /// and processing them. It handles concurrency limits and worktree cleanup.
     pub async fn start(&self) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        self.start_until_shutdown(shutdown_rx).await;
+        drop(shutdown_tx);
+    }
+
+    /// Starts the reviewer service loop with a graceful shutdown signal.
+    pub async fn start_until_shutdown(&self, mut shutdown: watch::Receiver<bool>) {
         info!(
             "Starting Reviewer service with concurrency limit: {}",
             self.settings.review.concurrency
@@ -197,10 +250,17 @@ impl Reviewer {
             Err(e) => error!("Failed to reset reviewing status: {}", e),
         }
 
+        let mut review_tasks = ReviewTasks::default();
+
         loop {
-            match self.process_pending_patchsets().await {
-                Ok(_) => {}
-                Err(e) => error!("Error in reviewer loop: {}", e),
+            review_tasks.reap_finished();
+
+            if !*shutdown.borrow()
+                && let Err(e) = self
+                    .process_pending_patchsets(&mut shutdown, &mut review_tasks)
+                    .await
+            {
+                error!("Error in reviewer loop: {}", e);
             }
 
             if let Err(e) = self.release_embargoed_results().await {
@@ -211,11 +271,80 @@ impl Reviewer {
                 error!("Error processing cross-instance reviews: {}", e);
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            review_tasks.reap_finished();
+            if *shutdown.borrow() && review_tasks.is_empty() {
+                info!("All in-progress reviews completed; reviewer service stopped");
+                return;
+            }
+
+            Self::wait_for_next_iteration(&mut shutdown, &mut review_tasks).await;
         }
     }
 
-    async fn process_pending_patchsets(&self) -> Result<()> {
+    async fn wait_for_next_iteration(
+        shutdown: &mut watch::Receiver<bool>,
+        review_tasks: &mut ReviewTasks,
+    ) {
+        let sleep = tokio::time::sleep(tokio::time::Duration::from_secs(10));
+        tokio::pin!(sleep);
+
+        if review_tasks.is_empty() {
+            tokio::select! {
+                _ = shutdown.changed() => {}
+                _ = &mut sleep => {}
+            }
+        } else {
+            tokio::select! {
+                _ = shutdown.changed() => {}
+                _ = review_tasks.join_next() => {}
+                _ = &mut sleep => {}
+            }
+        }
+    }
+
+    async fn acquire_review_permit(
+        semaphore: Arc<Semaphore>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<Option<OwnedSemaphorePermit>> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(None);
+            }
+
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(None);
+                    }
+                }
+                permit = semaphore.clone().acquire_owned() => {
+                    return permit.map(Some).map_err(Into::into);
+                }
+            }
+        }
+    }
+
+    fn claim_patch_unless_shutdown<T>(
+        jobs: &mut Vec<T>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Option<T> {
+        // Holding the watch borrow through pop makes claiming a patch atomic
+        // with respect to publishing the shutdown signal. A patch claimed
+        // first is in progress and will drain; otherwise it remains queued.
+        let shutdown_requested = shutdown.borrow();
+        if *shutdown_requested {
+            None
+        } else {
+            jobs.pop()
+        }
+    }
+
+    async fn process_pending_patchsets(
+        &self,
+        shutdown: &mut watch::Receiver<bool>,
+        review_tasks: &mut ReviewTasks,
+    ) -> Result<()> {
         let patchsets = self.db.get_pending_patchsets(10).await?;
 
         if patchsets.is_empty() {
@@ -225,7 +354,11 @@ impl Reviewer {
         info!("Found {} pending patchsets for review", patchsets.len());
 
         for patchset in patchsets {
-            let permit = self.semaphore.clone().acquire_owned().await?;
+            let Some(permit) =
+                Self::acquire_review_permit(self.semaphore.clone(), shutdown).await?
+            else {
+                break;
+            };
             let target_review_count = patchset.target_review_count.unwrap_or(1) as usize;
 
             let context = ReviewContext {
@@ -238,11 +371,16 @@ impl Reviewer {
                 target_review_count,
                 provider: self.provider.clone(),
             };
+            let task_shutdown = shutdown.clone();
 
-            tokio::spawn(async move {
+            let task = async move {
                 let _permit = permit;
-                Self::review_patchset_task(context, patchset).await;
-            });
+                Self::review_patchset_task(context, patchset, task_shutdown).await;
+            };
+
+            if !review_tasks.spawn_unless_shutdown(shutdown, task) {
+                break;
+            }
         }
 
         Ok(())
@@ -504,7 +642,11 @@ impl Reviewer {
         Ok(())
     }
 
-    async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
+    async fn review_patchset_task(
+        ctx: ReviewContext,
+        patchset: PatchsetRow,
+        shutdown: watch::Receiver<bool>,
+    ) {
         let patchset_id = patchset.id;
         info!("Starting review for patchset {}", patchset_id);
 
@@ -779,13 +921,14 @@ impl Reviewer {
                     let baseline_id_clone = baseline_id;
                     let embargo_until_clone = patchset.embargo_until;
                     let worktree_path_clone = worktree_path.clone();
+                    let shutdown_clone = shutdown.clone();
 
                     let handle = tokio::spawn(async move {
                         let mut failed = 0;
                         loop {
                             let job = {
                                 let mut q = queue.lock().await;
-                                q.pop()
+                                Self::claim_patch_unless_shutdown(&mut q, &shutdown_clone)
                             };
                             if let Some(job) = job {
                                 match Self::process_patch_review(
@@ -832,7 +975,7 @@ impl Reviewer {
             loop {
                 let job = {
                     let mut q = valid_jobs_queue.lock().await;
-                    q.pop()
+                    Self::claim_patch_unless_shutdown(&mut q, &shutdown)
                 };
                 if let Some(job) = job {
                     match Self::process_patch_review(
@@ -866,6 +1009,8 @@ impl Reviewer {
                 }
             }
 
+            let remaining_jobs = valid_jobs_queue.lock().await.len();
+
             if failed_patches > 0 {
                 review_success = false;
             }
@@ -874,6 +1019,32 @@ impl Reviewer {
             let _ = worktree.remove().await;
 
             let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
+
+            if remaining_jobs > 0 {
+                if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
+                    info!(
+                        "Shutdown left {} patches unreviewed in cancelled patchset {}; preserving status",
+                        remaining_jobs, patchset_id
+                    );
+                } else {
+                    info!(
+                        "Shutdown left {} patches unreviewed in patchset {}; returning it to Pending",
+                        remaining_jobs, patchset_id
+                    );
+                    if let Err(error) = ctx
+                        .db
+                        .update_patchset_status(patchset_id, ReviewStatus::Pending.as_str())
+                        .await
+                    {
+                        error!(
+                            "Failed to return interrupted patchset {} to Pending: {}",
+                            patchset_id, error
+                        );
+                    }
+                }
+                return;
+            }
+
             if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
                 info!(
                     "Patchset {} was cancelled during review, preserving status",
@@ -2839,6 +3010,84 @@ mod tests {
         assert!(output.contains("published"));
         assert!(!output.contains("canonical_candidates"));
         assert!(!output.contains("rejected internal candidate"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_waiting_for_review_permit() {
+        let semaphore = Arc::new(Semaphore::new(0));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let waiter = tokio::spawn(async move {
+            Reviewer::acquire_review_permit(semaphore, &mut shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+
+        shutdown_tx.send(true).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("permit wait did not observe shutdown")
+            .unwrap();
+
+        assert!(permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_new_review_task() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let mut review_tasks = ReviewTasks::default();
+
+        assert!(!review_tasks.spawn_unless_shutdown(&shutdown_rx, async {
+            panic!("review task started after shutdown");
+        }));
+        assert!(review_tasks.is_empty());
+    }
+
+    #[test]
+    fn shutdown_prevents_claiming_another_patch() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut jobs = vec![1, 2];
+
+        assert_eq!(
+            Reviewer::claim_patch_unless_shutdown(&mut jobs, &shutdown_rx),
+            Some(2)
+        );
+
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(
+            Reviewer::claim_patch_unless_shutdown(&mut jobs, &shutdown_rx),
+            None
+        );
+        assert_eq!(jobs, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn review_tasks_are_tracked_until_all_complete() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let mut review_tasks = ReviewTasks::default();
+
+        assert!(
+            review_tasks.spawn_unless_shutdown(&shutdown_rx, async move {
+                let _ = first_rx.await;
+            })
+        );
+        assert!(
+            review_tasks.spawn_unless_shutdown(&shutdown_rx, async move {
+                let _ = second_rx.await;
+            })
+        );
+
+        first_tx.send(()).unwrap();
+        review_tasks.join_next().await;
+        assert!(!review_tasks.is_empty());
+
+        second_tx.send(()).unwrap();
+        review_tasks.join_next().await;
+        assert!(review_tasks.is_empty());
     }
 
     struct MockProvider;

@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -835,9 +835,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Reviewer Service
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
-    tokio::spawn(async move {
-        reviewer.start().await;
+    let reviewer_handle = tokio::spawn(async move {
+        reviewer.start_until_shutdown(shutdown_rx).await;
     });
 
     let metrics_db = db.clone();
@@ -859,15 +860,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Keep the main thread running
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    let signal = shutdown_signal().await?;
+    info!(
+        "{} received; stopping new reviews and waiting for in-progress reviews",
+        signal
+    );
+    shutdown_tx.send(true)?;
+    reviewer_handle.await?;
+    info!("Graceful shutdown complete");
 
     // Abort handles
     ingestor_handle.abort();
     parser_handle.abort();
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<&'static str, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            Ok("SIGINT")
+        }
+        _ = terminate.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<&'static str, std::io::Error> {
+    tokio::signal::ctrl_c().await?;
+    Ok("interrupt signal")
 }
 
 fn handle_init_command(

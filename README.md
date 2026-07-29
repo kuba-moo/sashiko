@@ -173,6 +173,13 @@ sashiko
 
 (Or from source: `cargo run`, or via Nix: `nix run github:sashiko-dev/sashiko`)
 
+To stop the daemon gracefully, send SIGTERM or press Ctrl-C. The daemon stops
+starting reviews for Pending patchsets and stops claiming additional patches
+from patchsets already being processed. Reviews already in progress for
+individual patches finish, interrupted patchsets return to Pending, and then
+the daemon exits. There is no built-in drain timeout; service managers may apply
+their normal forced-termination timeout if needed.
+
 #### Web Interface
 
 Once the daemon is running, you can access the Web UI. The daemon will print the URL to access it from localhost.

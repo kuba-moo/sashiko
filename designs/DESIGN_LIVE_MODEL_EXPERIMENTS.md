@@ -241,6 +241,12 @@ Comparison cost averages include only stage numbers completed successfully by
 both sources. Confirmation cost is reported separately and never folded into
 discovery cost. Unknown pricing produces a null cost rather than zero.
 
+The live comparison charts group canonical findings into outcome buckets and
+stack each bucket by severity. Each tooltip count includes its share of all
+findings at that severity across the displayed outcome buckets. Each outcome
+label includes the bucket's share of all displayed findings across critical,
+high, medium, and low severities. Empty denominators display as zero percent.
+
 ## Finding Presentation
 
 Every generated inline comment carries machine-readable finding-ID and source

@@ -2790,7 +2790,10 @@ impl Database {
             }
         }
 
-        // Attribute shared findings to every stage that contributed to them.
+        // Attribute shared findings and rejected main-model candidates to every
+        // stage that contributed to them, then normalize against main-model stage
+        // invocations. Starting from stage engagements also keeps stages with no
+        // findings visible in the chart.
         let subsystem_join = if subsystem_id.is_some() {
             "JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id"
         } else {
@@ -2802,23 +2805,75 @@ impl Database {
             ""
         };
         let sql = format!(
-            "SELECT CAST(stage.value AS INTEGER) AS stage,
-                    COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 THEN f.id END),
-                    COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) > 1 THEN f.id END)
-             FROM findings f
-             JOIN reviews r ON f.review_id = r.id
-             {}
-             JOIN json_each(
-                CASE WHEN json_valid(f.source_stages) THEN f.source_stages ELSE '[]' END
-             ) AS stage
-             WHERE r.created_at >= unixepoch('now', '-13 days', 'start of day')
-               AND json_valid(f.source_stages)
-               AND json_type(f.source_stages) = 'array'
-               AND json_array_length(f.source_stages) > 0
-               AND stage.type = 'integer'
-               {}
-             GROUP BY stage.value
-             ORDER BY stage",
+            "WITH eligible_reviews AS (
+                 SELECT DISTINCT r.id
+                 FROM reviews r
+                 {}
+                 WHERE r.created_at >= unixepoch('now', '-13 days', 'start of day')
+                   {}
+             ),
+             stage_engagements AS (
+                 SELECT mer.stage, COUNT(DISTINCT mer.review_id) AS engagements
+                 FROM model_experiment_runs mer
+                 JOIN eligible_reviews er ON er.id = mer.review_id
+                 WHERE mer.experiment_name = 'main'
+                 GROUP BY mer.stage
+             ),
+             finding_counts AS (
+                 SELECT CAST(stage.value AS INTEGER) AS stage,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 THEN f.id END) AS unique_findings,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) > 1 THEN f.id END) AS duplicate_findings,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 AND f.severity = 4 THEN f.id END) AS unique_critical,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 AND f.severity = 3 THEN f.id END) AS unique_high,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 AND f.severity = 2 THEN f.id END) AS unique_medium,
+                        COUNT(DISTINCT CASE WHEN json_array_length(f.source_stages) = 1 AND f.severity = 1 THEN f.id END) AS unique_low
+                 FROM findings f
+                 JOIN eligible_reviews er ON er.id = f.review_id
+                 JOIN json_each(
+                    CASE WHEN json_valid(f.source_stages) THEN f.source_stages ELSE '[]' END
+                 ) AS stage
+                 WHERE json_valid(f.source_stages)
+                   AND json_type(f.source_stages) = 'array'
+                   AND json_array_length(f.source_stages) > 0
+                   AND stage.type = 'integer'
+                 GROUP BY stage.value
+             ),
+             rejected_main_findings AS (
+                 SELECT lcf.id,
+                        CASE WHEN json_valid(lcf.finding_json)
+                             THEN lcf.finding_json ELSE '{{}}' END AS finding_json
+                 FROM local_canonical_findings lcf
+                 JOIN eligible_reviews er ON er.id = lcf.review_id
+                 WHERE lcf.accepted = 0
+             ),
+             hallucination_counts AS (
+                 SELECT CAST(stage.value AS INTEGER) AS stage,
+                        COUNT(DISTINCT rejected.id) AS hallucinations
+                 FROM rejected_main_findings rejected
+                 JOIN json_each(rejected.finding_json, '$.source_stages') AS stage
+                 WHERE json_type(rejected.finding_json, '$.source_stages') = 'array'
+                   AND stage.type = 'integer'
+                   AND json_type(rejected.finding_json, '$.source_models') = 'array'
+                   AND EXISTS (
+                       SELECT 1
+                       FROM json_each(rejected.finding_json, '$.source_models') AS model
+                       WHERE model.type = 'text' AND model.value = 'main'
+                   )
+                 GROUP BY stage.value
+             )
+             SELECT se.stage,
+                    COALESCE(fc.unique_findings, 0),
+                    COALESCE(fc.duplicate_findings, 0),
+                    COALESCE(hc.hallucinations, 0),
+                    se.engagements,
+                    COALESCE(fc.unique_critical, 0),
+                    COALESCE(fc.unique_high, 0),
+                    COALESCE(fc.unique_medium, 0),
+                    COALESCE(fc.unique_low, 0)
+             FROM stage_engagements se
+             LEFT JOIN finding_counts fc ON fc.stage = se.stage
+             LEFT JOIN hallucination_counts hc ON hc.stage = se.stage
+             ORDER BY se.stage",
             subsystem_join, subsystem_filter
         );
         let mut findings_by_stage = Vec::new();
@@ -2831,6 +2886,14 @@ impl Database {
                 "stage": row.get::<i64>(0)?,
                 "unique": row.get::<i64>(1)?,
                 "duplicates": row.get::<i64>(2)?,
+                "hallucinations": row.get::<i64>(3)?,
+                "engagements": row.get::<i64>(4)?,
+                "unique_by_severity": {
+                    "critical": row.get::<i64>(5)?,
+                    "high": row.get::<i64>(6)?,
+                    "medium": row.get::<i64>(7)?,
+                    "low": row.get::<i64>(8)?,
+                },
             }));
         }
 
@@ -6376,7 +6439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeline_stats_count_unique_and_duplicate_findings_by_stage() {
+    async fn timeline_stats_count_findings_and_hallucinations_by_stage() {
         let db = setup_db().await;
         db.conn
             .execute_batch(
@@ -6384,15 +6447,47 @@ mod tests {
                  INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
                  INSERT INTO reviews (id, patchset_id, created_at) VALUES
                     (1, 1, unixepoch('now')),
-                    (2, 1, unixepoch('now', '-14 days'));
+                    (2, 1, unixepoch('now', '-14 days')),
+                    (3, 1, unixepoch('now'));
                  INSERT INTO findings (review_id, severity, source_stages) VALUES
                     (1, 1, '[1]'),
+                    (1, 2, '[2]'),
+                    (1, 3, '[3]'),
+                    (1, 4, '[4]'),
                     (1, 1, '[1,2]'),
                     (1, 1, '[2,3]'),
                     (1, 1, '[3,3]'),
                     (1, 1, 'invalid'),
                     (1, 1, NULL),
-                    (2, 1, '[1]');",
+                    (2, 1, '[1]');
+                 INSERT INTO model_experiment_runs
+                    (review_id, experiment_name, stage, status) VALUES
+                    (1, 'main', 1, 'completed'),
+                    (1, 'main', 2, 'completed'),
+                    (1, 'main', 3, 'completed'),
+                    (1, 'main', 4, 'completed'),
+                    (1, 'variant', 1, 'completed'),
+                    (2, 'main', 1, 'completed'),
+                    (3, 'main', 1, 'completed'),
+                    (3, 'main', 2, 'failed');
+                 INSERT INTO local_canonical_findings
+                    (review_id, finding_id, finding_json, accepted) VALUES
+                    (1, 'main-one-stage', json_object(
+                        'source_models', json_array('main'),
+                        'source_stages', json_array(2)), 0),
+                    (1, 'main-two-stages', json_object(
+                        'source_models', json_array('main'),
+                        'source_stages', json_array(2, 4)), 0),
+                    (1, 'variant-only', json_object(
+                        'source_models', json_array('variant'),
+                        'source_stages', json_array(1)), 0),
+                    (1, 'invalid-json', 'invalid', 0),
+                    (2, 'too-old', json_object(
+                        'source_models', json_array('main'),
+                        'source_stages', json_array(1)), 0),
+                    (3, 'accepted', json_object(
+                        'source_models', json_array('main'),
+                        'source_stages', json_array(1)), 1);",
             )
             .await
             .unwrap();
@@ -6402,9 +6497,14 @@ mod tests {
         assert_eq!(
             stats["findings_by_stage"],
             json!([
-                {"stage": 1, "unique": 1, "duplicates": 1},
-                {"stage": 2, "unique": 0, "duplicates": 2},
-                {"stage": 3, "unique": 0, "duplicates": 2},
+                {"stage": 1, "unique": 1, "duplicates": 1, "hallucinations": 0, "engagements": 2,
+                 "unique_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 1}},
+                {"stage": 2, "unique": 1, "duplicates": 2, "hallucinations": 2, "engagements": 2,
+                 "unique_by_severity": {"critical": 0, "high": 0, "medium": 1, "low": 0}},
+                {"stage": 3, "unique": 1, "duplicates": 2, "hallucinations": 0, "engagements": 1,
+                 "unique_by_severity": {"critical": 0, "high": 1, "medium": 0, "low": 0}},
+                {"stage": 4, "unique": 1, "duplicates": 0, "hallucinations": 1, "engagements": 1,
+                 "unique_by_severity": {"critical": 1, "high": 0, "medium": 0, "low": 0}},
             ])
         );
     }

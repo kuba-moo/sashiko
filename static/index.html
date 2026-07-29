@@ -3657,7 +3657,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += '<h3>Review Outcomes</h3><div class="chart-section"><div id="chart-review-outcomes" class="chart-container"></div></div>';
 
                 html += '<h3>Findings Severity</h3><div class="chart-section"><div id="chart-findings" class="chart-container"></div></div>';
-                html += '<h3>Unique vs Duplicate Findings by Stage (last 14 days)</h3><div class="chart-section"><div id="chart-findings-stage" class="chart-container"></div></div>';
+                html += '<h3>Unique, Duplicate, and Hallucinated Findings per Stage Run (last 14 days)</h3><div class="chart-section"><div id="chart-findings-stage" class="chart-container"></div></div>';
+                html += '<h3>Accepted Unique Findings by Severity per Stage Run (last 14 days)</h3><div class="chart-section"><div id="chart-findings-stage-severity" class="chart-container"></div></div>';
 
                 // Calculate total tokens
                 // Exclude In Review (Pending/In Review) AND Failed To Apply
@@ -3713,7 +3714,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += renderStatCard('Cost last 30 days', '$' + cost30.toFixed(2));
                 html += '</div>';
                 html += '<h3>Daily cost by model</h3><div class="chart-section"><div id="chart-cost-daily" style="width:100%; height:300px;"></div></div>';
-                html += '<h3>Monthly LLM Token Usage by Model</h3><div class="chart-section"><div id="chart-model-usage-monthly" style="width:100%; height:300px;"></div></div>';
+                html += '<h3>Monthly LLM Cost by Model</h3><div class="chart-section"><div id="chart-model-cost-monthly" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Per-patch cost &amp; time (with vs without findings)</h3><div class="chart-section"><div id="chart-cost-perpatch" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Throughput &amp; signal</h3><div class="chart-section"><div id="chart-throughput" style="width:100%; height:300px;"></div></div>';
 
@@ -3773,18 +3774,50 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             row.main_model_id === pair.main.model &&
                             row.additional_provider_id === pair.additional.provider &&
                             row.additional_model_id === pair.additional.model);
+                        const findingCount = (outcome, severity) =>
+                            rows.find(row => row.outcome === outcome && row.severity === severity)?.count || 0;
+                        const severityTotals = Object.fromEntries(severityOrder.map(severity => [
+                            severity,
+                            outcomeOrder.reduce((total, outcome) => total + findingCount(outcome, severity), 0)
+                        ]));
+                        const outcomeTotals = Object.fromEntries(outcomeOrder.map(outcome => [
+                            outcome,
+                            severityOrder.reduce((total, severity) => total + findingCount(outcome, severity), 0)
+                        ]));
+                        const overallTotal = Object.values(outcomeTotals).reduce((total, count) => total + count, 0);
+                        const formatPercentage = (count, total) => {
+                            if (!total) return '0%';
+                            return (count / total * 100).toLocaleString(undefined, { maximumFractionDigits: 1 }) + '%';
+                        };
+                        const outcomeLabelsWithPercentages = outcomeLabels.map((label, outcomeIndex) => {
+                            const outcome = outcomeOrder[outcomeIndex];
+                            return `${label} (${formatPercentage(outcomeTotals[outcome], overallTotal)})`;
+                        });
                         const chart = echarts.init(document.getElementById('chart-model-pair-' + index), isDark ? 'dark' : null);
                         chart.setOption({
                             backgroundColor: 'transparent',
-                            tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+                            tooltip: {
+                                trigger: 'axis',
+                                axisPointer: { type: 'shadow' },
+                                formatter: params => {
+                                    const outcomeIndex = params[0]?.dataIndex || 0;
+                                    return [
+                                        outcomeLabelsWithPercentages[outcomeIndex],
+                                        ...params.map(item => {
+                                            const severity = severityOrder[item.seriesIndex];
+                                            return `${item.marker}${item.seriesName}: ${item.value} (${formatPercentage(item.value, severityTotals[severity])})`;
+                                        })
+                                    ].join('<br>');
+                                }
+                            },
                             legend: { data: severityOrder.map(s => s.charAt(0).toUpperCase() + s.slice(1)), bottom: 0 },
                             grid: { left: '3%', right: '4%', bottom: '18%', top: '5%', containLabel: true },
                             xAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
-                            yAxis: { type: 'category', data: outcomeLabels },
+                            yAxis: { type: 'category', data: outcomeLabelsWithPercentages },
                             series: severityOrder.map(severity => ({
                                 name: severity.charAt(0).toUpperCase() + severity.slice(1),
                                 type: 'bar', stack: 'findings', itemStyle: { color: severityColors[severity] },
-                                data: outcomeOrder.map(outcome => rows.find(row => row.outcome === outcome && row.severity === severity)?.count || 0)
+                                data: outcomeOrder.map(outcome => findingCount(outcome, severity))
                             }))
                         });
                         state.activeCharts.push(chart);
@@ -4007,25 +4040,109 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     document.getElementById('chart-findings').innerHTML = '<p class="loading">No findings data available.</p>';
                 }
 
-                // --- 4.5. Unique and duplicate findings by contributing stage ---
+                // --- 4.5. Findings and hallucinations per main-model stage run ---
                 if (timeline.findings_by_stage && timeline.findings_by_stage.length) {
                     const chart = echarts.init(document.getElementById('chart-findings-stage'), isDark ? 'dark' : null);
                     const stageFindings = timeline.findings_by_stage;
+                    const findingsPerRun = (findings, runs) => runs ? findings / runs : 0;
+                    const formatRate = value => Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
+                    const formatPercentage = (count, total) => {
+                        if (!total) return '0%';
+                        return (count / total * 100).toLocaleString(undefined, { maximumFractionDigits: 1 }) + '%';
+                    };
+                    const categories = [
+                        { key: 'unique', label: 'Unique', color: '#2e7d32' },
+                        { key: 'duplicates', label: 'Duplicates', color: '#e07a1f' },
+                        { key: 'hallucinations', label: 'Hallucinations', color: '#c62828' }
+                    ];
+                    const categoryTotals = Object.fromEntries(categories.map(category => [
+                        category.key,
+                        stageFindings.reduce((total, row) => total + (row[category.key] || 0), 0)
+                    ]));
+                    const overallTotal = Object.values(categoryTotals).reduce((total, count) => total + count, 0);
+                    const categoryLabels = categories.map(category =>
+                        `${category.label} / run (${formatPercentage(categoryTotals[category.key], overallTotal)})`);
                     chart.setOption({
                         backgroundColor: 'transparent',
-                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-                        legend: { data: ['Unique', 'Duplicates'], bottom: 0 },
+                        tooltip: {
+                            trigger: 'axis',
+                            axisPointer: { type: 'shadow' },
+                            formatter: params => {
+                                const row = stageFindings[params[0].dataIndex];
+                                const runLabel = row.engagements === 1 ? 'run' : 'runs';
+                                return [
+                                    `Stage ${row.stage} (${row.engagements} ${runLabel})`,
+                                    ...params.map(item => {
+                                        const category = categories[item.seriesIndex];
+                                        return `${item.marker}${item.seriesName}: ${formatRate(item.value)} (${row[category.key]} total)`;
+                                    })
+                                ].join('<br>');
+                            }
+                        },
+                        legend: { data: categoryLabels, bottom: 0 },
                         grid: { left: '3%', right: '4%', bottom: '15%', top: '5%', containLabel: true },
-                        xAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { type: 'dashed' } } },
+                        xAxis: { type: 'value', axisLabel: { formatter: formatRate }, splitLine: { lineStyle: { type: 'dashed' } } },
                         yAxis: { type: 'category', data: stageFindings.map(row => 'Stage ' + row.stage) },
-                        series: [
-                            { name: 'Unique', type: 'bar', stack: 'findings', itemStyle: { color: '#2e7d32' }, data: stageFindings.map(row => row.unique) },
-                            { name: 'Duplicates', type: 'bar', stack: 'findings', itemStyle: { color: '#e07a1f' }, data: stageFindings.map(row => row.duplicates) }
-                        ]
+                        series: categories.map((category, categoryIndex) => ({
+                            name: categoryLabels[categoryIndex],
+                            type: 'bar',
+                            stack: 'findings',
+                            itemStyle: { color: category.color },
+                            data: stageFindings.map(row => findingsPerRun(row[category.key], row.engagements))
+                        }))
                     });
                     state.activeCharts.push(chart);
                 } else {
-                    document.getElementById('chart-findings-stage').innerHTML = '<p class="loading">No stage provenance available in the last 14 days.</p>';
+                    document.getElementById('chart-findings-stage').innerHTML = '<p class="loading">No stage engagement data available in the last 14 days.</p>';
+                }
+
+                // --- 4.6. Accepted single-stage findings by severity per stage run ---
+                if (timeline.findings_by_stage && timeline.findings_by_stage.length) {
+                    const chart = echarts.init(document.getElementById('chart-findings-stage-severity'), isDark ? 'dark' : null);
+                    const stageFindings = timeline.findings_by_stage;
+                    const severityOrder = ['critical', 'high', 'medium', 'low'];
+                    const computedStyle = getComputedStyle(document.body);
+                    const severityColors = {
+                        critical: computedStyle.getPropertyValue('--sev-critical').trim() || '#B71C1C',
+                        high: computedStyle.getPropertyValue('--sev-high').trim() || '#FF5722',
+                        medium: computedStyle.getPropertyValue('--sev-medium').trim() || '#FF9800',
+                        low: computedStyle.getPropertyValue('--sev-low').trim() || '#FBC02D'
+                    };
+                    const findingsPerRun = (findings, runs) => runs ? findings / runs : 0;
+                    const formatRate = value => Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 3 });
+                    chart.setOption({
+                        backgroundColor: 'transparent',
+                        tooltip: {
+                            trigger: 'axis',
+                            axisPointer: { type: 'shadow' },
+                            formatter: params => {
+                                const row = stageFindings[params[0].dataIndex];
+                                const runLabel = row.engagements === 1 ? 'run' : 'runs';
+                                return [
+                                    `Stage ${row.stage} (${row.engagements} ${runLabel})`,
+                                    ...params.map(item => {
+                                        const severity = severityOrder[item.seriesIndex];
+                                        const total = row.unique_by_severity?.[severity] || 0;
+                                        return `${item.marker}${item.seriesName}: ${formatRate(item.value)} (${total} total)`;
+                                    })
+                                ].join('<br>');
+                            }
+                        },
+                        legend: { data: severityOrder.map(severity => severity.charAt(0).toUpperCase() + severity.slice(1)), bottom: 0 },
+                        grid: { left: '3%', right: '4%', bottom: '15%', top: '5%', containLabel: true },
+                        xAxis: { type: 'value', axisLabel: { formatter: formatRate }, splitLine: { lineStyle: { type: 'dashed' } } },
+                        yAxis: { type: 'category', data: stageFindings.map(row => 'Stage ' + row.stage) },
+                        series: severityOrder.map(severity => ({
+                            name: severity.charAt(0).toUpperCase() + severity.slice(1),
+                            type: 'bar',
+                            stack: 'severity',
+                            itemStyle: { color: severityColors[severity] },
+                            data: stageFindings.map(row => findingsPerRun(row.unique_by_severity?.[severity] || 0, row.engagements))
+                        }))
+                    });
+                    state.activeCharts.push(chart);
+                } else {
+                    document.getElementById('chart-findings-stage-severity').innerHTML = '<p class="loading">No stage engagement data available in the last 14 days.</p>';
                 }
 
                 // --- 5. Cost charts ---
@@ -4067,42 +4184,41 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     });
                     state.activeCharts.push(costChart);
 
-                    // Calendar-month token totals, stacked by model.
-                    const monthlyUsage = new Map();
+                    // Calendar-month estimated costs, stacked by model.
+                    const monthlyCost = new Map();
                     daily.forEach(day => {
                         const month = day.day.slice(0, 7);
-                        if (!monthlyUsage.has(month)) monthlyUsage.set(month, new Map());
-                        const usageByModel = monthlyUsage.get(month);
+                        if (!monthlyCost.has(month)) monthlyCost.set(month, new Map());
+                        const costByModel = monthlyCost.get(month);
                         (day.by_model || []).forEach(entry => {
                             const model = entry.model || '(unknown)';
-                            // Cached tokens are already included in tokens_in.
-                            const tokens = (entry.tokens_in || 0) + (entry.tokens_out || 0);
-                            usageByModel.set(model, (usageByModel.get(model) || 0) + tokens);
+                            const cost = estimateCost(model, entry.tokens_in || 0, entry.tokens_out || 0, entry.tokens_cached || 0);
+                            if (cost !== null) costByModel.set(model, (costByModel.get(model) || 0) + cost);
                         });
                     });
-                    const months = [...monthlyUsage.keys()].sort();
+                    const months = [...monthlyCost.keys()].sort();
                     const monthLabel = month => {
                         const [year, monthNumber] = month.split('-').map(Number);
                         return new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' })
                             .format(new Date(Date.UTC(year, monthNumber - 1, 1)));
                     };
-                    const usageChart = echarts.init(document.getElementById('chart-model-usage-monthly'), isDark ? 'dark' : null);
-                    usageChart.setOption({
+                    const monthlyCostChart = echarts.init(document.getElementById('chart-model-cost-monthly'), isDark ? 'dark' : null);
+                    monthlyCostChart.setOption({
                         backgroundColor: 'transparent',
-                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: value => Number(value || 0).toLocaleString() + ' tokens' },
+                        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: value => '$' + Number(value || 0).toFixed(2) },
                         legend: { data: models, bottom: 0 },
                         grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
                         xAxis: { type: 'category', data: months.map(monthLabel), axisLine: { lineStyle: { color: themeAxis } } },
-                        yAxis: { type: 'value', axisLabel: { formatter: value => echarts.format.addCommas(value) }, splitLine: { lineStyle: { type: 'dashed' } } },
+                        yAxis: { type: 'value', axisLabel: { formatter: '${value}' }, splitLine: { lineStyle: { type: 'dashed' } } },
                         series: models.map(model => ({
                             name: model,
                             type: 'bar',
-                            stack: 'tokens',
+                            stack: 'cost',
                             emphasis: { focus: 'series' },
-                            data: months.map(month => monthlyUsage.get(month).get(model) || 0)
+                            data: months.map(month => Number((monthlyCost.get(month).get(model) || 0).toFixed(4)))
                         }))
                     });
-                    state.activeCharts.push(usageChart);
+                    state.activeCharts.push(monthlyCostChart);
 
                     // 5b. Per-patch avg cost and duration, split by with/without findings.
                     const avg = (sumTokens, count, model) => {
@@ -4198,7 +4314,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     window.addEventListener('resize', () => tChart.resize());
                 } else {
                     document.getElementById('chart-cost-daily').innerHTML = '<p class="loading">No cost data available.</p>';
-                    document.getElementById('chart-model-usage-monthly').innerHTML = '<p class="loading">No LLM usage data available.</p>';
+                    document.getElementById('chart-model-cost-monthly').innerHTML = '<p class="loading">No monthly cost data available.</p>';
                     document.getElementById('chart-cost-perpatch').innerHTML = '<p class="loading">No cost data available.</p>';
                     document.getElementById('chart-throughput').innerHTML = '<p class="loading">No cost data available.</p>';
                 }

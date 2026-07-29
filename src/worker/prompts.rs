@@ -2724,17 +2724,27 @@ pub fn calculate_series_range(
     if is_last_patch_review {
         None
     } else {
-        patches
+        let series_tail = patches
             .iter()
-            .map(|p| p.index)
-            .max()
-            .and_then(|max_idx| {
-                patches
-                    .iter()
-                    .find(|p| p.index == max_idx)
-                    .and_then(|p| p.commit_id.clone())
-                    .or_else(|| patch_shas.get(&max_idx).cloned())
-            })
+            .max_by_key(|patch| patch.index)
+            .and_then(|patch| {
+                patch_shas
+                    .get(&patch.index)
+                    .cloned()
+                    .or_else(|| patch.commit_id.clone())
+            });
+        let reviewed_tail = patches_to_review
+            .iter()
+            .max_by_key(|patch| patch.index)
+            .and_then(|patch| {
+                patch_shas
+                    .get(&patch.index)
+                    .cloned()
+                    .or_else(|| patch.commit_id.clone())
+            });
+
+        series_tail
+            .or(reviewed_tail)
             .map(|end_sha| format!("{}..{}", baseline_sha, end_sha))
     }
 }
@@ -3741,6 +3751,66 @@ mod tests {
         assert_eq!(
             calculate_series_range(&patches, &patches_to_review, &patch_shas, "base"),
             Some("base..sha2_resolved".to_string())
+        );
+    }
+
+    #[test]
+    fn test_calculate_series_range_prefers_resolved_tail_sha() {
+        let p1 = PatchInput {
+            index: 1,
+            diff: String::new(),
+            subject: None,
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("input_sha1".to_string()),
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: String::new(),
+            subject: None,
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: Some("stale_input_sha2".to_string()),
+        };
+        let patches = vec![p1.clone(), p2];
+        let mut patch_shas = std::collections::HashMap::new();
+        patch_shas.insert(2, "resolved_sha2".to_string());
+
+        assert_eq!(
+            calculate_series_range(&patches, &[p1], &patch_shas, "base"),
+            Some("base..resolved_sha2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_calculate_series_range_falls_back_to_reviewed_sha() {
+        let p1 = PatchInput {
+            index: 1,
+            diff: String::new(),
+            subject: None,
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        };
+        let p2 = PatchInput {
+            index: 2,
+            diff: String::new(),
+            subject: None,
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        };
+        let patches = vec![p1.clone(), p2];
+        let mut patch_shas = std::collections::HashMap::new();
+        patch_shas.insert(1, "resolved_sha1".to_string());
+
+        assert_eq!(
+            calculate_series_range(&patches, &[p1], &patch_shas, "base"),
+            Some("base..resolved_sha1".to_string())
         );
     }
 

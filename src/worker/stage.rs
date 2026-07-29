@@ -366,7 +366,8 @@ fn parse_json_response(response: &AiResponse) -> Result<serde_json::Value, Valid
     Ok(parsed)
 }
 
-fn find_json_candidates(text: &str) -> Vec<Value> {
+/// Recovers embedded JSON objects from prose- or fence-wrapped model output.
+pub(crate) fn find_json_candidates(text: &str) -> Vec<Value> {
     let mut candidates = Vec::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;

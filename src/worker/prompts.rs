@@ -2289,9 +2289,14 @@ Example:
                     json!({"finding_id": target.finding_id, "finding": items[target.index]})
                 })
                 .collect();
+            let expected_ids: Vec<&str> = batch
+                .iter()
+                .map(|target| target.finding_id.as_str())
+                .collect();
             let prompt = format!(
-                "{shared_context}\n\nYou are the false-positive confirmation reviewer. Independently verify every finding below against the patch and supplied code context. Return one boolean for every finding ID: true only when the issue is real and actionable, false when it is unsupported or incorrect.\n\nFindings:\n{}",
-                serde_json::to_string_pretty(&payload)?
+                "{shared_context}\n\nYou are the false-positive confirmation reviewer. Independently verify every finding below against the patch and supplied code context. Return one boolean for every finding ID: true only when the issue is real and actionable, false when it is unsupported or incorrect.\n\nFindings:\n{}\n\n{}",
+                serde_json::to_string_pretty(&payload)?,
+                confirmation_format_instruction(&expected_ids)
             );
             let request = AiRequest {
                 system: None,
@@ -2306,13 +2311,11 @@ Example:
                 }],
                 tools: None,
                 temperature: Some(0.0),
-                response_format: Some(AiResponseFormat::Json { schema: None }),
+                response_format: Some(AiResponseFormat::Json {
+                    schema: Some(confirmation_schema(&expected_ids)),
+                }),
                 context_tag: self.context_tag.clone(),
             };
-            let expected_ids: Vec<&str> = batch
-                .iter()
-                .map(|target| target.finding_id.as_str())
-                .collect();
             let validation_budget = self.validation_budget.map(ReviewBudget::new);
             let (decision_result, (tokens_in, tokens_out, tokens_cached)) = request_confirmation(
                 provider.as_ref(),
@@ -2334,6 +2337,26 @@ Example:
                                 .unwrap_or(true);
                         } else {
                             accepted[target.index] = false;
+                        }
+                        // Record the unresolved comparison so a failed confirmer reads as
+                        // "not decided" instead of vanishing from the outcome charts.
+                        let outcome = if target.discoverer == "main" {
+                            "main_unconfirmed"
+                        } else {
+                            "additional_unconfirmed"
+                        };
+                        for additional_model in &target.compared_models {
+                            comparisons.push(json!({
+                                "finding_id": target.finding_id,
+                                "additional_model": additional_model,
+                                "main_model_id": self.main_model,
+                                "additional_model_id": model_ids.get(additional_model.as_str()).copied().unwrap_or("unknown"),
+                                "main_provider_id": self.cohort.main.provider,
+                                "additional_provider_id": provider_ids.get(additional_model.as_str()).copied().unwrap_or("unknown"),
+                                "outcome": outcome,
+                                "confirmed_by": confirmer,
+                                "severity": items[target.index]["severity"].as_str().unwrap_or("unknown"),
+                            }));
                         }
                     }
                     confirmation_runs.push(json!({
@@ -2399,6 +2422,61 @@ Example:
     }
 }
 
+/// Pins the confirmation reply to the flat `{"<finding id>": bool}` shape the
+/// validator requires; without it models wrap decisions in their own envelope.
+fn confirmation_schema(expected_ids: &[&str]) -> Value {
+    let properties: serde_json::Map<String, Value> = expected_ids
+        .iter()
+        .map(|id| ((*id).to_string(), json!({"type": "boolean"})))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": expected_ids,
+        "additionalProperties": false,
+    })
+}
+
+fn confirmation_format_instruction(expected_ids: &[&str]) -> String {
+    let example: serde_json::Map<String, Value> = expected_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| ((*id).to_string(), json!(index % 2 == 0)))
+        .collect();
+    format!(
+        "RESPONSE FORMAT: Return ONLY a raw JSON object whose keys are exactly the {} finding ID(s) listed above and whose values are booleans. Do not nest the decisions under another key, do not return an array, and do not add commentary or code fences.\n\nExample shape (values illustrative only):\n{}",
+        expected_ids.len(),
+        serde_json::to_string_pretty(&Value::Object(example)).unwrap_or_default()
+    )
+}
+
+/// Recovers the decision object from replies that arrive wrapped in prose, code
+/// fences, or a single-key envelope, mirroring the salvage the review stages use.
+fn parse_confirmation_response(content: &str, expected_ids: &[&str]) -> Result<Value> {
+    let cleaned = crate::utils::clean_json_string(content);
+    let mut candidates = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(&cleaned) {
+        candidates.push(value);
+    }
+    candidates.extend(crate::worker::stage::find_json_candidates(content));
+
+    let mut last_error = None;
+    for candidate in candidates {
+        match validate_confirmation_decisions(&candidate, expected_ids) {
+            Ok(()) => return Ok(candidate),
+            Err(error) => last_error = Some(error),
+        }
+        // Unwrap a single-key envelope such as {"decisions": {...}}.
+        for nested in candidate.as_object().into_iter().flatten().map(|(_, v)| v) {
+            if validate_confirmation_decisions(nested, expected_ids).is_ok() {
+                return Ok(nested.clone());
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("confirmation response contained no JSON object")))
+}
+
 async fn request_confirmation(
     provider: &dyn AiProvider,
     request: AiRequest,
@@ -2407,7 +2485,25 @@ async fn request_confirmation(
 ) -> (Result<Value>, (usize, usize, usize)) {
     let mut last_error = None;
     let mut tokens = (0, 0, 0);
-    for _ in 0..2 {
+    let mut request = request;
+    for attempt in 0..2 {
+        // Restate the contract on retry; resending the identical prompt just
+        // reproduces the same malformed reply.
+        if attempt > 0 {
+            let feedback = format!(
+                "\n\nYour previous reply could not be parsed ({}). {}",
+                last_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown error".to_string()),
+                confirmation_format_instruction(expected_ids)
+            );
+            if let Some(message) = request.messages.last_mut()
+                && let Some(content) = message.content.as_mut()
+            {
+                content.push_str(&feedback);
+            }
+        }
         let estimated_input = provider.estimate_tokens(&request);
         if budget.is_some_and(|budget| !budget.allows(estimated_input, 0)) {
             return (
@@ -2447,15 +2543,9 @@ async fn request_confirmation(
                     }
                 }
                 let content = response.content.as_deref().unwrap_or("{}");
-                let cleaned = crate::utils::clean_json_string(content);
-                match serde_json::from_str::<Value>(&cleaned) {
-                    Ok(decisions) => {
-                        match validate_confirmation_decisions(&decisions, expected_ids) {
-                            Ok(()) => return (Ok(decisions), tokens),
-                            Err(error) => last_error = Some(error),
-                        }
-                    }
-                    Err(error) => last_error = Some(error.into()),
+                match parse_confirmation_response(content, expected_ids) {
+                    Ok(decisions) => return (Ok(decisions), tokens),
+                    Err(error) => last_error = Some(error),
                 }
             }
             Err(error) => last_error = Some(error),
@@ -3382,6 +3472,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmation_retry_restates_the_required_format() {
+        /// Records the prompt of every call so we can assert the retry differs.
+        struct PromptRecorder {
+            prompts: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AiProvider for PromptRecorder {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                let mut prompts = self.prompts.lock().unwrap();
+                prompts.push(request.messages[0].content.clone().unwrap_or_default());
+                let call = prompts.len();
+                drop(prompts);
+                Ok(AiResponse {
+                    content: Some(if call == 1 {
+                        "I think finding a is real.".to_string()
+                    } else {
+                        json!({"a": true}).to_string()
+                    }),
+                    thought: None,
+                    thought_signature: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+                0
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "prompt-recorder".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let provider = PromptRecorder {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Confirm these findings.".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let (decisions, _) = request_confirmation(&provider, request, &["a"], None).await;
+        assert_eq!(decisions.unwrap()["a"], true);
+
+        let prompts = provider.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(!prompts[0].contains("could not be parsed"));
+        assert!(prompts[1].contains("could not be parsed"));
+        assert!(prompts[1].contains("RESPONSE FORMAT"));
+    }
+
+    #[tokio::test]
     async fn confirmation_retry_cannot_exceed_its_review_budget() {
         let provider = ConfirmationProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -3544,7 +3705,7 @@ mod tests {
         ]);
         let baseline = std::collections::BTreeMap::from([("main-3-0".to_string(), false)]);
 
-        let (accepted, _, confirmation_runs) = worker
+        let (accepted, comparisons, confirmation_runs) = worker
             .confirm_unique_findings("context", &findings, runs.as_array().unwrap(), &baseline)
             .await
             .unwrap();
@@ -3552,6 +3713,77 @@ mod tests {
         assert!(accepted.as_array().unwrap().is_empty());
         assert_eq!(confirmation_runs[0]["status"], "failed");
         assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The unresolved comparison must still be reported, otherwise a failed
+        // confirmer silently erases the finding from the outcome charts.
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["outcome"], "main_unconfirmed");
+        assert_eq!(comparisons[0]["finding_id"], "main-3-0");
+        assert_eq!(comparisons[0]["additional_model"], "variant");
+        assert_eq!(comparisons[0]["severity"], "High");
+    }
+
+    #[tokio::test]
+    async fn failed_confirmation_reports_unconfirmed_variant_findings() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = Worker::new(
+            Arc::new(FailingConfirmationProvider),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                analysis_stage_parallelism: 1,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                baseline_sha: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                merge_budget: None,
+                retry_provider: None,
+                additional_models: vec![AdditionalModelRunner {
+                    name: "variant".to_string(),
+                    provider: Arc::new(FailingConfirmationProvider),
+                    temperature: 0.0,
+                    max_interactions: 2,
+                    model_id: "model-b".to_string(),
+                    provider_id: "test".to_string(),
+                    budget: None,
+                }],
+                cohort: test_variant_cohort(),
+                validation_budget: None,
+            },
+        );
+        // A variant-only finding: main is the confirmer, and main is failing here.
+        let findings = json!([{
+            "finding_ids": ["variant-3-0"],
+            "source_models": ["variant"],
+            "source_stages": [3],
+            "severity": "Medium"
+        }]);
+        let runs = json!([
+            {"model": "main", "stage": 3, "status": "completed"},
+            {"model": "variant", "stage": 3, "status": "completed"}
+        ]);
+
+        let (accepted, comparisons, confirmation_runs) = worker
+            .confirm_unique_findings(
+                "context",
+                &findings,
+                runs.as_array().unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(accepted.as_array().unwrap().is_empty());
+        assert_eq!(confirmation_runs[0]["status"], "failed");
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["outcome"], "additional_unconfirmed");
+        assert_eq!(comparisons[0]["additional_model"], "variant");
+        assert_eq!(comparisons[0]["severity"], "Medium");
     }
 
     #[test]
@@ -3607,6 +3839,54 @@ mod tests {
             annotate_validation_candidates(&concern, &test_variant_cohort(), &[])[0]["requires_validation"],
             true
         );
+    }
+
+    #[test]
+    fn confirmation_response_is_salvaged_from_wrapped_replies() {
+        let ids = ["main-1-0", "variant-2-1"];
+        let expected = json!({"main-1-0": true, "variant-2-1": false});
+
+        // Bare object.
+        assert_eq!(
+            parse_confirmation_response(r#"{"main-1-0": true, "variant-2-1": false}"#, &ids)
+                .unwrap(),
+            expected
+        );
+        // Fenced and prefixed with prose.
+        assert_eq!(
+            parse_confirmation_response(
+                "Here are my decisions:\n```json\n{\"main-1-0\": true, \"variant-2-1\": false}\n```",
+                &ids
+            )
+            .unwrap(),
+            expected
+        );
+        // Wrapped in a single-key envelope.
+        assert_eq!(
+            parse_confirmation_response(
+                r#"{"decisions": {"main-1-0": true, "variant-2-1": false}}"#,
+                &ids
+            )
+            .unwrap(),
+            expected
+        );
+        // A reply missing an ID is still a failure.
+        assert!(parse_confirmation_response(r#"{"main-1-0": true}"#, &ids).is_err());
+        // Prose with no JSON at all is a failure.
+        assert!(parse_confirmation_response("I could not verify these.", &ids).is_err());
+    }
+
+    #[test]
+    fn confirmation_schema_pins_every_expected_id() {
+        let ids = ["a-1-0", "b-2-1"];
+        let schema = confirmation_schema(&ids);
+        assert_eq!(schema["properties"]["a-1-0"]["type"], "boolean");
+        assert_eq!(schema["properties"]["b-2-1"]["type"], "boolean");
+        assert_eq!(schema["required"], json!(["a-1-0", "b-2-1"]));
+        assert_eq!(schema["additionalProperties"], false);
+        // The instruction must name the exact IDs so the model cannot invent an envelope.
+        let instruction = confirmation_format_instruction(&ids);
+        assert!(instruction.contains("a-1-0") && instruction.contains("b-2-1"));
     }
 
     #[test]

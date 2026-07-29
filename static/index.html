@@ -3739,6 +3739,42 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         html += '</div>';
                     });
                     html += '<h3>False-positive confirmation cost</h3><div class="chart-section"><div id="chart-confirmation-cost" style="width:100%; height:300px;"></div></div>';
+
+                    const health = modelExperiments.confirmation_health || [];
+                    if (health.length) {
+                        const byModel = new Map();
+                        health.forEach(row => {
+                            const entry = byModel.get(row.model) ||
+                                { total: 0, failed: 0, error: '' };
+                            entry.total += row.count || 0;
+                            if (row.status !== 'completed') {
+                                entry.failed += row.count || 0;
+                                if (!entry.error && row.sample_error) entry.error = row.sample_error;
+                            }
+                            byModel.set(row.model, entry);
+                        });
+                        const totals = [...byModel.values()].reduce((acc, entry) => ({
+                            total: acc.total + entry.total, failed: acc.failed + entry.failed
+                        }), { total: 0, failed: 0 });
+                        html += '<h3>Confirmation reliability</h3>';
+                        html += '<p style="opacity:0.8; font-size:0.9em;">Findings seen by only one model need a confirmation run to be' +
+                            ' classified. A failed run leaves them unconfirmed, so high failure rates suppress the' +
+                            ' unique-discovery and hallucination outcomes above.</p>';
+                        html += '<div class="stat-card-grid">';
+                        html += renderStatCard('Confirmation runs', totals.total);
+                        html += renderStatCard('Failed runs', totals.failed +
+                            (totals.total ? ' (' + (totals.failed / totals.total * 100).toFixed(0) + '%)' : ''));
+                        html += '</div>';
+                        html += '<table style="font-size:0.9em;"><thead><tr><th>Confirmer</th><th>Runs</th>' +
+                            '<th>Failed</th><th>Failure rate</th><th>Last error</th></tr></thead><tbody>';
+                        [...byModel.entries()].sort((a, b) => b[1].failed - a[1].failed).forEach(([model, entry]) => {
+                            const rate = entry.total ? (entry.failed / entry.total * 100).toFixed(0) + '%' : '-';
+                            html += '<tr><td>' + escapeHtml(model) + '</td><td>' + entry.total + '</td><td>' +
+                                entry.failed + '</td><td>' + rate + '</td><td>' +
+                                escapeHtml(entry.error ? entry.error.slice(0, 120) : '') + '</td></tr>';
+                        });
+                        html += '</tbody></table>';
+                    }
                 }
 
                 const crossPairs = [];
@@ -3771,8 +3807,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
                 if (experimentPairs.length) {
                     const severityOrder = ['critical', 'high', 'medium', 'low'];
-                    const outcomeOrder = ['both', 'main_only', 'additional_only', 'main_hallucination', 'additional_hallucination'];
-                    const outcomeLabels = ['Both', 'Main model', 'Additional model', 'Main hallucination', 'Additional hallucination'];
+                    const outcomeOrder = ['both', 'main_only', 'additional_only', 'main_hallucination', 'additional_hallucination', 'main_unconfirmed', 'additional_unconfirmed'];
+                    const outcomeLabels = ['Both', 'Main model', 'Additional model', 'Main hallucination', 'Additional hallucination', 'Main unconfirmed', 'Additional unconfirmed'];
                     experimentPairs.forEach((pair, index) => {
                         const rows = (modelExperiments.outcomes || []).filter(row =>
                             row.additional_model === pair.additional_model &&

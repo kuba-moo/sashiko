@@ -2417,8 +2417,25 @@ impl Database {
                 "tokens_cached": row.get::<i64>(5).unwrap_or(0),
             }));
         }
+        drop(rows);
+
+        let mut confirmation_health = Vec::new();
+        let mut rows = self.conn.query(
+            "SELECT model, provider_id, model_id, status, count(*), max(COALESCE(error, '')) FROM model_confirmation_runs GROUP BY model, provider_id, model_id, status ORDER BY model, provider_id, model_id, status",
+            (),
+        ).await?;
+        while let Ok(Some(row)) = rows.next().await {
+            confirmation_health.push(json!({
+                "model": row.get::<String>(0)?,
+                "provider": row.get::<String>(1)?,
+                "model_id": row.get::<String>(2)?,
+                "status": row.get::<String>(3)?,
+                "count": row.get::<i64>(4)?,
+                "sample_error": row.get::<String>(5).unwrap_or_default(),
+            }));
+        }
         Ok(
-            json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost}),
+            json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost, "confirmation_health": confirmation_health}),
         )
     }
 
@@ -9360,7 +9377,8 @@ mod tests {
                 {"additional_model": "variant", "main_provider_id": "openai", "main_model_id": "model-a", "additional_provider_id": "claude", "additional_model_id": "model-b", "finding_id": "f1", "outcome": "both"}
             ],
             "confirmation_runs": [
-                {"model": "main", "provider_id": "openai", "model_id": "model-a", "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 5, "budget_input": 40, "budget_output": 4, "budget_flags": 1}
+                {"model": "main", "provider_id": "openai", "model_id": "model-a", "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 5, "budget_input": 40, "budget_output": 4, "budget_flags": 1},
+                {"model": "variant", "provider_id": "claude", "model_id": "model-b", "status": "failed", "error": "unparseable reply", "tokens_in": 30, "tokens_out": 3, "tokens_cached": 0, "budget_input": 30, "budget_output": 3, "budget_flags": 0}
             ]
         });
         let findings = json!([{"finding_ids": ["f1"], "severity": "High"}]);
@@ -9374,7 +9392,26 @@ mod tests {
         assert_eq!(stats["outcomes"][0]["additional_provider_id"], "claude");
         assert_eq!(stats["paired_cost"][0]["paired_stages"], 2);
         assert_eq!(stats["paired_cost"][0]["compared_patches"], 1);
-        assert_eq!(stats["confirmation_cost"][0]["model"], "model-a");
+        assert!(
+            stats["confirmation_cost"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["model"] == "model-a" && row["provider"] == "openai")
+        );
+        let health = stats["confirmation_health"].as_array().unwrap();
+        let failed = health
+            .iter()
+            .find(|row| row["status"] == "failed")
+            .expect("failed confirmation run is reported");
+        assert_eq!(failed["model"], "variant");
+        assert_eq!(failed["count"], 1);
+        assert_eq!(failed["sample_error"], "unparseable reply");
+        assert!(
+            health
+                .iter()
+                .any(|row| row["status"] == "completed" && row["model"] == "main")
+        );
         assert!(
             stats["run_status"]
                 .as_array()

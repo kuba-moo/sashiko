@@ -4042,10 +4042,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         stack: 'cost',
                         emphasis: { focus: 'series' },
                         data: daily.map(d => {
-                            const m = (d.by_model || []).find(x => (x.model || '(unknown)') === model);
-                            if (!m) return 0;
-                            const c = estimateCost(m.model, m.tokens_in || 0, m.tokens_out || 0, m.tokens_cached || 0);
-                            return c !== null ? Number(c.toFixed(4)) : 0;
+                            const cost = (d.by_model || [])
+                                .filter(x => (x.model || '(unknown)') === model)
+                                .reduce((total, m) => {
+                                    const c = estimateCost(m.model, m.tokens_in || 0, m.tokens_out || 0, m.tokens_cached || 0);
+                                    return c !== null ? total + c : total;
+                                }, 0);
+                            return Number(cost.toFixed(4));
                         })
                     }));
                     const costChart = echarts.init(document.getElementById('chart-cost-daily'), isDark ? 'dark' : null);

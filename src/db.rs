@@ -2962,25 +2962,110 @@ impl Database {
         }
 
         // Query B: per-day-per-model token sums (for stacked cost-by-model).
+        //
+        // The review's ai_interactions row contains the complete main-model
+        // workflow, including its discovery and merge stages.  Variant stages
+        // and confirmation requests are deliberately accounted separately,
+        // however, as are the local merge requests made for cross reviews.
+        // Union those supplemental invocations here so this is a service-wide
+        // usage view, while excluding experiment_name = 'main' because those
+        // tokens are already included in ai_interactions.
+        let supplemental_subsystem_join = if subsystem_id.is_some() {
+            "JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id"
+        } else {
+            ""
+        };
+        let supplemental_subsystem_filter = if subsystem_id.is_some() {
+            "AND ps.subsystem_id = ?"
+        } else {
+            ""
+        };
+        let cross_review_subsystem_join = if subsystem_id.is_some() {
+            "JOIN patchsets_subsystems ps ON p.id = ps.patchset_id"
+        } else {
+            ""
+        };
+        let cross_review_subsystem_filter = if subsystem_id.is_some() {
+            "WHERE ps.subsystem_id = ?"
+        } else {
+            ""
+        };
         let sql_b = format!(
-            "SELECT
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
-                COALESCE(r.provider, ''),
-                COALESCE(r.model, ''),
-                SUM(COALESCE(ai.tokens_in, 0)),
-                SUM(COALESCE(ai.tokens_out, 0)),
-                SUM(COALESCE(ai.tokens_cached, 0)),
-                COUNT(*)
-            FROM reviews r
-            LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
-            {}
-            {}
-            GROUP BY day, r.provider, r.model
-            ORDER BY day, r.model",
-            subsystem_join, subsystem_filter
+            "SELECT day, provider, model,
+                    SUM(tokens_in), SUM(tokens_out), SUM(tokens_cached),
+                    SUM(reviews)
+             FROM (
+                SELECT strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
+                       COALESCE(r.provider, '') AS provider,
+                       COALESCE(r.model, '') AS model,
+                       SUM(COALESCE(ai.tokens_in, 0)) AS tokens_in,
+                       SUM(COALESCE(ai.tokens_out, 0)) AS tokens_out,
+                       SUM(COALESCE(ai.tokens_cached, 0)) AS tokens_cached,
+                       COUNT(*) AS reviews
+                FROM reviews r
+                LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
+                {subsystem_join}
+                {subsystem_filter}
+                GROUP BY day, r.provider, r.model
+
+                UNION ALL
+
+                SELECT strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
+                       COALESCE(run.provider_id, '') AS provider,
+                       COALESCE(run.model_id, '') AS model,
+                       SUM(COALESCE(run.tokens_in, 0)) AS tokens_in,
+                       SUM(COALESCE(run.tokens_out, 0)) AS tokens_out,
+                       SUM(COALESCE(run.tokens_cached, 0)) AS tokens_cached,
+                       COUNT(DISTINCT run.review_id) AS reviews
+                FROM model_experiment_runs run
+                JOIN reviews r ON r.id = run.review_id
+                {supplemental_subsystem_join}
+                WHERE run.experiment_name != 'main'
+                {supplemental_subsystem_filter}
+                GROUP BY day, run.provider_id, run.model_id
+
+                UNION ALL
+
+                SELECT strftime('%Y-%m-%d', r.created_at, 'unixepoch') AS day,
+                       COALESCE(run.provider_id, '') AS provider,
+                       COALESCE(run.model_id, '') AS model,
+                       SUM(COALESCE(run.tokens_in, 0)) AS tokens_in,
+                       SUM(COALESCE(run.tokens_out, 0)) AS tokens_out,
+                       SUM(COALESCE(run.tokens_cached, 0)) AS tokens_cached,
+                       COUNT(DISTINCT run.review_id) AS reviews
+                FROM model_confirmation_runs run
+                JOIN reviews r ON r.id = run.review_id
+                {supplemental_subsystem_join}
+                WHERE 1 = 1
+                {supplemental_subsystem_filter}
+                GROUP BY day, run.provider_id, run.model_id
+
+                UNION ALL
+
+                SELECT strftime('%Y-%m-%d',
+                                COALESCE(job.completed_at, job.first_attempt_at),
+                                'unixepoch') AS day,
+                       COALESCE(job.local_provider, '') AS provider,
+                       COALESCE(job.local_model, '') AS model,
+                       SUM(COALESCE(job.merge_tokens_in, 0)) AS tokens_in,
+                       SUM(COALESCE(job.merge_tokens_out, 0)) AS tokens_out,
+                       SUM(COALESCE(job.merge_tokens_cached, 0)) AS tokens_cached,
+                       COUNT(*) AS reviews
+                FROM cross_review_jobs job
+                JOIN patchsets p ON p.id = job.patchset_id
+                {cross_review_subsystem_join}
+                {cross_review_subsystem_filter}
+                GROUP BY day, job.local_provider, job.local_model
+             ) usage
+             GROUP BY day, provider, model
+             ORDER BY day, model"
         );
         let mut rows_b = match subsystem_id {
-            Some(sid) => self.conn.query(&sql_b, libsql::params![sid]).await?,
+            Some(sid) => {
+                self.conn
+                    .query(&sql_b, libsql::params![sid, sid, sid, sid])
+                    .await?
+            }
             None => self.conn.query(&sql_b, ()).await?,
         };
         while let Ok(Some(row)) = rows_b.next().await {
@@ -9058,6 +9143,74 @@ mod tests {
             ps1, ps2,
             "Patchset from B4 Relay devnull alias and real author email MUST merge"
         );
+    }
+
+    #[tokio::test]
+    async fn cost_stats_include_all_supplemental_llm_usage() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO subsystems (id, name, mailing_list_address)
+                    VALUES (1, 'networking', 'net@example.com');
+                 INSERT INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (1, 1);
+                 INSERT INTO ai_interactions
+                    (id, provider, model, tokens_in, tokens_out, tokens_cached, created_at)
+                    VALUES ('main-interaction', 'openai', 'main-model', 100, 20, 10, 1000);
+                 INSERT INTO reviews
+                    (id, patchset_id, interaction_id, status, created_at, provider, model)
+                    VALUES (99, 1, 'main-interaction', 'Reviewed', 1000, 'openai', 'main-model');
+                 INSERT INTO cross_review_jobs
+                    (id, patchset_id, source_name, source_url, local_model, local_provider,
+                     lookup_message_id, generation, status, first_attempt_at, next_attempt_at,
+                     deadline_at, completed_at, merge_tokens_in, merge_tokens_out,
+                     merge_tokens_cached)
+                    VALUES (1, 1, 'peer', 'https://peer.example', 'merge-model', 'openai',
+                            'lookup', 1, 'complete', 1000, 1000, 2000, 1000, 30, 3, 2);",
+            )
+            .await
+            .unwrap();
+
+        let experiment = json!({
+            "cohort": {
+                "main": {"name": "main", "provider": "openai", "model": "main-model"},
+                "variants": [{
+                    "source": {"name": "variant", "provider": "anthropic", "model": "variant-model"},
+                    "selected": true
+                }]
+            },
+            "runs": [
+                {"model": "main", "provider_id": "openai", "model_id": "main-model", "stage": 1, "status": "completed", "tokens_in": 60, "tokens_out": 6, "tokens_cached": 5},
+                {"model": "variant", "provider_id": "anthropic", "model_id": "variant-model", "stage": 1, "status": "completed", "tokens_in": 50, "tokens_out": 5, "tokens_cached": 4},
+                {"model": "variant", "provider_id": "anthropic", "model_id": "variant-model", "stage": 2, "status": "completed", "tokens_in": 30, "tokens_out": 3, "tokens_cached": 2}
+            ],
+            "confirmation_runs": [
+                {"model": "main", "provider_id": "openai", "model_id": "main-model", "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 3}
+            ]
+        });
+        db.save_model_experiment(99, &experiment, &json!([]))
+            .await
+            .unwrap();
+
+        let stats = db.get_cost_stats(Some(1)).await.unwrap();
+        let models = stats["daily"][0]["by_model"].as_array().unwrap();
+        let usage = |model: &str| models.iter().find(|row| row["model"] == model).unwrap();
+
+        let main = usage("main-model");
+        assert_eq!(main["tokens_in"], 140);
+        assert_eq!(main["tokens_out"], 24);
+        assert_eq!(main["tokens_cached"], 13);
+
+        let variant = usage("variant-model");
+        assert_eq!(variant["tokens_in"], 80);
+        assert_eq!(variant["tokens_out"], 8);
+        assert_eq!(variant["tokens_cached"], 6);
+
+        let cross_review = usage("merge-model");
+        assert_eq!(cross_review["tokens_in"], 30);
+        assert_eq!(cross_review["tokens_out"], 3);
+        assert_eq!(cross_review["tokens_cached"], 2);
     }
 
     #[tokio::test]

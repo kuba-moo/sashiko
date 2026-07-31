@@ -1795,7 +1795,8 @@
             const comparisons = Array.isArray(experiment.comparisons) ? experiment.comparisons : [];
             comparisons.forEach(comparison => {
                 if (typeof comparison?.finding_id === 'string' &&
-                    typeof comparison?.confirmed_by === 'string') {
+                    typeof comparison?.confirmed_by === 'string' &&
+                    !String(comparison.outcome || '').endsWith('_unconfirmed')) {
                     confirmations.set(comparison.finding_id, comparison.confirmed_by);
                 }
             });
@@ -3740,6 +3741,46 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         html += '</div>';
                     });
                     html += '<h3>False-positive confirmation cost</h3><div class="chart-section"><div id="chart-confirmation-cost" style="width:100%; height:300px;"></div></div>';
+
+                    const confirmationOutcomes = modelExperiments.confirmation_outcomes || [];
+                    if (confirmationOutcomes.length) {
+                        const byConfirmer = new Map();
+                        confirmationOutcomes.forEach(row => {
+                            const entry = byConfirmer.get(row.confirmed_by) || {
+                                kept: 0, dropped: 0, unconfirmed: 0,
+                                lowKept: 0, lowDropped: 0, elevatedKept: 0, elevatedDropped: 0
+                            };
+                            const count = row.count || 0;
+                            const kept = row.outcome === 'main_only' || row.outcome === 'additional_only';
+                            const dropped = row.outcome === 'main_hallucination' || row.outcome === 'additional_hallucination';
+                            const unconfirmed = String(row.outcome || '').endsWith('_unconfirmed');
+                            if (kept) entry.kept += count;
+                            if (dropped) entry.dropped += count;
+                            if (unconfirmed) entry.unconfirmed += count;
+                            if (row.severity === 'low') {
+                                if (kept) entry.lowKept += count;
+                                if (dropped) entry.lowDropped += count;
+                            } else if (['medium', 'high', 'critical'].includes(row.severity)) {
+                                if (kept) entry.elevatedKept += count;
+                                if (dropped) entry.elevatedDropped += count;
+                            }
+                            byConfirmer.set(row.confirmed_by, entry);
+                        });
+                        const rate = (dropped, kept) => dropped + kept
+                            ? (dropped / (dropped + kept) * 100).toFixed(0) + '%' : '-';
+                        html += '<h3>Confirmation decisions</h3>';
+                        html += '<table style="font-size:0.9em;"><thead><tr><th>Confirmer</th><th>Kept</th>' +
+                            '<th>Dropped</th><th>Drop rate</th><th>Low</th><th>Medium+</th><th>Unconfirmed</th>' +
+                            '</tr></thead><tbody>';
+                        [...byConfirmer.entries()].sort((a, b) => a[0].localeCompare(b[0])).forEach(([model, entry]) => {
+                            html += '<tr><td>' + escapeHtml(model) + '</td><td>' + entry.kept + '</td><td>' +
+                                entry.dropped + '</td><td>' + rate(entry.dropped, entry.kept) + '</td><td>' +
+                                rate(entry.lowDropped, entry.lowKept) + '</td><td>' +
+                                rate(entry.elevatedDropped, entry.elevatedKept) + '</td><td>' +
+                                entry.unconfirmed + '</td></tr>';
+                        });
+                        html += '</tbody></table>';
+                    }
 
                     const health = modelExperiments.confirmation_health || [];
                     if (health.length) {

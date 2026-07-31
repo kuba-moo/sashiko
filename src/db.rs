@@ -552,7 +552,7 @@ impl Database {
         for sql in [
             "CREATE TABLE IF NOT EXISTS model_experiment_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', stage INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE TABLE IF NOT EXISTS model_experiment_sources (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', selected INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id), UNIQUE(review_id, experiment_name))",
-            "CREATE TABLE IF NOT EXISTS model_experiment_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, additional_model TEXT NOT NULL, main_model_id TEXT NOT NULL DEFAULT '', additional_model_id TEXT NOT NULL DEFAULT '', main_provider_id TEXT NOT NULL DEFAULT '', additional_provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, outcome TEXT NOT NULL, severity TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE TABLE IF NOT EXISTS model_experiment_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, additional_model TEXT NOT NULL, main_model_id TEXT NOT NULL DEFAULT '', additional_model_id TEXT NOT NULL DEFAULT '', main_provider_id TEXT NOT NULL DEFAULT '', additional_provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, outcome TEXT NOT NULL, severity TEXT, confirmed_by TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE TABLE IF NOT EXISTS model_confirmation_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, model TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_input INTEGER NOT NULL DEFAULT 0, budget_output INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_runs_review ON model_experiment_runs(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_sources_review ON model_experiment_sources(review_id)",
@@ -669,6 +669,9 @@ impl Database {
                 "additional_model_id",
                 "TEXT NOT NULL DEFAULT ''",
             )
+            .await;
+        let _ = self
+            .try_add_column("model_experiment_findings", "confirmed_by", "TEXT")
             .await;
         let _ = self
             .conn
@@ -2366,7 +2369,7 @@ impl Database {
             let finding_id = comparison["finding_id"].as_str().unwrap_or("unknown");
             connection
                 .execute(
-                    "INSERT INTO model_experiment_findings (review_id, additional_model, main_model_id, additional_model_id, main_provider_id, additional_provider_id, finding_id, outcome, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO model_experiment_findings (review_id, additional_model, main_model_id, additional_model_id, main_provider_id, additional_provider_id, finding_id, outcome, severity, confirmed_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     libsql::params![
                         review_id,
                         comparison["additional_model"].as_str().unwrap_or("unknown"),
@@ -2379,6 +2382,7 @@ impl Database {
                         comparison["severity"]
                             .as_str()
                             .or_else(|| severities.get(finding_id).copied()),
+                        comparison["confirmed_by"].as_str(),
                     ],
                 )
                 .await?;
@@ -2431,6 +2435,32 @@ impl Database {
                 "model": row.get::<String>(2)?,
                 "status": row.get::<String>(3)?,
                 "count": row.get::<i64>(4)?,
+            }));
+        }
+        drop(rows);
+
+        let mut confirmation_outcomes = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT confirmed_by, outcome, severity, count(*)
+             FROM (
+                 SELECT DISTINCT review_id, finding_id, confirmed_by, outcome,
+                        lower(COALESCE(severity, 'unknown')) AS severity
+                 FROM model_experiment_findings
+                 WHERE confirmed_by IS NOT NULL
+             )
+             GROUP BY confirmed_by, outcome, severity
+             ORDER BY confirmed_by, outcome, severity",
+                (),
+            )
+            .await?;
+        while let Ok(Some(row)) = rows.next().await {
+            confirmation_outcomes.push(json!({
+                "confirmed_by": row.get::<String>(0)?,
+                "outcome": row.get::<String>(1)?,
+                "severity": row.get::<String>(2)?,
+                "count": row.get::<i64>(3)?,
             }));
         }
         drop(rows);
@@ -2520,7 +2550,7 @@ impl Database {
             }));
         }
         Ok(
-            json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost, "confirmation_health": confirmation_health}),
+            json!({"run_status": run_status, "cohort_status": cohort_status, "outcomes": outcomes, "confirmation_outcomes": confirmation_outcomes, "paired_cost": paired_cost, "confirmation_cost": confirmation_cost, "confirmation_health": confirmation_health}),
         )
     }
 
@@ -9535,7 +9565,8 @@ mod tests {
                 {"model": "variant", "provider_id": "claude", "model_id": "model-b", "stage": 4, "status": "failed", "error": "provider unavailable", "tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
             ],
             "comparisons": [
-                {"additional_model": "variant", "main_provider_id": "openai", "main_model_id": "model-a", "additional_provider_id": "claude", "additional_model_id": "model-b", "finding_id": "f1", "outcome": "both"}
+                {"additional_model": "variant", "main_provider_id": "openai", "main_model_id": "model-a", "additional_provider_id": "claude", "additional_model_id": "model-b", "finding_id": "f1", "outcome": "main_hallucination", "confirmed_by": "variant"},
+                {"additional_model": "variant", "main_provider_id": "openai", "main_model_id": "model-a", "additional_provider_id": "claude", "additional_model_id": "model-b", "finding_id": "f1", "outcome": "main_hallucination", "confirmed_by": "variant"}
             ],
             "confirmation_runs": [
                 {"model": "main", "provider_id": "openai", "model_id": "model-a", "status": "completed", "tokens_in": 40, "tokens_out": 4, "tokens_cached": 5, "budget_input": 40, "budget_output": 4, "budget_flags": 1},
@@ -9551,6 +9582,13 @@ mod tests {
         assert_eq!(stats["paired_cost"][0]["main"]["model"], "model-a");
         assert_eq!(stats["paired_cost"][0]["main"]["provider"], "openai");
         assert_eq!(stats["outcomes"][0]["additional_provider_id"], "claude");
+        assert_eq!(stats["confirmation_outcomes"][0]["confirmed_by"], "variant");
+        assert_eq!(
+            stats["confirmation_outcomes"][0]["outcome"],
+            "main_hallucination"
+        );
+        assert_eq!(stats["confirmation_outcomes"][0]["severity"], "high");
+        assert_eq!(stats["confirmation_outcomes"][0]["count"], 1);
         assert_eq!(stats["paired_cost"][0]["paired_stages"], 2);
         assert_eq!(stats["paired_cost"][0]["compared_patches"], 1);
         assert!(
@@ -10053,6 +10091,62 @@ mod tests {
         }
         assert!(columns.contains("cross_review_job_id"));
         assert!(columns.contains("external_finding_id"));
+    }
+
+    #[tokio::test]
+    async fn model_experiment_migration_adds_confirmer_without_backfill() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp.path().join("old-experiment.db").display().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE model_experiment_findings;
+                 CREATE TABLE model_experiment_findings (
+                    id INTEGER PRIMARY KEY,
+                    review_id INTEGER NOT NULL,
+                    additional_model TEXT NOT NULL,
+                    main_model_id TEXT NOT NULL DEFAULT '',
+                    additional_model_id TEXT NOT NULL DEFAULT '',
+                    main_provider_id TEXT NOT NULL DEFAULT '',
+                    additional_provider_id TEXT NOT NULL DEFAULT '',
+                    finding_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    severity TEXT
+                 );
+                 INSERT INTO model_experiment_findings
+                    (id, review_id, additional_model, finding_id, outcome)
+                    VALUES (1, 1, 'variant', 'old-finding', 'main_only');",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query("PRAGMA table_info(model_experiment_findings)", ())
+            .await
+            .unwrap();
+        let mut columns = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.insert(row.get::<String>(1).unwrap());
+        }
+        assert!(columns.contains("confirmed_by"));
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT confirmed_by FROM model_experiment_findings WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert!(row.get::<Option<String>>(0).unwrap().is_none());
     }
 
     #[tokio::test]

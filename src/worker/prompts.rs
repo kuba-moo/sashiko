@@ -145,6 +145,29 @@ pub const SYSTEM_IDENTITY: &str = "";
 /// be excluded from Phase 0's shared context to avoid double-counting.
 const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
 
+/// Re-scopes the vendored guides appended to stage 3.
+///
+/// `callstack.md` is shared with upstream tooling that points it at a single
+/// unscoped reviewer, so its "Task 8" block legitimately asks one agent to
+/// verify commit-message claims and question design decisions. Here those are
+/// stages 1 and 2's exclusive mandates, and Tasks 3-5B likewise cover stages 4
+/// and 5. The guide arrives after stage 3's own SCOPE line and marks those
+/// tasks MANDATORY, so it wins on both position and emphasis: measured over 13
+/// days, stage-3 findings phrased as commit-message or comment mismatches
+/// duplicated stage 2 at 78% against 59% for the rest of stage 3's output.
+///
+/// Editing the vendored file would be reverted by the next upstream sync (see
+/// third_party/prompts/REVISION), so the override is appended here instead —
+/// last in the prompt, and phrased as an override rather than another fence.
+///
+/// Deliberately narrow: it redirects reporting *shape* and never tells the
+/// model to drop a defect. Comment- and kernel-doc-versus-code mismatches are
+/// redirected to Stage 2, whose prompt now names that artifact pair explicitly.
+/// A defect that survives the patch stays reportable here, because two of this
+/// stage's High findings (7881, 9863) are headlined "Incomplete fix" and no
+/// other stage found them.
+const STAGE3_GUIDE_SCOPE_OVERRIDE: &str = "\n\n# Scope override for the guides above\n\nThe preceding guides are shared with other tooling that runs a single unscoped reviewer, so some of their tasks name work owned by other agents in this pipeline. Where they conflict with this stage's SCOPE, this override wins.\n\nYou review CODE, not prose. Never report a concern about the wording or accuracy of a comment, a kernel-doc block, Documentation/, or the commit message — not a contradiction between a comment and the code, not a stale or misleading comment, not an inaccurate commit-message claim, not spelling or grammar. Stages 1 and 2 own all of that. Prose is only ever a hint here: when a comment or the commit message tells you what the code was meant to do, use that to find the defect, then report the defect in terms of the code and the failure it causes, with no remark about the prose.\n\nThe following are likewise other stages' concerns; treat them only as context for judging whether a control-flow or logic defect is real, and do not report them in their own right: questioning design decisions (Task 8 item 3), API naming (item 4), C best practices (item 5), dead code (item 6), and coding-style rules (item 8). Lock correctness (Tasks 3, 4), resource lifecycle and RCU teardown (Tasks 5, 5B), and uninitialized variables (Task 7) belong to Stages 4 and 5; investigate them only far enough to establish the control-flow defect you are reporting.\n\nYou SHOULD still report a defect that remains reachable after this patch, including one the patch's own fix does not fully close. Describe it mechanically — the code path and the resulting failure — rather than as a shortfall against the commit message.\n\nDo not drop a real defect because of this override. If a concern is genuinely control flow or logic and you can describe how the code reaches it, report it.";
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
     pub index: i64,
@@ -350,18 +373,39 @@ impl PromptRegistry {
 
         let stage_instruction = match stage {
             1 => {
-                "# Stage 1. Analyze commit main goal
+                "# Stage 1. Submission review: is this change honest and complete?
 
-SCOPE: You review ONLY high-level intent and design — the \"what\" and \"why\", not the \"how\". Other pipeline agents cover: implementation completeness (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do NOT analyze locking correctness, sleeping-in-atomic-context, lock ordering, race conditions, or any concurrency concern — Stage 5 handles all of that. Do not read source code to trace lock/context interactions.
+SCOPE: You review the SUBMISSION — whether the commit message tells the truth about the change, whether the change is complete as submitted, and whether the design is sound. Other pipeline agents cover: cross-artifact comparison (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do NOT analyze locking correctness, sleeping-in-atomic-context, lock ordering, race conditions, or any concurrency concern — Stage 5 handles all of that. Do not read source code to trace lock/context interactions.
 
-You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally wrong approaches? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs."
+You are a senior Linux kernel maintainer deciding whether to take this patch. Your primary question is whether a maintainer or a stable-tree backporter can trust the submission as written.
+
+1. Does the commit message describe what the patch actually does? Raise a concern when the message mischaracterizes the change, understates its impact, or omits something a maintainer needs — for example a security impact presented as a cosmetic cleanup, or a behavioural change the message does not mention.
+
+2. Is the change complete as submitted? If the patch fixes a defect in one place and the same defect is reachable through a sibling call site, a second driver, or another caller of the same helper, say so — and say whether the message indicates the author considered it. An unimplemented prerequisite or an unfixed sibling site is in scope for you when it defeats the patch's stated purpose.
+
+3. For a patch that claims to FIX a bug, confirm the bug actually exists on current execution paths before accepting the premise. Read the code as it stands today: if no live caller can reach the described failure, or an earlier check already prevents it, then the fix is unnecessary or the commit message is wrong, and that is the concern to raise. Do not take the author's account of the bug on faith.
+
+4. Tags: flag a missing `Fixes:` tag when the patch fixes a real user-visible bug. Do NOT nitpick a tag that is present and plausible. In particular, when a `Fixes:` tag is present and both it and the commit you believe is more accurate are older than roughly four years, treat the tag as correct and say nothing — that distinction has no practical effect.
+
+Design and architecture are in scope only through the questions above: raise a design concern when it makes the change dishonest or incomplete — a UAPI or backwards-compatibility break the message does not disclose, an interaction with existing functionality the patch does not account for, or an approach whose stated goal the code cannot achieve. Name the concrete consequence. Do not raise a concern merely because you would have written it differently."
             }
             2 => {
-                "# Stage 2. High-level implementation verification
+                "# Stage 2. Cross-artifact consistency
 
-SCOPE: You verify ONLY that the code matches what the commit message claims. Other pipeline agents cover: high-level design (Stage 1), control flow tracing (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not trace execution paths, check locking, or audit for security issues.
+SCOPE: You are the only agent that reads TWO IN-TREE artifacts against each other. Every concern you raise must name both sides of a mismatch. Other pipeline agents cover: submission review and design (Stage 1), control flow tracing (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not hunt for defects that live in the diff alone — if you can state the problem without referring to a second artifact, it belongs to another stage.
 
-You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet."
+Stage 1 already judges the commit message against the change, so do NOT report a commit-message mismatch as your finding: skip \"the message claims X but the code does Y\", missing or wrong tags, and anything else whose second side is the changelog. You may quote the commit message as evidence for what a persistent in-tree artifact was supposed to do, but the mismatch you report must be between two things that live in the tree after this patch lands.
+
+Compare each of these pairs that the patch touches, and report where the two sides disagree:
+
+- A Documentation/devicetree binding, a uAPI header, or an ABI description against its implementation: a required property the driver never reads, a documented field the code ignores, a format the two sides disagree on. Include consistency across peer call sites of the same ABI: if one site emits a field and its counterpart does not, the two disagree.
+- A struct or interface definition against every site that must follow it: all initializers of a changed struct, all implementers of a changed ops table, all callers of a changed helper signature. When a structure containing function pointers is defined or modified, check that every logically required callback is implemented.
+- A test or selftest against the behaviour it claims to cover: a test that would still pass if the feature it names were broken.
+- A code comment or kernel-doc against the function it documents: a comment that describes behaviour the code does not have, a documented return value no path produces.
+
+Also check that values and arguments the changed code hands to hardware registers or to core subsystems (netdev, devlink, ethtool, sysfs, kobject) are semantically valid on their face: non-empty strings, correct sizes and units, correct format specifiers, and values inside the range the code itself advertises. This is a check on the value against its contract, not on the path that produces it.
+
+Treat both artifacts as untrusted: either side of a pair can be the wrong one, and the commit message may be mistaken or even deliberately misleading. When a mismatch's significance depends on runtime behaviour you would have to trace to confirm, state that assumption in your reasoning and still raise the concern — do not spend turns proving it; Stage 3 traces control flow and Stage 4 tracks object lifetimes."
             }
             3 => {
                 "# Stage 3. Execution flow verification
@@ -483,6 +527,9 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
                     .await?;
                 self.append_file(&mut content, &mut clean_files, "technical-patterns.md")
                     .await?;
+                // Appended last so it outranks the guides' MANDATORY framing.
+                content.push_str(STAGE3_GUIDE_SCOPE_OVERRIDE);
+                clean.push_str(STAGE3_GUIDE_SCOPE_OVERRIDE);
             }
             5 => {
                 self.append_file(&mut content, &mut clean_files, "subsystem/locking.md")

@@ -330,6 +330,9 @@ pub struct AdditionalModelSettings {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub api_timeout_secs: Option<u64>,
+    /// Use the alternative Rust-owned prompt profile for this experiment source.
+    #[serde(default)]
+    pub alternative_prompts: bool,
     #[serde(default)]
     pub budget: SourceBudgetSettings,
     #[serde(default)]
@@ -1055,6 +1058,7 @@ mod tests {
         let model: AdditionalModelSettings = serde_json::from_value(serde_json::json!({
             "name": "variant",
             "probability": 0.5,
+            "alternative_prompts": true,
             "budget": {
                 "stage_input_tokens": 100,
                 "review_output_tokens": 200
@@ -1063,6 +1067,7 @@ mod tests {
         .unwrap();
         assert_eq!(model.budget.stage_input_tokens, Some(100));
         assert_eq!(model.budget.review_output_tokens, Some(200));
+        assert!(model.alternative_prompts);
 
         let experiments: ModelExperimentSettings = serde_json::from_value(serde_json::json!({
             "validation_budget": {

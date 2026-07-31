@@ -143,6 +143,11 @@ provider = "gemini"
 model = "gemini-3-pro"
 temperature = 0.7
 probability = 0.05
+
+[[ai.additional_models]]
+name = "legacy-prompts"
+probability = 0.10
+alternative_prompts = true
 ```
 
 | Key | Type | Default | Description |
@@ -155,11 +160,17 @@ probability = 0.05
 | `max_input_tokens` | integer | main setting | Input token limit override. |
 | `max_interactions` | integer | main setting | Tool-call round limit override. |
 | `api_timeout_secs` | integer | main setting | Provider request timeout override. |
+| `alternative_prompts` | boolean | `false` | Use the alternative Rust prompt profile while retaining the selected provider/model settings and vendored guidance. |
 
 Each selected model owns an independent budget ledger. The optional
 `[ai.additional_models.budget]` table accepts the same keys as `[ai.budget]`
 and inherits omitted values from the main model. Variant consumption never
 changes the main model's warning flags or retry behavior.
+
+The alternative profile changes only prompts owned by the Sashiko Rust code.
+Both sources read the same vendored guidance from the configured prompt
+directory. Planner stage selection remains shared so default and alternative
+sources run paired analytical stages.
 
 #### `[ai.model_experiments.validation_budget]`
 

@@ -69,6 +69,28 @@ A source has a stable experiment name, provider identity, model identity, and
 origin. Initially origins are `main` and `variant`. Future external review
 results can add another origin without changing reconciliation or validation.
 
+### Prompt-Control Variants
+
+An additional source may set `alternative_prompts = true` to measure a Rust
+prompt change independently of a model change. Enrollment still uses the
+source's normal probability and stable experiment name. The source may inherit
+the main provider and model, making the prompt profile the only intentional
+experimental variable.
+
+Prompt-control variants run the same selected discovery stages as the main
+source. They share stage planning, patch and pre-fetched context, tools, and
+vendored guidance from `third_party/prompts`. `PromptRegistry` switches only
+the Rust-owned per-stage instructions and discovery output guidance when it
+constructs that source's Stage 1 through 7 requests. Merge stages,
+confirmation, and publication policy remain common to both sources.
+
+The alternative profile is a frozen control, not another prompt directory. It
+currently preserves the pre-experiment Stage 1, 2, 3, and 7 behavior and the
+previous dismissed-concern reporting rule. New prompt experiments update the
+default profile while retaining the corresponding old text in the alternative
+profile. Request-level tests must prove that both sources receive the same
+vendored context and that each receives its intended Rust prompt text.
+
 ## Discoveries And Provenance
 
 Every Stage 1 through 7 concern becomes a source-owned discovery with a stable
@@ -195,6 +217,11 @@ name = "opus"
 name = "sonnet"
 probability = 0.10
 model = "claude-sonnet-4-6"
+
+[[ai.additional_models]]
+name = "legacy-prompts"
+probability = 0.10
+alternative_prompts = true
 
 [ai.additional_models.budget]
 stage_input_tokens = 120000

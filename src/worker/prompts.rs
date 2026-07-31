@@ -168,6 +168,38 @@ const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
 /// other stage found them.
 const STAGE3_GUIDE_SCOPE_OVERRIDE: &str = "\n\n# Scope override for the guides above\n\nThe preceding guides are shared with other tooling that runs a single unscoped reviewer, so some of their tasks name work owned by other agents in this pipeline. Where they conflict with this stage's SCOPE, this override wins.\n\nYou review CODE, not prose. Never report a concern about the wording or accuracy of a comment, a kernel-doc block, Documentation/, or the commit message — not a contradiction between a comment and the code, not a stale or misleading comment, not an inaccurate commit-message claim, not spelling or grammar. Stages 1 and 2 own all of that. Prose is only ever a hint here: when a comment or the commit message tells you what the code was meant to do, use that to find the defect, then report the defect in terms of the code and the failure it causes, with no remark about the prose.\n\nThe following are likewise other stages' concerns; treat them only as context for judging whether a control-flow or logic defect is real, and do not report them in their own right: questioning design decisions (Task 8 item 3), API naming (item 4), C best practices (item 5), dead code (item 6), and coding-style rules (item 8). Lock correctness (Tasks 3, 4), resource lifecycle and RCU teardown (Tasks 5, 5B), and uninitialized variables (Task 7) belong to Stages 4 and 5; investigate them only far enough to establish the control-flow defect you are reporting.\n\nYou SHOULD still report a defect that remains reachable after this patch, including one the patch's own fix does not fully close. Describe it mechanically — the code path and the resulting failure — rather than as a shortfall against the commit message.\n\nDo not drop a real defect because of this override. If a concern is genuinely control flow or logic and you can describe how the code reaches it, report it.";
 
+/// Rust-owned stage prompts preserved for the alternative experiment profile.
+///
+/// These are deliberately separate from the default literals in
+/// `PromptRegistry::get_stage_prompt()`: prompt experiments update the default
+/// prompt while this snapshot remains stable for the sampled control source.
+const ALTERNATIVE_STAGE_1_INSTRUCTION: &str = "# Stage 1. Analyze commit main goal
+
+SCOPE: You review ONLY high-level intent and design — the \"what\" and \"why\", not the \"how\". Other pipeline agents cover: implementation completeness (Stage 2), control flow bugs (Stage 3), resource leaks/UAF (Stage 4), locking/concurrency (Stage 5), security vulnerabilities (Stage 6), and hardware correctness (Stage 7). Do NOT analyze locking correctness, sleeping-in-atomic-context, lock ordering, race conditions, or any concurrency concern — Stage 5 handles all of that. Do not read source code to trace lock/context interactions.
+
+You are a senior Linux kernel maintainer evaluating the high-level intent of a proposed commit. Analyze the commit message and the conceptual change. Focus on the big picture: Are there architectural flaws, UAPI breakages, backwards compatibility issues, or fundamentally wrong approaches? Consider the long-term maintainability and system-wide implications of this design. If the core idea is dangerous, incorrect, or violates established kernel principles, raise a concern. Be open-minded but thorough; question assumptions made by the author and consider alternative, simpler designs.";
+
+const ALTERNATIVE_STAGE_2_INSTRUCTION: &str = "# Stage 2. High-level implementation verification
+
+SCOPE: You verify ONLY that the code matches what the commit message claims. Other pipeline agents cover: high-level design (Stage 1), control flow tracing (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), security (Stage 6), and hardware (Stage 7). Do not trace execution paths, check locking, or audit for security issues.
+
+You are verifying if the provided code changes actually implement what the commit message claims. Look for undocumented side-effects, missing pieces (e.g., a core change without updating corresponding callers, or changing a struct without updating all initializers), and unhandled corner cases related to the feature's logic. Explicitly check for missing API callbacks and interface omissions: when defining or modifying structures containing function pointers, verify that all logically required callbacks are implemented. Verify that all claims in the commit message are fully realized in the code. Identify any incomplete implementations, implicit behavioral changes, or API contract violations. Furthermore, verify that the logic is mathematically and semantically sound. Check for off-by-one errors in bounds, incorrect bitwise operations, and verify that all arguments passed to external subsystems (like kobjects or netdevs) are valid and semantically correct (e.g., non-empty strings, correct sizes, correct format specifiers). Don't trust the commit message without verifying each claim. Assume that the message might be incorrect or even intentionally malicious. Do not focus on low-level memory or locking errors yet.";
+
+const ALTERNATIVE_STAGE_7_INSTRUCTION: &str = "# Stage 7. Hardware engineer's review
+
+SCOPE: You review ONLY hardware/driver-specific concerns. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), and security (Stage 6). Do not report general software logic issues that aren't hardware-related.
+
+You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return empty concerns and dismissed-concerns arrays.";
+
+const DEFAULT_DISMISSED_CONCERNS_GUIDANCE: &str = "Use the \"dismissed_concerns\" array ONLY for candidate concerns you considered plausible, investigated with a tool call, and disproved. If re-reading the diff, pre-fetched context, or commit message was enough to rule a candidate out, drop it without reporting.";
+const ALTERNATIVE_DISMISSED_CONCERNS_GUIDANCE: &str = "Use the \"dismissed_concerns\" array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustPromptProfile {
+    Default,
+    Alternative,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct PatchInput {
     pub index: i64,
@@ -221,6 +253,7 @@ pub struct AdditionalModelRunner {
     pub model_id: String,
     pub provider_id: String,
     pub budget: Option<ReviewBudget>,
+    pub alternative_prompts: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -281,13 +314,25 @@ fn dedup_stats(total_concerns: usize, findings: &Value) -> Value {
     })
 }
 
+#[derive(Clone)]
 pub struct PromptRegistry {
     base_dir: PathBuf,
+    rust_profile: RustPromptProfile,
 }
 
 impl PromptRegistry {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            rust_profile: RustPromptProfile::Default,
+        }
+    }
+
+    pub fn with_alternative_rust_prompts(&self) -> Self {
+        Self {
+            base_dir: self.base_dir.clone(),
+            rust_profile: RustPromptProfile::Alternative,
+        }
     }
 
     pub fn get_system_identity() -> &'static str {
@@ -371,7 +416,7 @@ impl PromptRegistry {
         let mut clean_files = Vec::new();
         let mut content = String::with_capacity(10_000);
 
-        let stage_instruction = match stage {
+        let default_stage_instruction = match stage {
             1 => {
                 "# Stage 1. Submission review: is this change honest and complete?
 
@@ -556,6 +601,12 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
             }
             _ => "",
         };
+        let stage_instruction = match (self.rust_profile, stage) {
+            (RustPromptProfile::Alternative, 1) => ALTERNATIVE_STAGE_1_INSTRUCTION,
+            (RustPromptProfile::Alternative, 2) => ALTERNATIVE_STAGE_2_INSTRUCTION,
+            (RustPromptProfile::Alternative, 7) => ALTERNATIVE_STAGE_7_INSTRUCTION,
+            _ => default_stage_instruction,
+        };
 
         if !stage_instruction.is_empty() {
             content.push_str(stage_instruction);
@@ -570,9 +621,6 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
                     .await?;
                 self.append_file(&mut content, &mut clean_files, "technical-patterns.md")
                     .await?;
-                // Appended last so it outranks the guides' MANDATORY framing.
-                content.push_str(STAGE3_GUIDE_SCOPE_OVERRIDE);
-                clean.push_str(STAGE3_GUIDE_SCOPE_OVERRIDE);
             }
             5 => {
                 self.append_file(&mut content, &mut clean_files, "subsystem/locking.md")
@@ -590,11 +638,42 @@ SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function n
             }
             _ => {}
         }
+        let rust_suffix = self.rust_stage_suffix(stage);
+        if !rust_suffix.is_empty() {
+            content.push_str(rust_suffix);
+            clean.push_str(rust_suffix);
+        }
         if !clean_files.is_empty() {
             clean.push_str(&clean_files.join(", "));
             clean.push_str("\n\n");
         }
         Ok((content, clean))
+    }
+
+    /// Rust-owned text appended after vendored stage guides.
+    ///
+    /// Default prompt experiments can add an override here without changing
+    /// the preserved alternative profile.
+    fn rust_stage_suffix(&self, stage: u8) -> &'static str {
+        match (self.rust_profile, stage) {
+            // Appended last so it outranks the guides' MANDATORY framing.
+            (RustPromptProfile::Default, 3) => STAGE3_GUIDE_SCOPE_OVERRIDE,
+            _ => "",
+        }
+    }
+
+    fn apply_discovery_format_profile(
+        &self,
+        default: &'static str,
+    ) -> std::borrow::Cow<'static, str> {
+        match self.rust_profile {
+            RustPromptProfile::Default => std::borrow::Cow::Borrowed(default),
+            RustPromptProfile::Alternative => std::borrow::Cow::Owned(default.replacen(
+                DEFAULT_DISMISSED_CONCERNS_GUIDANCE,
+                ALTERNATIVE_DISMISSED_CONCERNS_GUIDANCE,
+                1,
+            )),
+        }
     }
 
     async fn append_file(
@@ -1158,6 +1237,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                     progress,
                     StageExecutionConfig {
                         provider: main_provider,
+                        prompts: self.prompts.clone(),
                         name: "main".to_string(),
                         temperature: self.temperature,
                         max_interactions: self.max_interactions,
@@ -1171,6 +1251,11 @@ You MUST respond with ONLY a JSON object, no other text. Example:
 
                 for model in &self.additional_models {
                     let variant_stage = create_stage(stage_num);
+                    let variant_prompts = if model.alternative_prompts {
+                        self.prompts.with_alternative_rust_prompts()
+                    } else {
+                        self.prompts.clone()
+                    };
                     let (opener, waiter) = claim_prefix_gate(
                         &mut prefix_gates,
                         &model.name,
@@ -1184,6 +1269,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                         progress,
                         StageExecutionConfig {
                             provider: model.provider.clone(),
+                            prompts: variant_prompts,
                             name: model.name.clone(),
                             temperature: model.temperature,
                             max_interactions: model.max_interactions,
@@ -2067,7 +2153,7 @@ Example Output:
         }
 
         info!("Running Stage {}", stage_num);
-        let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage_num).await?;
+        let (stage_prompt, clean_stage_prompt) = config.prompts.get_stage_prompt(stage_num).await?;
 
         let format_guidance = r#"EFFICIENCY: Stay focused on this stage's scope. Use tools only to verify specific concerns from the diff; do not explore broadly. Aim to finish in 3-5 tool calls or fewer.
 
@@ -2127,6 +2213,10 @@ Example:
   ]
 }
 ```"#;
+
+        let format_guidance = config
+            .prompts
+            .apply_discovery_format_profile(format_guidance);
 
         let user_prompt = format!("{}\n\n{}", stage_prompt, format_guidance);
         let clean_user_prompt = format!("{}\n\n{}", clean_stage_prompt, format_guidance);
@@ -3000,6 +3090,7 @@ struct StageExecutionResult {
 
 struct StageExecutionConfig {
     provider: Arc<dyn AiProvider>,
+    prompts: PromptRegistry,
     name: String,
     temperature: f32,
     max_interactions: usize,
@@ -3598,6 +3689,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn alternative_rust_profile_reuses_the_vendored_prompt_directory() {
+        let default = PromptRegistry::new(PathBuf::from("/srv/prompts/kernel"));
+        let alternative = default.with_alternative_rust_prompts();
+
+        assert_eq!(default.base_dir, alternative.base_dir);
+        assert_eq!(default.rust_profile, RustPromptProfile::Default);
+        assert_eq!(alternative.rust_profile, RustPromptProfile::Alternative);
+
+        let (default_stage1, _) = default.get_stage_prompt(1).await.unwrap();
+        let (alternative_stage1, _) = alternative.get_stage_prompt(1).await.unwrap();
+        assert!(default_stage1.contains("is this change honest and complete?"));
+        assert!(alternative_stage1.contains("Analyze commit main goal"));
+
+        let (default_stage3, _) = default.get_stage_prompt(3).await.unwrap();
+        let (alternative_stage3, _) = alternative.get_stage_prompt(3).await.unwrap();
+        assert!(default_stage3.contains("Scope override for the guides above"));
+        assert!(!alternative_stage3.contains("Scope override for the guides above"));
+
+        let (default_stage7, _) = default.get_stage_prompt(7).await.unwrap();
+        let (alternative_stage7, _) = alternative.get_stage_prompt(7).await.unwrap();
+        assert!(default_stage7.contains("SCOPE TEST: apply this to every concern"));
+        assert!(!alternative_stage7.contains("SCOPE TEST: apply this to every concern"));
+        assert!(alternative_stage7.contains("rings/queues are actually initialized"));
+    }
+
     #[test]
     fn review_source_manifest_distinguishes_participation_states() {
         let mut cohort = test_variant_cohort();
@@ -4105,6 +4222,7 @@ mod tests {
                     model_id: "model-b".to_string(),
                     provider_id: "test".to_string(),
                     budget: None,
+                    alternative_prompts: false,
                 }],
                 cohort: crate::ai::model_experiment::ReviewCohort {
                     main: crate::ai::model_experiment::SourceIdentity {
@@ -4184,6 +4302,7 @@ mod tests {
                     model_id: "model-b".to_string(),
                     provider_id: "test".to_string(),
                     budget: None,
+                    alternative_prompts: false,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -4247,6 +4366,7 @@ mod tests {
                     model_id: "model-b".to_string(),
                     provider_id: "test".to_string(),
                     budget: None,
+                    alternative_prompts: false,
                 }],
                 cohort: test_variant_cohort(),
                 validation_budget: None,
@@ -4878,6 +4998,119 @@ mod tests {
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         assert_eq!(provider.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    struct PromptCaptureProvider {
+        requests: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for PromptCaptureProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let mut text = request.system.unwrap_or_default();
+            for message in request.messages {
+                if let Some(content) = message.content {
+                    text.push_str(&content);
+                }
+            }
+            self.requests.lock().unwrap().push(text);
+            Ok(crate::ai::AiResponse {
+                content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            1
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "prompt-capture".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn alternative_prompt_variant_reuses_vendored_guidance() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("kernel");
+        std::fs::create_dir_all(prompts_dir.join("patterns")).unwrap();
+        std::fs::write(
+            prompts_dir.join("patterns/context.md"),
+            "SHARED_VENDORED_CONTEXT_MARKER",
+        )
+        .unwrap();
+
+        let main = Arc::new(PromptCaptureProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let variant = Arc::new(PromptCaptureProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            main_model: "main-model".to_string(),
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            analysis_stage_parallelism: 1,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec![1]),
+            dump_conversation: None,
+            budget: None,
+            merge_budget: None,
+            retry_provider: None,
+            additional_models: vec![AdditionalModelRunner {
+                name: "variant".to_string(),
+                provider: variant.clone(),
+                temperature: 0.0,
+                max_interactions: 3,
+                model_id: "variant-model".to_string(),
+                provider_id: "test".to_string(),
+                budget: None,
+                alternative_prompts: true,
+            }],
+            cohort: test_variant_cohort(),
+            validation_budget: None,
+        };
+        let mut worker = Worker::new(
+            main.clone(),
+            Arc::new(tools),
+            PromptRegistry::new(prompts_dir),
+            config,
+        );
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        worker.run(patchset, None).await.unwrap();
+
+        let main_requests = main.requests.lock().unwrap();
+        assert_eq!(main_requests.len(), 1);
+        assert!(main_requests[0].contains("SHARED_VENDORED_CONTEXT_MARKER"));
+        assert!(main_requests[0].contains("is this change honest and complete?"));
+        assert!(main_requests[0].contains("investigated with a tool call"));
+
+        let variant_requests = variant.requests.lock().unwrap();
+        assert_eq!(variant_requests.len(), 1);
+        assert!(variant_requests[0].contains("SHARED_VENDORED_CONTEXT_MARKER"));
+        assert!(variant_requests[0].contains("Analyze commit main goal"));
+        assert!(variant_requests[0].contains("disproved with concrete evidence"));
+        assert!(!variant_requests[0].contains("investigated with a tool call"));
     }
 
     #[tokio::test]

@@ -540,6 +540,7 @@ async fn review_single_patch(
                     model_id: variant_ai.model.clone(),
                     provider_id,
                     budget: Some(ReviewBudget::new(variant_ai.discovery_budget_config())),
+                    alternative_prompts: model.alternative_prompts,
                 }
             })
             .collect::<Vec<_>>();

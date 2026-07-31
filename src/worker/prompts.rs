@@ -2294,33 +2294,22 @@ Example:
                 .map(|target| target.finding_id.as_str())
                 .collect();
             let prompt = format!(
-                "{shared_context}\n\nYou are the false-positive confirmation reviewer. Independently verify every finding below against the patch and supplied code context. Return one boolean for every finding ID: true only when the issue is real and actionable, false when it is unsupported or incorrect.\n\nFindings:\n{}\n\n{}",
+                "{shared_context}\n\nYou are the false-positive confirmation reviewer. Independently verify every finding below against the patch and supplied code context. This is a bounded second opinion, not a full re-review: begin with the supplied evidence and do not broadly re-investigate the patch or explore the repository. Use the read-only code tools only when a specific missing fact or ambiguity prevents a reliable decision, and keep tool use to the minimum needed to resolve it. In particular, before rejecting a finding whose validity depends on code outside the supplied context, inspect only the exact caller, implementation, or test path needed to resolve that dependency. Return one boolean for every finding ID: true only when the issue is real and actionable, false when concrete evidence shows it is unsupported or incorrect.\n\nFindings:\n{}\n\n{}",
                 serde_json::to_string_pretty(&payload)?,
                 confirmation_format_instruction(&expected_ids)
             );
-            let request = AiRequest {
-                system: None,
-                messages: vec![AiMessage {
-                    role: AiRole::User,
-                    content: Some(prompt),
-                    thought: None,
-                    thought_signature: None,
-                    reasoning: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                }],
-                tools: None,
-                temperature: Some(0.0),
-                response_format: Some(AiResponseFormat::Json {
-                    schema: Some(confirmation_schema(&expected_ids)),
-                }),
-                context_tag: self.context_tag.clone(),
-            };
             let validation_budget = self.validation_budget.map(ReviewBudget::new);
             let (decision_result, (tokens_in, tokens_out, tokens_cached)) = request_confirmation(
                 provider.as_ref(),
-                request,
-                &expected_ids,
+                ConfirmationRequest {
+                    prompt,
+                    expected_ids: expected_ids.iter().map(|id| (*id).to_string()).collect(),
+                    tools: self.tools.clone(),
+                    context_tag: self.context_tag.clone(),
+                    conversation_dumper: self.conversation_dumper.clone(),
+                    dump_label: format!("confirm-{confirmer}"),
+                    max_turns: self.max_interactions,
+                },
                 validation_budget.as_ref(),
             )
             .await;
@@ -2497,98 +2486,201 @@ fn parse_confirmation_response(content: &str, expected_ids: &[&str]) -> Result<V
         .unwrap_or_else(|| anyhow::anyhow!("confirmation response contained no JSON object")))
 }
 
-async fn request_confirmation(
-    provider: &dyn AiProvider,
-    request: AiRequest,
-    expected_ids: &[&str],
-    budget: Option<&ReviewBudget>,
-) -> (Result<Value>, (usize, usize, usize)) {
-    let mut last_error: Option<anyhow::Error> = None;
-    let mut tokens = (0, 0, 0);
-    let mut request = request;
-    for attempt in 0..2 {
-        // Restate the contract on retry; resending the identical prompt just
-        // reproduces the same malformed reply.
-        if attempt > 0 {
-            let feedback = format!(
-                "\n\nYour previous reply could not be parsed ({}). {}",
-                last_error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unknown error".to_string()),
-                confirmation_format_instruction(expected_ids)
-            );
-            if let Some(message) = request.messages.last_mut()
-                && let Some(content) = message.content.as_mut()
-            {
-                content.push_str(&feedback);
-            }
-        }
-        let estimated_input = provider.estimate_tokens(&request);
-        if budget.is_some_and(|budget| !budget.allows(estimated_input, 0)) {
-            return (
-                Err(anyhow::anyhow!(
-                    "validation input estimate exceeds the confirmation budget"
-                )),
-                tokens,
-            );
-        }
-        match provider.generate_content(request.clone()).await {
-            Ok(response) => {
-                if let Some(usage) = &response.usage {
-                    let within_budget = budget.is_none_or(|budget| {
-                        budget.allows(usage.prompt_tokens, usage.completion_tokens)
-                    });
-                    tokens.0 += usage.prompt_tokens;
-                    tokens.1 += usage.completion_tokens;
-                    tokens.2 += usage.cached_tokens.unwrap_or(0);
-                    if let Some(budget) = budget {
-                        let mut flags = 0;
-                        budget.record_and_check(
-                            &mut flags,
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            usage.cached_tokens.unwrap_or(0),
-                        );
-                    }
-                    if !within_budget {
-                        return (
-                            Err(anyhow::anyhow!(
-                                "confirmation usage exceeded the validation budget"
-                            )),
-                            tokens,
-                        );
-                    }
-                }
-                let content = response.content.as_deref().unwrap_or("{}");
-                match parse_confirmation_response(content, expected_ids) {
-                    Ok(decisions) => {
-                        if attempt > 0 {
-                            crate::json_health::record(
-                                CONFIRMATION_SOURCE,
-                                crate::json_health::JsonDecodeOutcome::RecoveredOnRetry,
-                                &last_error
-                                    .map(|error| error.to_string())
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        return (Ok(decisions), tokens);
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            Err(error) => return (Err(error), tokens),
+struct ConfirmationRequest {
+    prompt: String,
+    expected_ids: Vec<String>,
+    tools: Arc<ToolBox>,
+    context_tag: Option<String>,
+    conversation_dumper: Option<Arc<ConversationDumper>>,
+    dump_label: String,
+    max_turns: usize,
+}
+
+struct ConfirmationSession {
+    prompt: String,
+    expected_ids: Vec<String>,
+    tools: Arc<ToolBox>,
+    context_tag: Option<String>,
+    last_tool_call: Option<(String, Value)>,
+    pending_json_decode_error: Option<String>,
+}
+
+impl ConfirmationSession {
+    fn new(
+        prompt: String,
+        expected_ids: Vec<String>,
+        tools: Arc<ToolBox>,
+        context_tag: Option<String>,
+    ) -> Self {
+        Self {
+            prompt,
+            expected_ids,
+            tools,
+            context_tag,
+            last_tool_call: None,
+            pending_json_decode_error: None,
         }
     }
-    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("confirmation request failed"));
-    crate::json_health::record(
-        CONFIRMATION_SOURCE,
-        crate::json_health::JsonDecodeOutcome::Fatal,
-        &error.to_string(),
+
+    fn expected_ids(&self) -> Vec<&str> {
+        self.expected_ids.iter().map(String::as_str).collect()
+    }
+
+    fn finish_json_decode(&mut self, outcome: crate::json_health::JsonDecodeOutcome) {
+        if let Some(error) = self.pending_json_decode_error.take() {
+            crate::json_health::record(CONFIRMATION_SOURCE, outcome, &error);
+        }
+    }
+}
+
+impl Drop for ConfirmationSession {
+    fn drop(&mut self) {
+        self.finish_json_decode(crate::json_health::JsonDecodeOutcome::Fatal);
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmSession for ConfirmationSession {
+    type Output = Value;
+
+    fn system_prompt(&self) -> String {
+        String::new()
+    }
+
+    fn initial_user_prompt(&self) -> String {
+        self.prompt.clone()
+    }
+
+    fn format_validation_feedback(&self, violation: &str) -> String {
+        format!(
+            "Your previous reply could not be parsed ({violation}). {}",
+            confirmation_format_instruction(&self.expected_ids())
+        )
+    }
+
+    fn tools(&self) -> Option<Vec<AiTool>> {
+        Some(self.tools.get_declarations_generic())
+    }
+
+    fn temperature(&self) -> Option<f32> {
+        Some(0.0)
+    }
+
+    fn context_tag(&self) -> Option<String> {
+        self.context_tag.clone()
+    }
+
+    fn response_format(&self) -> Option<AiResponseFormat> {
+        Some(AiResponseFormat::Json {
+            schema: Some(confirmation_schema(&self.expected_ids())),
+        })
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        if self
+            .last_tool_call
+            .as_ref()
+            .is_some_and(|(last_name, last_args)| last_name == name && last_args == &args)
+        {
+            return Ok(json!({
+                "error": "Duplicate tool call blocked. Use the evidence already returned."
+            }));
+        }
+        self.last_tool_call = Some((name.to_string(), args.clone()));
+        match self.tools.call(name, args).await {
+            Ok(value) => Ok(value),
+            Err(error) => Ok(json!({"error": error.to_string()})),
+        }
+    }
+
+    fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+        let content = response.content.as_deref().unwrap_or("{}");
+        match parse_confirmation_response(content, &self.expected_ids()) {
+            Ok(decisions) => {
+                self.finish_json_decode(crate::json_health::JsonDecodeOutcome::RecoveredOnRetry);
+                Ok(decisions)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.pending_json_decode_error.get_or_insert(error.clone());
+                Err(ValidationError::FormatViolation(error))
+            }
+        }
+    }
+}
+
+struct UsageTrackingProvider<'a> {
+    inner: &'a dyn AiProvider,
+    usage: std::sync::Mutex<(usize, usize, usize)>,
+}
+
+impl<'a> UsageTrackingProvider<'a> {
+    fn new(inner: &'a dyn AiProvider) -> Self {
+        Self {
+            inner,
+            usage: std::sync::Mutex::new((0, 0, 0)),
+        }
+    }
+
+    fn usage(&self) -> (usize, usize, usize) {
+        *self.usage.lock().unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl AiProvider for UsageTrackingProvider<'_> {
+    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        let response = self.inner.generate_content(request).await?;
+        if let Some(usage) = &response.usage {
+            let mut total = self.usage.lock().unwrap();
+            total.0 += usage.prompt_tokens;
+            total.1 += usage.completion_tokens;
+            total.2 += usage.cached_tokens.unwrap_or(0);
+        }
+        Ok(response)
+    }
+
+    fn estimate_tokens(&self, request: &AiRequest) -> usize {
+        self.inner.estimate_tokens(request)
+    }
+
+    fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+        self.inner.get_capabilities()
+    }
+
+    fn cache_stats(&self) -> Option<crate::ai::CacheStats> {
+        self.inner.cache_stats()
+    }
+
+    fn caches_prompt_prefix(&self) -> bool {
+        self.inner.caches_prompt_prefix()
+    }
+}
+
+async fn request_confirmation(
+    provider: &dyn AiProvider,
+    request: ConfirmationRequest,
+    budget: Option<&ReviewBudget>,
+) -> (Result<Value>, (usize, usize, usize)) {
+    let tracked = UsageTrackingProvider::new(provider);
+    let mut session = ConfirmationSession::new(
+        request.prompt,
+        request.expected_ids,
+        request.tools,
+        request.context_tag,
     );
-    (Err(error), tokens)
+    let result = SessionRunner::new(&tracked)
+        .with_conversation_dump(request.conversation_dumper, request.dump_label)
+        .with_budget(budget.cloned())
+        .with_max_validation_attempts(2)
+        .with_max_turns(request.max_turns)
+        .run(&mut session)
+        .await;
+    let tokens = tracked.usage();
+    match result {
+        Ok(result) => (Ok(result.output), tokens),
+        Err(error) => (Err(error), tokens),
+    }
 }
 
 fn validate_confirmation_decisions(decisions: &Value, expected_ids: &[&str]) -> Result<()> {
@@ -3592,6 +3684,34 @@ mod tests {
         }
     }
 
+    async fn run_test_confirmation(
+        provider: &dyn AiProvider,
+        request: AiRequest,
+        expected_ids: &[&str],
+        budget: Option<&ReviewBudget>,
+    ) -> (Result<Value>, (usize, usize, usize)) {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = request
+            .messages
+            .first()
+            .and_then(|message| message.content.clone())
+            .unwrap_or_default();
+        request_confirmation(
+            provider,
+            ConfirmationRequest {
+                prompt,
+                expected_ids: expected_ids.iter().map(|id| (*id).to_string()).collect(),
+                tools: Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+                context_tag: request.context_tag,
+                conversation_dumper: None,
+                dump_label: "test-confirmation".to_string(),
+                max_turns: 4,
+            },
+            budget,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn confirmation_retries_incomplete_mappings() {
         let _guard = crate::json_health::TEST_GUARD.lock().await;
@@ -3607,7 +3727,7 @@ mod tests {
             response_format: None,
             context_tag: None,
         };
-        let (decisions, _) = request_confirmation(&provider, request, &["a", "b"], None).await;
+        let (decisions, _) = run_test_confirmation(&provider, request, &["a", "b"], None).await;
         let decisions = decisions.unwrap();
         assert_eq!(decisions["b"], false);
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -3627,7 +3747,15 @@ mod tests {
         impl AiProvider for PromptRecorder {
             async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
                 let mut prompts = self.prompts.lock().unwrap();
-                prompts.push(request.messages[0].content.clone().unwrap_or_default());
+                prompts.push(
+                    request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == AiRole::User)
+                        .filter_map(|message| message.content.as_deref())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
                 let call = prompts.len();
                 drop(prompts);
                 Ok(AiResponse {
@@ -3677,7 +3805,7 @@ mod tests {
             context_tag: None,
         };
 
-        let (decisions, _) = request_confirmation(&provider, request, &["a"], None).await;
+        let (decisions, _) = run_test_confirmation(&provider, request, &["a"], None).await;
         assert_eq!(decisions.unwrap()["a"], true);
 
         let prompts = provider.prompts.lock().unwrap();
@@ -3728,7 +3856,7 @@ mod tests {
             context_tag: None,
         };
 
-        let (result, _) = request_confirmation(&provider, request, &["a"], None).await;
+        let (result, _) = run_test_confirmation(&provider, request, &["a"], None).await;
 
         assert!(result.is_err());
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3736,7 +3864,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmation_can_resolve_ambiguity_with_a_code_tool() {
+        struct ToolUsingProvider {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl AiProvider for ToolUsingProvider {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    assert!(request.tools.as_ref().is_some_and(|tools| {
+                        tools.iter().any(|tool| tool.name == "git_read_files")
+                    }));
+                    return Ok(AiResponse {
+                        content: None,
+                        thought: None,
+                        thought_signature: None,
+                        reasoning: None,
+                        tool_calls: Some(vec![crate::ai::ToolCall {
+                            id: "tool-1".to_string(),
+                            function_name: "git_ls".to_string(),
+                            arguments: json!({"revision": "HEAD", "path": "."}),
+                            thought_signature: None,
+                        }]),
+                        usage: None,
+                        truncated: false,
+                    });
+                }
+                assert!(request.messages.iter().any(|message| {
+                    message.role == AiRole::Tool
+                        && message.tool_call_id.as_deref() == Some("tool-1")
+                }));
+                Ok(AiResponse {
+                    content: Some(json!({"a": true}).to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+                0
+            }
+
+            fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+                crate::ai::ProviderCapabilities {
+                    model_name: "tool-using-confirmer".to_string(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let provider = ToolUsingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Confirm finding a.".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let (result, _) = run_test_confirmation(&provider, request, &["a"], None).await;
+
+        assert_eq!(result.unwrap()["a"], true);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn confirmation_retry_cannot_exceed_its_review_budget() {
+        let _guard = crate::json_health::TEST_GUARD.lock().await;
+        crate::json_health::drain();
         let provider = ConfirmationProvider {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -3760,11 +3972,12 @@ mod tests {
         });
 
         let (decisions, tokens) =
-            request_confirmation(&provider, request, &["a", "b"], Some(&budget)).await;
+            run_test_confirmation(&provider, request, &["a", "b"], Some(&budget)).await;
 
         assert!(decisions.is_err());
         assert_eq!(tokens.0, 10);
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        crate::json_health::drain();
     }
 
     #[tokio::test]

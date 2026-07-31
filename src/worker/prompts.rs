@@ -2039,7 +2039,7 @@ If you find concerns, each must be an object with:
 - "preexisting": A boolean value: `true` if this bug/vulnerability already existed in the codebase before these patches were applied, or `false` if the issue was newly introduced by the reviewed patchset.
 - "locations": An array of objects, each containing "file", "function_or_symbol", "line_range" (e.g., "120-125"), and "why_this_location_matters". Use `null` for "file", "function_or_symbol", or "line_range" when an issue is non-local or the exact value is not known. Do not invent line numbers; use `line_range: null` when the exact lines are not known and explain the triggering condition in "reasoning".
 
-Use the "dismissed_concerns" array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
+Use the "dismissed_concerns" array ONLY for candidate concerns you considered plausible, investigated with a tool call, and disproved. If re-reading the diff, pre-fetched context, or commit message was enough to rule a candidate out, drop it without reporting.
 If you find dismissed_concerns, each must use the same item schema as concerns except that dismissed_concerns do not need the "preexisting" field:
 - "type": A short category string.
 - "description": The candidate concern that was investigated and disproved.

@@ -15,8 +15,20 @@ and consolidated dismissed concerns before final verification.
 Before passing data to the stages, the orchestrator should prepare the context:
 1. **Target Commit Diff:** The raw patch being analyzed.
 2. **Commit Message:** The full commit log.
-3. **Loaded Context:** Relevant files loaded from the project (e.g., modified functions, relevant structs) based on the diff. This avoids sending the entire kernel tree to every stage.
+3. **Loaded Context:** Relevant post-patch definitions loaded from the project
+   based on the diff. Modified functions are not duplicated when their complete
+   definition is already visible in one additive-only diff section for the file;
+   partial or subtractive functions remain included. Referenced types and
+   direct callees are still eligible for definition lookup when the modified
+   function itself is omitted. Files with multiple revisions in a series
+   retain their function context because hunk coordinates refer to different
+   intermediate versions.
 4. **Callchain Tracing:** Extract and provide at least 1-level of the callchain (callers of modified functions and callees invoked within them) to Stages 3, 4, and 5.
+
+Prefetched ranges are rendered from the applied worktree with modified files
+first, followed by referenced definitions. Referenced-symbol lookup is limited
+to 50 candidates and the rendered prefetch payload is limited to 200,000
+characters.
 
 ## Prompt Distribution (Precache vs. Stage-Specific)
 To optimize LLM context caching and ensure each stage receives focused instructions, existing prompt files are logically distributed between a globally precached blob and stage-specific injections.

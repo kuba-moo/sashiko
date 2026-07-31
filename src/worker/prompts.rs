@@ -1026,24 +1026,24 @@ impl Worker {
             && !prefetched.is_empty()
         {
             dynamic_context.push_str("\n\n<pre_fetched_context>\n");
-            dynamic_context.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
+            dynamic_context.push_str("The following post-patch source context was automatically pre-fetched from the modified lines and their referenced definitions. Functions already shown completely by an additive-only diff may be omitted to avoid duplicating the patch.\n");
             dynamic_context.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
             dynamic_context.push_str(&prefetched);
             dynamic_context.push_str("\n</pre_fetched_context>\n");
 
             clean_dynamic_context.push_str("\n\n<pre_fetched_context>\n");
-            clean_dynamic_context.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
+            clean_dynamic_context.push_str("The following post-patch source context was automatically pre-fetched from the modified lines and their referenced definitions. Functions already shown completely by an additive-only diff may be omitted to avoid duplicating the patch.\n");
             clean_dynamic_context.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
             clean_dynamic_context.push_str("{{prefetched_context}}\n</pre_fetched_context>\n");
 
             dynamic_context_no_log.push_str("\n\n<pre_fetched_context>\n");
-            dynamic_context_no_log.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
+            dynamic_context_no_log.push_str("The following post-patch source context was automatically pre-fetched from the modified lines and their referenced definitions. Functions already shown completely by an additive-only diff may be omitted to avoid duplicating the patch.\n");
             dynamic_context_no_log.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
             dynamic_context_no_log.push_str(&prefetched);
             dynamic_context_no_log.push_str("\n</pre_fetched_context>\n");
 
             clean_dynamic_context_no_log.push_str("\n\n<pre_fetched_context>\n");
-            clean_dynamic_context_no_log.push_str("The following context was automatically pre-fetched based on the modified lines in the patch. It contains the full source code of the functions and structs modified by the diff AFTER applying the target patch.\n");
+            clean_dynamic_context_no_log.push_str("The following post-patch source context was automatically pre-fetched from the modified lines and their referenced definitions. Functions already shown completely by an additive-only diff may be omitted to avoid duplicating the patch.\n");
             clean_dynamic_context_no_log.push_str("If it's not sufficient, you MUST use available tools to explore the source code. Don't make assumptions without actually looking into the relevant code.\n\n");
             clean_dynamic_context_no_log
                 .push_str("{{prefetched_context}}\n</pre_fetched_context>\n");

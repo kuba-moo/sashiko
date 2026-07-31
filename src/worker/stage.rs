@@ -86,35 +86,12 @@ impl ReviewStage for Stage8 {
         "Deduplication and Consolidation"
     }
     fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-        let parsed = parse_json_response(response, 8)?;
-        if let Some(c) = parsed.get("concerns") {
-            if !c.is_array() {
-                return Err(ValidationError::FormatViolation(
-                    "output 'concerns' is not an array".to_string(),
-                ));
-            }
-            validate_source_stages(c, "concern")?;
-            validate_model_provenance(c, "concern")?;
-        } else {
-            return Err(ValidationError::FormatViolation(
-                "missing 'concerns' array in output".to_string(),
-            ));
-        }
-        if let Some(c) = parsed.get("dismissed_concerns") {
-            if !c.is_array() {
-                return Err(ValidationError::FormatViolation(
-                    "output 'dismissed_concerns' is not an array".to_string(),
-                ));
-            }
-        } else {
-            return Err(ValidationError::FormatViolation(
-                "missing 'dismissed_concerns' array in output".to_string(),
-            ));
-        }
-        Ok(parsed)
+        parse_json_response(response, 8)
     }
     fn format_validation_feedback(&self, violation: &str) -> String {
-        format_validation_feedback_stages_1_to_8(violation)
+        format!(
+            "\n\nYour previous Stage 8 response was rejected. {violation}\n\nReturn one corrected compact plan with `concerns` and `dismissed_concerns` objects, each containing `keep` and `merge` arrays. Every input ID must appear exactly once."
+        )
     }
 }
 

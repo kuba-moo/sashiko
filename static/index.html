@@ -3847,17 +3847,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
                 const decodeDaily = (jsonDecode && jsonDecode.daily) || [];
                 const decodeBySource = (jsonDecode && jsonDecode.by_source) || [];
-                html += '<h2>JSON Decode Failures (last 14 days)</h2>';
+                html += '<h2>Structured Response Errors (last 14 days)</h2>';
                 if (decodeDaily.length) {
                     const decodeTotals = decodeBySource.reduce((acc, row) => ({
                         salvaged: acc.salvaged + (row.salvaged || 0),
                         recovered: acc.recovered + (row.recovered_on_retry || 0),
                         fatal: acc.fatal + (row.fatal || 0)
                     }), { salvaged: 0, recovered: 0, fatal: 0 });
-                    html += '<p style="opacity:0.8; font-size:0.9em;">Replies the models returned that were not' +
-                        ' decodable as the requested JSON. Salvaged means an embedded object was recovered without' +
+                    html += '<p style="opacity:0.8; font-size:0.9em;">Replies that could not be decoded or assembled' +
+                        ' into the required response. Salvaged means an embedded JSON object was recovered without' +
                         ' another call; recovered on retry means restating the schema worked; fatal means the request' +
-                        ' was abandoned and its result silently lost.</p>';
+                        ' was abandoned and its result was lost.</p>';
                     html += '<div class="stat-card-grid">';
                     html += renderStatCard('Salvaged', decodeTotals.salvaged);
                     html += renderStatCard('Recovered on retry', decodeTotals.recovered);
@@ -3875,7 +3875,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     });
                     html += '</tbody></table>';
                 } else {
-                    html += '<p class="loading">No JSON decode failures recorded.</p>';
+                    html += '<p class="loading">No structured response errors recorded.</p>';
                 }
 
                 html += '<h2>Tool Usage (last 1k reviews)</h2><div class="chart-section"><div id="chart-tools" class="chart-container-lg"></div></div>';
@@ -4073,7 +4073,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                      document.getElementById('chart-review-outcomes').innerHTML = '<p class="loading">No review history available.</p>';
                 }
 
-                // --- 2.7 JSON decode failures, stacked by source per day ---
+                // --- 2.7 Structured response errors, stacked by source per day ---
                 if (decodeDaily.length) {
                     const decodeDays = [...new Set(decodeDaily.map(row => row.day))].sort();
                     // Order sources by volume so the biggest offender reads first.

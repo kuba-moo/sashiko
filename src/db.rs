@@ -1545,7 +1545,7 @@ impl Database {
         Ok(())
     }
 
-    /// Persists JSON decode failures so silent malformed replies stay visible.
+    /// Persists structured-response failures so silent malformed replies stay visible.
     /// `review_id` is None for work that runs outside a review (cross-review).
     pub async fn save_json_decode_events(
         &self,
@@ -1572,7 +1572,7 @@ impl Database {
         Ok(())
     }
 
-    /// Daily JSON decode failures by source and outcome over the trailing two
+    /// Daily structured-response failures by source and outcome over the trailing two
     /// weeks, plus a per-source roll-up for the summary table.
     pub async fn get_json_decode_stats(&self) -> Result<serde_json::Value> {
         let mut daily = Vec::new();

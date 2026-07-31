@@ -3,12 +3,12 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-//! Tracks how often models return JSON we cannot decode.
+//! Tracks how often models return structured responses we cannot use.
 //!
 //! A malformed reply that is silently swallowed looks identical to a model that
 //! simply found nothing, which is how a 69% confirmation failure rate went
-//! unnoticed. Recording every decode failure — and whether restating the schema
-//! recovered it — makes that class of regression visible.
+//! unnoticed. Recording decode and response-assembly failures, and whether
+//! restating the schema recovered them, makes that class of regression visible.
 //!
 //! Reviews run in a subprocess without database access, so events are collected
 //! in process memory, serialized into the review result, and persisted by the
@@ -40,7 +40,7 @@ impl JsonDecodeOutcome {
     }
 }
 
-/// One decode problem, attributed to the request that produced it.
+/// One structured-response problem, attributed to the request that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonDecodeEvent {
     /// Which request produced it, e.g. `stage:10`, `confirmation`,

@@ -1628,6 +1628,23 @@ impl Reviewer {
                         None
                     };
 
+                    if let Some(events) = json_output
+                        .get("review")
+                        .and_then(|review| review.get("json_decode_events"))
+                    {
+                        let events = crate::json_health::from_json(events);
+                        if !events.is_empty() {
+                            let now = chrono::Utc::now().timestamp();
+                            if let Err(error) = ctx
+                                .db
+                                .save_json_decode_events(Some(review_id), &events, now)
+                                .await
+                            {
+                                error!("Failed to save structured response errors: {}", error);
+                            }
+                        }
+                    }
+
                     if target_applied {
                         if let Some(error_msg) = json_output["error"].as_str() {
                             error!(
@@ -1756,20 +1773,6 @@ impl Reviewer {
                                 {
                                     error!("Failed to save merge usage: {}", error);
                                 }
-                                if let Some(events) = review_content.get("json_decode_events") {
-                                    let events = crate::json_health::from_json(events);
-                                    if !events.is_empty() {
-                                        let now = chrono::Utc::now().timestamp();
-                                        if let Err(error) = ctx
-                                            .db
-                                            .save_json_decode_events(Some(review_id), &events, now)
-                                            .await
-                                        {
-                                            error!("Failed to save JSON decode events: {}", error);
-                                        }
-                                    }
-                                }
-
                                 let mut db_success = true;
 
                                 if let Err(e) = ctx

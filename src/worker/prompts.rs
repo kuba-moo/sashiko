@@ -446,12 +446,55 @@ SCOPE: You audit ONLY security vulnerabilities and attack surfaces. Other pipeli
 
 You are a Red Team security researcher auditing a Linux kernel patch. Look for security vulnerabilities such as buffer overflows, out-of-bounds reads/writes, integer overflows, privilege escalation vectors, time-of-check to time-of-use (TOCTOU) races, and information leaks (e.g., copying uninitialized kernel memory to user-space via copy_to_user). Scrutinize all points where untrusted user input reaches sensitive functions without validation. Ensure all length checks and bounds checks are robust against malicious input. Focus heavily on attack surfaces and data boundaries."
             }
+            // The SCOPE TEST and HARDWARE RESIDUE blocks below fix stage 7's *entry test*, not
+            // its capability list, and that distinction is the whole point. The persona
+            // sentence and every enumerated capability are unchanged: measured over 276
+            // solo-source crit/high/med findings, "register accesses" is load-bearing for 71 of
+            // them and the bare "You are a hardware engineer" framing for 54 — more than any
+            // enumerated item — even though those same two clauses attract the most
+            // duplication. Cutting what misfires would cost more than it saved, so this gates
+            // entry instead. What the data indicts: of 129 stage-7 findings another stage also
+            // raised (48h sample), ~72 were general software defects that merely lived in a
+            // driver file, and all 18 traceable to persona framing or "touches driver code" had
+            // no hardware substance at all.
+            //
+            // The strip-the-hardware-nouns question is the discriminator that separates those
+            // ~72 from the 51 solo-source findings whose root cause is *also* software: in the
+            // keepers a hardware fact is load-bearing in stating the bug (clocks left at
+            // mismatched rates, a dropped register write read back as valid), so HARDWARE
+            // RESIDUE names those four shapes explicitly. A blunt "hardware root cause only"
+            // rule was estimated to lose 18.5% of solo-source output including 11 High, which
+            // is why that is deliberately not what this says.
+            //
+            // One clause was reworded: "rings/queues are actually initialized ... before being
+            // unconditionally accessed" read as a licence to report any unvalidated array index
+            // and misfired on 86% of what it attracted (18 of 21) while only 9 solo-source
+            // findings relied on it. It now asks about hardware state rather than
+            // initialization.
+            //
+            // As with STAGE3_GUIDE_SCOPE_OVERRIDE, this redirects reporting *shape* and never
+            // tells the model to drop a defect it believes is real — the closing sentence is
+            // load-bearing, since stage 7's shared findings skew far more severe than its solo
+            // ones (27 critical / 270 high shared vs 2 / 57 solo, all-time) and over-
+            // suppression would cost corroboration on exactly the findings that matter most.
+            //
+            // Caveats, because this was tuned on judged data rather than a pipeline run: the
+            // verdicts above are LLM classifications (33 of 72 high-confidence, none
+            // double-judged), and `findings` holds only what survived stage 8-10 merging, so
+            // the pre-merge concerns stage 7 actually emits were never measured. Rationale and
+            // limitations: prompt_notes/stage7-hardware-scope.md.
             7 => {
                 "# Stage 7. Hardware engineer's review
 
 SCOPE: You review ONLY hardware/driver-specific concerns. Other pipeline agents cover: high-level design (Stage 1), implementation completeness (Stage 2), control flow (Stage 3), resource lifecycle (Stage 4), locking/concurrency (Stage 5), and security (Stage 6). Do not report general software logic issues that aren't hardware-related.
 
-You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return empty concerns and dismissed-concerns arrays."
+You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are in the hardware state the code assumes before it programs or advances them. If the patch is purely generic software logic (e.g., VFS, core networking), return empty concerns and dismissed-concerns arrays.
+
+SCOPE TEST: apply this to every concern before you report it. A concern is yours only if stating it requires a fact about the device, the bus, or the firmware contract: a register's semantics or access rules, a descriptor or ring ownership protocol, a DMA visibility requirement, a clock/power/reset sequencing constraint, a wire or bus format, or documented device behaviour. Ask yourself: if I removed the hardware nouns — register names, ring indices, MMIO offsets, device names — and restated the concern in plain C terms, would it still be the same defect? If yes, it is another stage's concern and you must not report it; being located in a driver file does not make a defect yours. Do not report a concern whose substance is a missing NULL check, an unchecked return value, an error path that leaks or unwinds wrongly, a refcount or lifetime mistake, a bounds or overflow check, a lock or race, or a mismatch with the commit message, unless the HARDWARE RESIDUE rule below applies.
+
+HARDWARE RESIDUE: this is the exception to the scope test, and you SHOULD report these. A plain software mistake IS yours when its consequence is that the device is left in a state the driver no longer describes correctly, and naming that state requires hardware knowledge. Report it whenever a partially completed hardware sequence is not rolled back (a clock, regulator, PHY or PCS left enabled or at a mismatched setting after a later step fails); a failed or dropped register read or write is treated as a successful one, so the driver acts on a value the hardware never gave it; an enable has no matching disable, so hardware stays armed; or software bookkeeping and the hardware's own state (ring head/tail, queue count, programmed table entries) silently diverge. Describe the defect through the hardware state it leaves behind rather than as a generic error-handling shortfall — that framing is what makes it yours rather than Stage 3's or Stage 4's.
+
+Do not drop a real defect because of this scope. If a hardware fact is genuinely load-bearing in your reasoning, report the concern even though another stage might also reach it."
             }
             8 => {
                 "# Stage 8. Deduplication and Consolidation

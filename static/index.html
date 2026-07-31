@@ -444,7 +444,8 @@
 
         .status-Finished,
         .status-Applied,
-        .status-Reviewed {
+        .status-Reviewed,
+        .status-Cross-reviewed {
             color: var(--status-reviewed);
         }
 
@@ -2133,7 +2134,7 @@
         function renderFindingsBadges(counts, status) {
             const { low = 0, medium = 0, high = 0, critical = 0 } = counts;
             if (low + medium + high + critical === 0) {
-                if (status === 'Reviewed' || status === 'Finished') {
+                if (status === 'Reviewed' || status === 'Finished' || status === 'Cross-reviewed') {
                     return '<span style="color:var(--status-reviewed);">✓</span>';
                 }
                 return '<span style="color:var(--text-dim)">-</span>';
@@ -3896,10 +3897,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             row.additional_model_id === pair.additional.model);
                         const findingCount = (outcome, severity) =>
                             rows.find(row => row.outcome === outcome && row.severity === severity)?.count || 0;
-                        const severityTotals = Object.fromEntries(severityOrder.map(severity => [
-                            severity,
-                            outcomeOrder.reduce((total, outcome) => total + findingCount(outcome, severity), 0)
-                        ]));
                         const outcomeTotals = Object.fromEntries(outcomeOrder.map(outcome => [
                             outcome,
                             severityOrder.reduce((total, severity) => total + findingCount(outcome, severity), 0)
@@ -3921,11 +3918,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                 axisPointer: { type: 'shadow' },
                                 formatter: params => {
                                     const outcomeIndex = params[0]?.dataIndex || 0;
+                                    const outcome = outcomeOrder[outcomeIndex];
+                                    const outcomeTotal = outcomeTotals[outcome];
                                     return [
                                         outcomeLabelsWithPercentages[outcomeIndex],
                                         ...params.map(item => {
-                                            const severity = severityOrder[item.seriesIndex];
-                                            return `${item.marker}${item.seriesName}: ${item.value} (${formatPercentage(item.value, severityTotals[severity])})`;
+                                            return `${item.marker}${item.seriesName}: ${item.value} (${formatPercentage(item.value, outcomeTotal)})`;
                                         })
                                     ].join('<br>');
                                 }
@@ -4235,11 +4233,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             formatter: params => {
                                 const row = stageFindings[params[0].dataIndex];
                                 const runLabel = row.engagements === 1 ? 'run' : 'runs';
+                                const stageTotal = categories.reduce((total, category) =>
+                                    total + (row[category.key] || 0), 0);
                                 return [
                                     `Stage ${row.stage} (${row.engagements} ${runLabel})`,
                                     ...params.map(item => {
                                         const category = categories[item.seriesIndex];
-                                        return `${item.marker}${item.seriesName}: ${formatRate(item.value)} (${row[category.key]} total)`;
+                                        const categoryTotal = row[category.key] || 0;
+                                        return `${item.marker}${category.label}: ${formatRate(item.value)} (${categoryTotal} total, ${formatPercentage(categoryTotal, stageTotal)})`;
                                     })
                                 ].join('<br>');
                             }

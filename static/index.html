@@ -2132,6 +2132,100 @@
             }
         }
 
+        function toggleFindingReasoning(id, btn) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const open = el.style.display !== 'none';
+            el.style.display = open ? 'none' : 'table-row';
+            if (btn) btn.innerText = open ? '▶' : '▼';
+        }
+
+        // Stage 10 writes its severity calibration into severity_explanation as a
+        // paragraph led by "Consequence:", "Triggering path:" and "Reachability:"
+        // (see third_party/prompts/kernel/severity.md). Split on those labels so
+        // each step can be read on its own. Only labels acting as section headers
+        // count: a bare prose mention such as "reachability is speculative" must
+        // not start a new section, hence the leading-boundary group. That boundary
+        // is matched rather than looked behind, because a lookbehind here is a
+        // top-level regex literal and would break this whole script block on
+        // browsers that do not support it.
+        // Explanations predating this format have no labels and render as one block.
+        const CALIBRATION_LABELS = /(^|[\s.;—-])(?:\(?[a-z0-9]\)?[.)]\s*)?(Consequence|Triggering path|Reachability)\s*[:—-]\s*/gi;
+
+        function parseSeverityCalibration(text) {
+            if (!text || !text.trim()) return null;
+            const trimmed = text.trim();
+            const marks = [];
+            CALIBRATION_LABELS.lastIndex = 0;
+            let m;
+            while ((m = CALIBRATION_LABELS.exec(trimmed)) !== null) {
+                const label = m[2].toLowerCase();
+                // The boundary character belongs to the preceding section, not to
+                // this label, so the section starts after it.
+                const start = m.index + m[1].length;
+                // Keep only the first occurrence of each label; later ones are
+                // back-references within the prose, not a second section.
+                if (!marks.some(mark => mark.label === label)) {
+                    marks.push({ label, start, bodyStart: m.index + m[0].length });
+                }
+            }
+            if (!marks.length) return { preamble: trimmed, sections: [] };
+
+            const sections = marks.map((mark, i) => ({
+                label: mark.label,
+                body: trimmed.slice(mark.bodyStart, i + 1 < marks.length ? marks[i + 1].start : undefined).trim()
+            })).filter(section => section.body);
+
+            return { preamble: trimmed.slice(0, marks[0].start).trim(), sections };
+        }
+
+        const CALIBRATION_TITLES = {
+            'consequence': 'Consequence',
+            'triggering path': 'Triggering path',
+            'reachability': 'Reachability'
+        };
+
+        function renderSeverityCalibration(text) {
+            const parsed = parseSeverityCalibration(text);
+            if (!parsed) return '';
+            const blocks = [];
+            if (parsed.preamble) {
+                blocks.push(`<div style="margin-bottom:6px;">${escapeHtml(parsed.preamble)}</div>`);
+            }
+            for (const section of parsed.sections) {
+                const title = CALIBRATION_TITLES[section.label] || section.label;
+                blocks.push(
+                    `<div style="margin-bottom:6px;">` +
+                    `<span style="color:var(--text-muted);font-weight:600;">${escapeHtml(title)}: </span>` +
+                    `${escapeHtml(section.body)}</div>`
+                );
+            }
+            return blocks.join('');
+        }
+
+        // The rubric caps a finding at Medium when the model cannot establish that
+        // the bug is real, and says so in the explanation. Surface that, because the
+        // level alone cannot distinguish it from a genuinely Medium-consequence bug.
+        //
+        // Severity gates the check: the cap only ever produces Low or Medium, so a
+        // High or Critical finding was by definition not capped. Explanations at
+        // those levels routinely argue the *opposite* ("Not capped as speculative",
+        // "at High rather than capping it"), which text matching alone reads backwards.
+        //
+        // Within Low/Medium the cap phrasing is decisive and never negated, so it is
+        // checked first: an explanation may cap the finding and separately call some
+        // other clause of its reasoning "not speculative". Only the weaker
+        // "is/marked speculative" wording is subject to the negation veto.
+        function isSpeculativeFinding(text, severity) {
+            if (!text) return false;
+            const level = String(severity || '').toLowerCase();
+            if (level === 'high' || level === 'critical') return false;
+            const lower = text.toLowerCase();
+            if (/capped at medium/.test(lower)) return true;
+            if (/not\s+speculative/.test(lower)) return false;
+            return /(?:is|as|marked?(?:\s+it)?)\s+speculative/.test(lower);
+        }
+
         function renderFindingsBadges(counts, status) {
             const { low = 0, medium = 0, high = 0, critical = 0 } = counts;
             if (low + medium + high + critical === 0) {
@@ -3074,11 +3168,16 @@
             const sourceSummaryHtml = renderReviewSourceSummary(sourcePresentation);
 
             let findingsDetailHtml = '';
+            // Rendered when a finding has cross-stage/cross-model provenance to show,
+            // or reasoning to explain its severity. Without the latter condition the
+            // table would stay hidden for single-stage single-model findings, which
+            // are the majority, and their reasoning would have nowhere to appear.
             if (parsedFindings && outputJson && Array.isArray(outputJson.findings) &&
                 outputJson.findings.some(f =>
                     (Array.isArray(f.source_stages) && f.source_stages.length > 1) ||
-                    (Array.isArray(f.source_models) && f.source_models.some(source => source !== 'main')))) {
-                const rows = outputJson.findings.map(f => {
+                    (Array.isArray(f.source_models) && f.source_models.some(source => source !== 'main')) ||
+                    (typeof f.severity_explanation === 'string' && f.severity_explanation.trim()))) {
+                const rows = outputJson.findings.map((f, i) => {
                     const severity = (f.severity || 'Low').toLowerCase();
                     const stages = Array.isArray(f.source_stages) && f.source_stages.length > 1
                         ? `stages ${f.source_stages.join(', ')}` : '';
@@ -3088,9 +3187,21 @@
                             .map(source => escapeHtml(source)).join(', ')
                         : '';
                     const problem = escapeHtml((f.problem || '').substring(0, 120));
-                    return `<tr><td style="color:var(--sev-${severity});font-weight:bold;">${escapeHtml(f.severity || 'Low')}</td><td>${problem}</td><td>${sources}</td><td>${stages}</td></tr>`;
+                    const reasoning = renderSeverityCalibration(f.severity_explanation);
+                    const speculative = isSpeculativeFinding(f.severity_explanation, f.severity)
+                        ? ` <span title="The reviewer could not establish that the bug is real, so the level is capped at Medium" style="font-weight:normal;font-size:0.85em;color:var(--text-muted);">(speculative)</span>`
+                        : '';
+                    const reasoningId = `reasoning-${uniqueId}-${i}`;
+                    const toggle = reasoning
+                        ? `<button class="toggle-btn" onclick="toggleFindingReasoning('${reasoningId}', this)" title="Show severity reasoning">▶</button>`
+                        : '';
+                    const mainRow = `<tr><td style="width:1em;">${toggle}</td><td style="color:var(--sev-${severity});font-weight:bold;">${escapeHtml(f.severity || 'Low')}${speculative}</td><td>${problem}</td><td>${sources}</td><td>${stages}</td></tr>`;
+                    const reasoningRow = reasoning
+                        ? `<tr id="${reasoningId}" style="display:none;"><td></td><td colspan="4" style="color:var(--text-muted);">${reasoning}</td></tr>`
+                        : '';
+                    return mainRow + reasoningRow;
                 });
-                findingsDetailHtml = `<div style="margin-top:8px;"><button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button><div id="findings-${uniqueId}" class="collapsible"><table style="width:100%;font-size:0.9em;"><thead><tr><th>Severity</th><th>Problem</th><th>Sources</th><th>Stages</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
+                findingsDetailHtml = `<div style="margin-top:8px;"><button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▶ Findings Provenance</button><div id="findings-${uniqueId}" class="collapsible"><table style="width:100%;font-size:0.9em;"><thead><tr><th></th><th>Severity</th><th>Problem</th><th>Sources</th><th>Stages</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
             }
 
             let inlineHtml = '';

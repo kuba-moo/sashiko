@@ -72,13 +72,21 @@ class SashikoClient:
         return response.json()
 
 
+PATCH_DECORATOR_RE = re.compile(r'^---\s+Patch\s+\[\d+\]:.*---\s*$')
+REVIEW_TAG_RE = re.compile(r'^\s*\[([A-Za-z][A-Za-z0-9_-]*):.*\]\s*$')
+
+
 def strip_commit_header(review_text: str) -> str:
-    """Strip commit/Author header lines and subsequent empty lines from review text"""
+    """Strip patch headers and non-severity metadata tags from review text."""
     lines = review_text.split('\n')
     start_idx = 0
 
+    # Skip the patch separator added by multi-patch review output.
+    if lines and PATCH_DECORATOR_RE.match(lines[start_idx]):
+        start_idx += 1
+
     # Skip "commit ..." line if present
-    if lines and lines[start_idx].startswith('commit '):
+    if start_idx < len(lines) and lines[start_idx].startswith('commit '):
         start_idx += 1
 
     # Skip "Author: ..." line if present
@@ -89,7 +97,14 @@ def strip_commit_header(review_text: str) -> str:
     while start_idx < len(lines) and not lines[start_idx].strip():
         start_idx += 1
 
-    return '\n'.join(lines[start_idx:])
+    clean_lines = []
+    for line in lines[start_idx:]:
+        tag = REVIEW_TAG_RE.match(line)
+        if tag and tag.group(1).lower() != 'severity':
+            continue
+        clean_lines.append(line)
+
+    return '\n'.join(clean_lines)
 
 
 def format_email(review_text: str, subject: str, from_addr: str,

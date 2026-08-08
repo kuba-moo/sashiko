@@ -16,7 +16,7 @@ The official OpenAI API uses `max_completion_tokens` in the request body (introd
 | Stdio support | Not needed for OpenAI-compatible provider |
 | Thinking/reasoning support | Not included in initial implementation (`thought: None` always) |
 | Temperature | Always passed through from `AiRequest` when present |
-| URL configuration | `base_url` from settings → model-based default (glm-*, moonshot-*, abab7-*, MiniMax-*, others) |
+| URL configuration | `base_url` from settings → model-based default (glm-*, moonshot-*, abab7-*, MiniMax-*, others). HTTP(S) base URLs ending in `/v1` may have arbitrary nested prefixes (including Azure AI Foundry project paths); `/chat/completions` is appended while query parameters are preserved. |
 | API key | `OPENAI_API_KEY` env only (fallback to `LLM_API_KEY`), no provider-specific keys |
 
 ## Provider Compatibility
@@ -86,7 +86,8 @@ pub struct OpenAiCompatClient {
 | `OpenAiFunction` | `name`, `description`, `parameters` |
 | `OpenAiResponse` | `choices`, `usage` |
 | `OpenAiChoice` | `index`, `message: OpenAiMessage`, `finish_reason` |
-| `OpenAiUsage` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
+| `OpenAiUsage` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details?` |
+| `OpenAiPromptTokensDetails` | `cached_tokens?` |
 
 #### `OpenAiRequest` Token Limit Fields
 
@@ -129,7 +130,7 @@ pub enum OpenAiCompatError {
 | Method | Purpose |
 |---|---|
 | `new(base_url, provider_type, model, context_window_size, max_tokens) -> Self` | Build `reqwest::Client` with `Authorization: Bearer {key}` header (from `OPENAI_API_KEY` → `LLM_API_KEY` env), 120s timeout |
-| `post_request(&self, body: &Value) -> Result<OpenAiResponse, OpenAiCompatError>` | POST JSON `body` to `self.base_url`. Transport error → `TransientError(30s)` (error string sanitized via `redact_secret()`). On HTTP success, reads body as text and parses JSON; parse failure → `ApiError`. HTTP errors: 429 → `RateLimitExceeded` (`Retry-After` header parsed first; body regex `"Please retry in ([0-9.]+)s"` overrides if matched; default 60s), 401/403 → `AuthenticationError`, 500/502/503/504 → `TransientError(30s)`, other → `ApiError`. Includes logging of response tokens on success. |
+| `post_request(&self, body: &Value) -> Result<OpenAiResponse, OpenAiCompatError>` | POST JSON `body` to `self.base_url`. Transport error → `TransientError(30s)` (error string sanitized via `redact_secret()`). On HTTP success, reads body as text and parses JSON; parse failure → `ApiError`. HTTP errors: 429 → `RateLimitExceeded` (`Retry-After` header parsed first; body regex `"Please retry in ([0-9.]+)s"` overrides if matched; default 60s), 401/403 → `AuthenticationError`, 500/502/503/504 → `TransientError(30s)`, other → `ApiError`. Successful responses log uncached input, cached input, and output tokens separately. |
 | `translate_ai_request(AiRequest, max_tokens, provider_type) -> OpenAiRequest` | See translation mapping below |
 | `translate_ai_response(OpenAiResponse) -> AiResponse` | See translation mapping below |
 | `estimate_tokens_generic(AiRequest) -> usize` | Reuse `TokenBudget::estimate_tokens`. Must include `request.system` along with messages and tools. |
@@ -138,6 +139,7 @@ pub enum OpenAiCompatError {
 
 | Method | Purpose |
 |---|---|
+| `normalize_base_url(url: &str) -> String` | Validate an HTTP(S) endpoint and normalize it to `/chat/completions`. Bare hosts and paths ending in `/v1` are supported, including nested Azure AI Foundry paths. Existing `/chat/completions` paths and URL query parameters are preserved. Other endpoint shapes are rejected. |
 | `default_base_url_for_model(model: &str) -> String` | Returns provider-specific default URL based on model name prefix |
 | `default_context_window_for_model(model: &str) -> usize` | Returns provider-specific default context window based on model name prefix |
 
@@ -167,7 +169,12 @@ pub enum OpenAiCompatError {
 | `usage.prompt_tokens` | `prompt_tokens` |
 | `usage.completion_tokens` | `completion_tokens` |
 | `usage.total_tokens` | `total_tokens` |
-| (no cached tokens in standard OpenAI) | `cached_tokens: None` |
+| `usage.prompt_tokens_details.cached_tokens` | `cached_tokens`; absent details remain `None` |
+
+OpenAI and Azure perform eligible prompt caching server-side. The client does
+not place explicit cache breakpoints, but it records the cached-token count
+returned by the service so logs and Sashiko's usage accounting distinguish
+cached prompt tokens from uncached input.
 
 #### `impl AiProvider for OpenAiCompatClient`
 
@@ -195,7 +202,7 @@ fn get_capabilities(&self) -> ProviderCapabilities {
 }
 ```
 
-#### Tests (16 tests in `#[cfg(test)] mod tests`)
+#### Tests (24 tests in `#[cfg(test)] mod tests`)
 
 ##### Request Translation Tests
 
@@ -217,6 +224,7 @@ fn get_capabilities(&self) -> ProviderCapabilities {
 | # | Test Name | Verifies |
 |---|---|---|
 | 9 | `test_translate_response_text` | `choices[0].message.content` → `AiResponse.content`. `thought` is `None`. Usage mapped. |
+| 9.1 | `test_translate_response_cached_tokens` | `usage.prompt_tokens_details.cached_tokens` is parsed and propagated to `AiUsage.cached_tokens`. |
 | 10 | `test_translate_response_tool_calls` | `tool_calls` with `arguments` as JSON string → parsed `Vec<ToolCall>`. `thought_signature: None`. |
 | 11 | `test_translate_response_empty_choices` | Empty/missing `choices` → error. |
 
@@ -232,6 +240,12 @@ fn get_capabilities(&self) -> ProviderCapabilities {
 |---|---|---|
 | 13 | `test_max_tokens_for_openai_compatible` | `OpenAiProviderType::OpenAiCompatible` → serialized JSON has `max_tokens` and no `max_completion_tokens`. |
 | 14 | `test_max_completion_tokens_for_openai` | `OpenAiProviderType::OpenAi` → serialized JSON has `max_completion_tokens` and no `max_tokens`. |
+
+##### URL Normalization Tests
+
+| Test Name | Verifies |
+|---|---|
+| `test_normalize_base_url_appends_chat_completions` | Standard `/v1`, nested Azure AI Foundry `/openai/v1`, and already-complete endpoints normalize correctly; query parameters are preserved and unrelated paths are rejected. |
 
 ### `src/settings.rs`
 
@@ -328,13 +342,13 @@ provider = "openai"
 model = "gpt-4o"
 temperature = 0.7
 
-# OpenAI via Azure proxy — uses max_completion_tokens
+# OpenAI via an Azure AI Foundry project endpoint
 [ai]
 provider = "openai"
 model = "gpt-4o"
 
 [ai.openai_compat]
-base_url = "https://my-azure-instance.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
+base_url = "https://example.services.ai.azure.com/api/projects/proj-default/openai/v1"
 
 # GLM (Zhipu AI) via OpenAI-compatible endpoint — uses max_tokens
 [ai]

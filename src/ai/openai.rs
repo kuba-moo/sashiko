@@ -25,6 +25,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+use url::Url;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAiRequest {
@@ -99,6 +100,14 @@ pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -193,24 +202,26 @@ impl OpenAiCompatClient {
     /// path.  Our `post_request` POSTs directly to `self.base_url`, so we
     /// ensure the full path is present.
     fn normalize_base_url(url: &str) -> Result<String> {
-        let trimmed = url.trim_end_matches('/');
+        let mut parsed =
+            Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid OpenAI url {}", url))?;
 
-        let (base, path) = match trimmed.split_once("://") {
-            Some((scheme, rest)) => match rest.split_once('/') {
-                Some((host, path)) => (format!("{scheme}://{host}"), format!("/{}", path)),
-                None => (trimmed.to_string(), String::new()),
-            },
-            None => return Err(anyhow::anyhow!("Invalid url scheme in OpenAI url {}", url)),
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(anyhow::anyhow!("Invalid OpenAI url {}", url));
+        }
+
+        let path = parsed.path().trim_end_matches('/');
+        let normalized_path = if path.is_empty() {
+            "/chat/completions".to_string()
+        } else if path.ends_with("/chat/completions") {
+            path.to_string()
+        } else if path.ends_with("/v1") {
+            format!("{path}/chat/completions")
+        } else {
+            return Err(anyhow::anyhow!("Invalid OpenAI url {}", url));
         };
 
-        let path = match path.as_str() {
-            "" => "/chat/completions",
-            "/v1" | "/v1/chat/completions" => "/v1/chat/completions",
-            "/api/v1" | "/api/v1/chat/completions" => "/api/v1/chat/completions",
-            _ => return Err(anyhow::anyhow!("Invalid OpenAI url {}", url)),
-        };
-
-        Ok(format!("{base}{path}"))
+        parsed.set_path(&normalized_path);
+        Ok(parsed.to_string())
     }
 
     pub fn default_base_url_for_model(model: &str) -> String {
@@ -263,9 +274,16 @@ impl OpenAiCompatClient {
             })?;
             match serde_json::from_str::<OpenAiResponse>(&body_text) {
                 Ok(response) => {
+                    let cached_tokens = response
+                        .usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|details| details.cached_tokens)
+                        .unwrap_or(0);
                     tracing::info!(
-                        "OpenAI response received. Tokens: in={}, out={}",
-                        response.usage.prompt_tokens,
+                        "OpenAI response received. Tokens: in={}, cached={}, out={}",
+                        response.usage.prompt_tokens.saturating_sub(cached_tokens),
+                        cached_tokens,
                         response.usage.completion_tokens
                     );
                     return Ok(response);
@@ -452,6 +470,12 @@ fn translate_ai_request(
 }
 
 fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
+    let cached_tokens = resp
+        .usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .map(|tokens| tokens as usize);
     let choice = resp
         .choices
         .into_iter()
@@ -487,7 +511,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         prompt_tokens: resp.usage.prompt_tokens as usize,
         completion_tokens: resp.usage.completion_tokens as usize,
         total_tokens: resp.usage.total_tokens as usize,
-        cached_tokens: None,
+        cached_tokens,
         cache_write_tokens: None,
     });
 
@@ -993,6 +1017,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1006,6 +1031,29 @@ mod tests {
         assert_eq!(usage.completion_tokens, 20);
         assert_eq!(usage.total_tokens, 30);
         assert_eq!(usage.cached_tokens, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_response_cached_tokens() -> Result<()> {
+        let openai_resp: OpenAiResponse = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "prompt_tokens_details": {"cached_tokens": 768}
+            }
+        }))?;
+
+        let usage = translate_ai_response(openai_resp)?.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(usage.cached_tokens, Some(768));
 
         Ok(())
     }
@@ -1034,6 +1082,7 @@ mod tests {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1059,6 +1108,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 0,
                 total_tokens: 10,
+                prompt_tokens_details: None,
             },
         };
 
@@ -1258,6 +1308,22 @@ mod tests {
             OpenAiCompatClient::normalize_base_url("https://openrouter.ai/api/v1/chat/completions")
                 .unwrap(),
             "https://openrouter.ai/api/v1/chat/completions"
+        );
+        // Azure AI Foundry project endpoint: preserve the nested path.
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://example.services.ai.azure.com/api/projects/proj-default/openai/v1"
+            )
+            .unwrap(),
+            "https://example.services.ai.azure.com/api/projects/proj-default/openai/v1/chat/completions"
+        );
+        // Deployment-style Azure endpoints may include an API version query.
+        assert_eq!(
+            OpenAiCompatClient::normalize_base_url(
+                "https://example.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
+            )
+            .unwrap(),
+            "https://example.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
         );
         // Test arbitrary deep nested paths that shouldn't be accepted
         assert!(

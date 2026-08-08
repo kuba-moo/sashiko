@@ -1443,12 +1443,13 @@
         // =====================================================================
         // COST ESTIMATION
         // =====================================================================
-        // `input` is the cache-write rate (base + 25% surcharge on Anthropic;
-        // 25% on Gemini). We don't persist cache-write counts separately, so
-        // every non-cached input token is priced as a cache write. The truly
-        // uncached portion (first turn before any caching takes effect) is a
-        // rounding-error share of the total for these workloads.
+        // `input` is the rate charged for non-cached input. For providers with
+        // explicit cache writes (Anthropic and Gemini), it includes the write
+        // surcharge because we do not persist cache-write counts separately.
+        // OpenAI cache population has no separate write-token charge.
         const PRICING = {
+            // Azure OpenAI Global Standard pricing, USD per million tokens.
+            'gpt-5.6-sol':          { input: 5.00,   cached: 0.50,   output: 30.0 },
             'gemini-2.5-pro':       { input: 1.5625, cached: 0.3125, output: 10.0 },
             'gemini-2.5-flash':     { input: 0.1875, cached: 0.0375, output: 0.60 },
             'gemini-3.1-pro':       { input: 1.5625, cached: 0.3125, output: 10.0 },

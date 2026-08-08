@@ -99,11 +99,12 @@ impl CachingAiProvider {
 
     fn compute_cache_key(request: &AiRequest) -> String {
         let mut val = serde_json::to_value(request).unwrap_or_default();
-        // Strip nondeterministic fields
+        // Context tags are logging metadata and do not affect the response.
+        // Provider-issued reasoning/signatures do affect subsequent turns and
+        // must remain in the key even though they are omitted from logs.
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("context_tag");
         }
-        super::scrub_ai_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
         let hash = Sha256::digest(canonical.as_bytes());
         hash.iter().map(|b| format!("{:02x}", b)).collect()
@@ -153,8 +154,13 @@ impl AiProvider for CachingAiProvider {
                     fmt_thousands(total)
                 );
                 if let Some(ref mut usage) = resp.usage {
-                    usage.cached_tokens =
-                        Some(usage.cached_tokens.unwrap_or(0) + usage.prompt_tokens);
+                    // This request never reached the remote provider: the
+                    // entire input was served by the local response cache.
+                    // Replace provider-side cache telemetry from the original
+                    // response instead of adding to it, which could otherwise
+                    // report more cached tokens than prompt tokens.
+                    usage.cached_tokens = Some(usage.prompt_tokens);
+                    usage.cache_write_tokens = None;
                 }
                 return Ok(resp);
             }
@@ -215,5 +221,132 @@ impl AiProvider for CachingAiProvider {
             tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
             tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiMessage, AiResponseFormat, AiRole, AiUsage, ReasoningBlock, ToolCall};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn request_with_reasoning(encrypted_content: &str, context_tag: Option<&str>) -> AiRequest {
+        AiRequest {
+            system: Some("Review the change".to_string()),
+            messages: vec![AiMessage {
+                role: AiRole::Assistant,
+                content: None,
+                thought: None,
+                thought_signature: None,
+                reasoning: Some(vec![ReasoningBlock::ProviderOutput {
+                    provider: "openai-responses".to_string(),
+                    items: vec![
+                        json!({
+                            "type": "reasoning",
+                            "encrypted_content": encrypted_content,
+                        }),
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/lib.rs\"}",
+                        }),
+                    ],
+                    token_estimate: Some(100),
+                }]),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "read_file".to_string(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                    thought_signature: None,
+                }]),
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: Some(AiResponseFormat::Text),
+            context_tag: context_tag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cache_key_includes_provider_reasoning_but_not_context_tag() {
+        let first = request_with_reasoning("opaque-a", Some("stage-a"));
+        let same_reasoning = request_with_reasoning("opaque-a", Some("stage-b"));
+        let different_reasoning = request_with_reasoning("opaque-b", Some("stage-a"));
+
+        assert_eq!(
+            CachingAiProvider::compute_cache_key(&first),
+            CachingAiProvider::compute_cache_key(&same_reasoning)
+        );
+        assert_ne!(
+            CachingAiProvider::compute_cache_key(&first),
+            CachingAiProvider::compute_cache_key(&different_reasoning)
+        );
+    }
+
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for CountingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: Some(AiUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                    total_tokens: 110,
+                    cached_tokens: Some(80),
+                    cache_write_tokens: Some(20),
+                }),
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test-model".to_string(),
+                context_window_size: 1_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cache_hit_replaces_provider_cache_accounting() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache_path = temp.path().join("response-cache.db");
+        let inner = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider = CachingAiProvider::new(
+            inner.clone(),
+            cache_path.to_str().expect("UTF-8 temporary path"),
+            7,
+        )
+        .await?;
+        let request = request_with_reasoning("opaque", None);
+
+        let first = provider.generate_content(request.clone()).await?;
+        assert_eq!(first.usage.as_ref().unwrap().cached_tokens, Some(80));
+        assert_eq!(first.usage.as_ref().unwrap().cache_write_tokens, Some(20));
+
+        let cached = provider.generate_content(request).await?;
+        let usage = cached.usage.as_ref().unwrap();
+        assert_eq!(usage.cached_tokens, Some(usage.prompt_tokens));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(inner.calls.load(AtomicOrdering::Relaxed), 1);
+        Ok(())
     }
 }

@@ -252,6 +252,11 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Reasoning effort for the OpenAI Responses API (for example `low`,
+    /// `medium`, or `high`). Accepted values are deployment-specific. Ignored
+    /// by Chat Completions providers.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1078,6 +1083,43 @@ mod tests {
         .unwrap();
         assert_eq!(experiments.validation_budget.request_input_tokens, 300);
         assert_eq!(experiments.validation_budget.review_output_tokens, 400);
+    }
+
+    #[test]
+    fn additional_model_can_override_main_with_azure_responses() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            ai: AiSettings,
+        }
+
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+                [ai]
+                provider = "bedrock"
+                model = "opus-primary"
+
+                [[ai.additional_models]]
+                name = "azure-gpt"
+                probability = 1.0
+                provider = "openai-responses"
+                model = "gpt-5.6"
+
+                [ai.additional_models.openai_compat]
+                base_url = "https://example.services.ai.azure.com/api/projects/proj/openai/v1"
+                context_window_size = 400000
+                max_tokens = 16384
+                reasoning_effort = "high"
+            "#,
+        )
+        .unwrap();
+        let ai = wrapper.ai;
+
+        let effective = ai.additional_models[0].effective_ai(&ai);
+        assert_eq!(effective.provider, "openai-responses");
+        assert_eq!(effective.model, "gpt-5.6");
+        let openai = effective.openai_compat.unwrap();
+        assert_eq!(openai.max_tokens, Some(16384));
+        assert_eq!(openai.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

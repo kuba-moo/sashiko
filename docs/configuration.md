@@ -72,7 +72,7 @@ Core AI settings that apply to all providers.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `name` | string | `"main"` | Stable presentation name for the main model in finding provenance. Uses ASCII letters, digits, `_`, or `-`. |
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai-compat`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `openai`, `openai-compatible`, or `openai-responses`. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
@@ -217,13 +217,16 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 #### `[ai.openai_compat]`
 
-Settings for OpenAI-compatible providers (`provider = "openai-compat"`).
+Settings shared by the OpenAI Chat Completions providers
+(`provider = "openai"` or `"openai-compatible"`) and the Responses API
+provider (`provider = "openai-responses"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `base_url` | string | -- | API endpoint URL. |
 | `context_window_size` | integer | -- | Context window size (optional). |
-| `max_tokens` | integer | -- | Max output tokens (optional). |
+| `max_tokens` | integer | provider-specific | Max output tokens. Defaults to `4096` for Chat Completions and `16384` for Responses, whose limit also includes reasoning tokens. |
+| `reasoning_effort` | string | -- | Responses API reasoning effort, such as `low`, `medium`, or `high`; accepted values are deployment-specific and the setting is ignored by Chat Completions. |
 
 #### `[ai.kiro_cli]`
 
@@ -447,7 +450,7 @@ are added to the local web and API result. Previously sent email is unchanged.
 | `LLM_API_KEY` | API key for the configured LLM provider (universal fallback). |
 | `GEMINI_API_KEY` | API key for Gemini (takes precedence over `LLM_API_KEY`). |
 | `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `LLM_API_KEY`). |
-| `OPENAI_API_KEY` | API key for OpenAI-compatible providers (takes precedence over `LLM_API_KEY`). |
+| `OPENAI_API_KEY` | API key for OpenAI-compatible and Responses providers (takes precedence over `LLM_API_KEY`). |
 | `ANTHROPIC_BASE_URL` | Override the Claude API base URL (for proxies). |
 | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI provider. |
 | `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |

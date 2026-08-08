@@ -526,7 +526,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
+pub(crate) fn estimate_tokens_generic(request: &AiRequest) -> usize {
     let mut total = 0;
     if let Some(system) = &request.system {
         total += TokenBudget::estimate_tokens(system);

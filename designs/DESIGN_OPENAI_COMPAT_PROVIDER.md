@@ -6,6 +6,11 @@ Sashiko currently supports two AI providers with custom API formats: Gemini (`sr
 
 The official OpenAI API uses `max_completion_tokens` in the request body (introduced with the `o1` model family), while third-party OpenAI-compatible providers use the legacy `max_tokens` field. To support both, we expose two provider names — `"openai"` and `"openai-compatible"` — backed by the same client with a serialization flag.
 
+This document covers Chat Completions only. The separate
+`"openai-responses"` transport, including Azure AI Foundry and encrypted
+reasoning round trips, is described in
+[`DESIGN_OPENAI_RESPONSES_PROVIDER.md`](DESIGN_OPENAI_RESPONSES_PROVIDER.md).
+
 ## Design Decisions
 
 | Decision | Choice |

@@ -333,6 +333,10 @@ fn translate_request(
                             ReasoningBlock::Redacted { data } => {
                                 ReasoningContentBlock::RedactedContent(Blob::new(data.clone()))
                             }
+                            // Opaque reasoning belongs to another provider and
+                            // cannot be translated into a Bedrock content block.
+                            ReasoningBlock::Provider { .. }
+                            | ReasoningBlock::ProviderOutput { .. } => continue,
                         };
                         builder = builder.content(ContentBlock::ReasoningContent(rc));
                     }

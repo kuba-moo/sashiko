@@ -58,6 +58,26 @@ pub enum ReasoningBlock {
     /// Provider-redacted reasoning; opaque bytes that must be echoed back
     /// verbatim.
     Redacted { data: Vec<u8> },
+    /// Individual provider-owned reasoning item that must be replayed
+    /// verbatim. Providers whose reasoning must remain interleaved with other
+    /// output items use [`ReasoningBlock::ProviderOutput`] instead.
+    Provider {
+        provider: String,
+        data: serde_json::Value,
+    },
+    /// Ordered provider-owned output items that must be replayed together.
+    ///
+    /// Some APIs interleave opaque reasoning with messages and tool calls.
+    /// Keeping the transcript as one block preserves that ordering while the
+    /// normalized [`AiMessage`] fields remain available to the session layer.
+    ProviderOutput {
+        provider: String,
+        items: Vec<serde_json::Value>,
+        /// Provider-reported cost of replaying the output transcript. This is
+        /// preferable to tokenizing opaque encrypted content as plain text.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_estimate: Option<usize>,
+    },
 }
 
 /// A single message in an AI conversation.
@@ -73,10 +93,9 @@ pub struct AiMessage {
     /// Optional thoughts signature of the AI model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
-    /// Optional ordered list of reasoning content blocks from providers
-    /// that return multiple signed blocks per response (e.g. Anthropic
-    /// extended thinking via Bedrock Converse). Must be echoed back on
-    /// the next request to satisfy the provider's signature contract.
+    /// Optional ordered list of reasoning or replay state from providers that
+    /// return signed or opaque blocks. Must be echoed back on the next request
+    /// to satisfy the provider's continuity contract.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Vec<ReasoningBlock>>,
     /// Optional tool calls requested by the AI (usually only for Assistant role).
@@ -562,6 +581,26 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
 
             Ok(Arc::new(provider))
         }
+        "openai-responses" => {
+            let cfg = ai.openai_compat.as_ref();
+            let base_url = cfg
+                .and_then(|c| c.base_url.clone())
+                .unwrap_or_else(openai_responses::OpenAiResponsesClient::default_base_url);
+            let context_window = cfg.and_then(|c| c.context_window_size).unwrap_or(128_000);
+            let max_tokens = cfg
+                .and_then(|c| c.max_tokens)
+                .unwrap_or(openai_responses::DEFAULT_MAX_OUTPUT_TOKENS);
+            let reasoning_effort = cfg.and_then(|c| c.reasoning_effort.clone());
+
+            Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
+                base_url,
+                ai.model.clone(),
+                context_window,
+                max_tokens,
+                ai.api_timeout_secs,
+                reasoning_effort,
+            )?))
+        }
         "ollama" => {
             let model = ai.model.clone();
             let base_url = ai
@@ -675,6 +714,7 @@ pub mod kiro_cli;
 pub mod model_experiment;
 pub mod ollama;
 pub mod openai;
+pub mod openai_responses;
 pub mod proxy;
 pub mod quota;
 pub mod review_budget;
@@ -1298,6 +1338,12 @@ mod tests {
         settings.ai.model = "gpt-4o".to_string();
         let provider = create_provider(&settings)?;
         assert_eq!(provider.get_capabilities().model_name, "gpt-4o");
+
+        settings.ai.provider = "openai-responses".to_string();
+        settings.ai.model = "gpt-5.6".to_string();
+        let provider = create_provider(&settings)?;
+        assert_eq!(provider.get_capabilities().model_name, "gpt-5.6");
+        assert!(provider.caches_prompt_prefix());
 
         settings.ai.provider = "unknown".to_string();
         let result = create_provider(&settings);

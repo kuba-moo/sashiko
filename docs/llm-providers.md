@@ -279,3 +279,58 @@ cp docs/examples/Settings.openai-compat.toml Settings.toml
 ```
 
 Adjust `base_url` to point to your provider's endpoint.
+
+This provider uses Chat Completions. For OpenAI reasoning models and Azure AI
+Foundry project endpoints, use the Responses provider below.
+
+## OpenAI Responses API and Azure AI Foundry
+
+Use `provider = "openai-responses"` for OpenAI's Responses API. It accepts
+both the public OpenAI `/v1` root and Azure AI Foundry project URLs ending in
+`/openai/v1`; Sashiko appends `/responses` automatically. On Azure, `model`
+is the deployment name. Query parameters are preserved, so deployments that
+require the preview API can use a URL such as
+`.../openai/v1?api-version=preview`.
+
+Azure API Management gateway endpoints may instead use a complete URL such as
+`https://RESOURCE.azure-api.net/openai/responses?api-version=VERSION`. For
+`.azure-api.net` hosts, Sashiko sends `OPENAI_API_KEY` in Azure's `api-key`
+header; OpenAI and Azure AI Foundry v1 endpoints continue to use bearer auth.
+
+```bash
+export OPENAI_API_KEY="your-api-key"
+cp docs/examples/Settings.azure-openai-responses.toml Settings.toml
+```
+
+The provider uses bearer authentication, requests encrypted reasoning content,
+and replays that opaque item on later tool-call turns. Requests are stateless
+(`store = false`), so one provider instance can safely serve concurrent review
+stages. Sampling temperature is intentionally omitted because GPT reasoning
+models may reject it. Azure/OpenAI prompt caching is automatic; cached input
+tokens are reported in usage and the prefix-cache warmup path is enabled.
+The default output limit is 16384 because Responses counts hidden reasoning
+against `max_output_tokens`; set a larger deployment-supported value for
+especially reasoning-heavy reviews. Reasoning-effort values are also
+deployment-specific.
+
+To run Azure GPT as a secondary model while Bedrock remains primary, add this
+to the existing configuration:
+
+```toml
+[[ai.additional_models]]
+name = "azure-gpt"
+probability = 1.0
+provider = "openai-responses"
+model = "gpt-5.6"
+max_input_tokens = 200000
+
+[ai.additional_models.openai_compat]
+base_url = "https://YOUR-RESOURCE.services.ai.azure.com/api/projects/YOUR-PROJECT/openai/v1"
+context_window_size = 400000
+max_tokens = 16384
+reasoning_effort = "high"
+```
+
+`probability = 1.0` runs the secondary model on every review; lower values
+sample it per patch review. Keep the API key in `OPENAI_API_KEY`, not in
+`Settings.toml`.

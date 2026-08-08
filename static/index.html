@@ -769,6 +769,14 @@
             border-left-color: var(--sev-low) !important;
         }
 
+        /* Second axis: the defect predates the patch. Only the border *style*
+           changes, so the severity colour above still reads at a glance.
+           !important beats the solid in .ai-comment's border-left shorthand
+           regardless of rule order, as the severity colours above do. */
+        .ai-comment-preexisting {
+            border-left-style: dashed !important;
+        }
+
         .ai-comment-source {
             color: var(--text-muted);
             font-size: 0.85em;
@@ -2033,6 +2041,15 @@
                         let confirmedBy = null;
                         const finding = block.findingId
                             ? sourcePresentation?.findingsById.get(block.findingId) : null;
+                        // The inline text carries no pre-existing tag — stage 11
+                        // writes its own prose — so the flag comes from the
+                        // finding the [Finding:] tag points at. Reviews without
+                        // that tag simply get the solid border.
+                        const preClass = finding?.preexisting === true
+                            ? ' ai-comment-preexisting' : '';
+                        const blockClass = sevClass + preClass;
+                        const preTitle = preClass
+                            ? ' title="Pre-existing: the code predates this patch"' : '';
                         if (finding && Array.isArray(finding.source_models)) {
                             discovered = [...new Set(finding.source_models.filter(source =>
                                 typeof source === 'string'))];
@@ -2057,10 +2074,10 @@
                             if (confirmedBy) {
                                 annotation += ` · Confirmed by: ${escapeHtml(sourcePresentation.displayName(confirmedBy))}`;
                             }
-                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${annotation}</div>`;
+                            resultHtml += `<div class="diff-line ai-comment${blockClass} ai-comment-source"${preTitle}>${annotation}</div>`;
                         } else if (!hasParticipation && discovered.length > 0) {
                             const label = discovered.length === 1 ? 'Source' : 'Sources';
-                            resultHtml += `<div class="diff-line ai-comment${sevClass} ai-comment-source">${label}: ${discovered.join(', ')}</div>`;
+                            resultHtml += `<div class="diff-line ai-comment${blockClass} ai-comment-source"${preTitle}>${label}: ${discovered.join(', ')}</div>`;
                         }
                         block.items.forEach(item => {
                             if (item.line === "" &&
@@ -2068,8 +2085,8 @@
                                 return; // Skip the tag-only line
                             }
                             let c = item.cls;
-                            if (renderAiComments) c += ' ai-comment' + sevClass;
-                            resultHtml += `<div class="${c}">${item.line}</div>`;
+                            if (renderAiComments) c += ' ai-comment' + blockClass;
+                            resultHtml += `<div class="${c}"${preTitle}>${item.line}</div>`;
                         });
                     } else if (block.type === 'EMPTY') {
                         resultHtml += `<div class="${block.item.cls}">${block.item.line}</div>`;

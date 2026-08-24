@@ -205,8 +205,9 @@ impl Reviewer {
 
     /// Starts the reviewer service loop.
     ///
-    /// This method runs indefinitely, polling the database for pending patchsets
-    /// and processing them. It handles concurrency limits and worktree cleanup.
+    /// This method runs indefinitely, releasing embargoed results, servicing
+    /// cross-instance reviews, and then dispatching pending patchsets in that
+    /// order. It handles concurrency limits and worktree cleanup.
     pub async fn start(&self) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.start_until_shutdown(shutdown_rx).await;
@@ -255,20 +256,26 @@ impl Reviewer {
         loop {
             review_tasks.reap_finished();
 
-            if !*shutdown.borrow()
-                && let Err(e) = self
-                    .process_pending_patchsets(&mut shutdown, &mut review_tasks)
-                    .await
-            {
-                error!("Error in reviewer loop: {}", e);
-            }
-
+            // Release and cross-review run before dispatching new work. Both
+            // finish a review that already exists, and the remote side of a
+            // cross-review is embargoed for far longer than a local review
+            // takes, so there is always slack to review a Pending afterwards.
+            // Dispatching first would let a backlog push cross-review jobs
+            // past their deadline, since starvation does not extend it.
             if let Err(e) = self.release_embargoed_results().await {
                 error!("Error releasing embargoed results: {}", e);
             }
 
             if let Err(e) = self.process_cross_reviews().await {
                 error!("Error processing cross-instance reviews: {}", e);
+            }
+
+            if !*shutdown.borrow()
+                && let Err(e) = self
+                    .process_pending_patchsets(&shutdown, &mut review_tasks)
+                    .await
+            {
+                error!("Error in reviewer loop: {}", e);
             }
 
             review_tasks.reap_finished();
@@ -302,27 +309,26 @@ impl Reviewer {
         }
     }
 
-    async fn acquire_review_permit(
+    /// Claims one unit of review capacity if it is free right now.
+    ///
+    /// Deliberately non-blocking: waiting here would pin the service loop for
+    /// as long as a review runs, which starves the embargo-release and
+    /// cross-review stages that run ahead of dispatch. A patchset that finds no
+    /// capacity stays `Pending` and is dispatched by a later iteration, and the
+    /// loop wakes as soon as a review task finishes, so capacity stays
+    /// saturated without holding the loop.
+    fn try_acquire_review_permit(
         semaphore: Arc<Semaphore>,
-        shutdown: &mut watch::Receiver<bool>,
-    ) -> Result<Option<OwnedSemaphorePermit>> {
-        loop {
-            if *shutdown.borrow() {
-                return Ok(None);
-            }
-
-            tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(None);
-                    }
-                }
-                permit = semaphore.clone().acquire_owned() => {
-                    return permit.map(Some).map_err(Into::into);
-                }
-            }
+        shutdown: &watch::Receiver<bool>,
+    ) -> Option<OwnedSemaphorePermit> {
+        // Holding the watch borrow through the claim makes taking capacity
+        // atomic with respect to publishing the shutdown signal.
+        let shutdown_requested = shutdown.borrow();
+        if *shutdown_requested {
+            return None;
         }
+
+        semaphore.try_acquire_owned().ok()
     }
 
     fn claim_patch_unless_shutdown<T>(
@@ -342,7 +348,7 @@ impl Reviewer {
 
     async fn process_pending_patchsets(
         &self,
-        shutdown: &mut watch::Receiver<bool>,
+        shutdown: &watch::Receiver<bool>,
         review_tasks: &mut ReviewTasks,
     ) -> Result<()> {
         let patchsets = self.db.get_pending_patchsets(10).await?;
@@ -354,8 +360,7 @@ impl Reviewer {
         info!("Found {} pending patchsets for review", patchsets.len());
 
         for patchset in patchsets {
-            let Some(permit) =
-                Self::acquire_review_permit(self.semaphore.clone(), shutdown).await?
+            let Some(permit) = Self::try_acquire_review_permit(self.semaphore.clone(), shutdown)
             else {
                 break;
             };
@@ -3126,25 +3131,33 @@ mod tests {
         assert!(!output.contains("rejected internal candidate"));
     }
 
-    #[tokio::test]
-    async fn shutdown_interrupts_waiting_for_review_permit() {
-        let semaphore = Arc::new(Semaphore::new(0));
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    #[test]
+    fn exhausted_capacity_does_not_hold_the_dispatch_loop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let waiter = tokio::spawn(async move {
-            Reviewer::acquire_review_permit(semaphore, &mut shutdown_rx)
-                .await
-                .unwrap()
-        });
-        tokio::task::yield_now().await;
+        let permit = Reviewer::try_acquire_review_permit(semaphore.clone(), &shutdown_rx);
+        assert!(permit.is_some());
+        // The loop must give up rather than wait: the cross-review and
+        // embargo-release stages run ahead of dispatch every iteration.
+        assert!(
+            Reviewer::try_acquire_review_permit(semaphore.clone(), &shutdown_rx).is_none(),
+            "dispatch claimed capacity that is already in use"
+        );
+
+        drop(permit);
+        assert!(Reviewer::try_acquire_review_permit(semaphore, &shutdown_rx).is_some());
+    }
+
+    #[test]
+    fn shutdown_prevents_claiming_review_capacity() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         shutdown_tx.send(true).unwrap();
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("permit wait did not observe shutdown")
-            .unwrap();
 
-        assert!(permit.is_none());
+        assert!(Reviewer::try_acquire_review_permit(semaphore.clone(), &shutdown_rx).is_none());
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[tokio::test]

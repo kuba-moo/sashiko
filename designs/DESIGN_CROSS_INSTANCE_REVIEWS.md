@@ -112,6 +112,13 @@ single scheduler claims due jobs with a lease
         +-- deadline ----> expired
 ```
 
+The scheduler shares the reviewer service loop with embargo release and
+patchset dispatch, and runs ahead of dispatch. Cross-review completes a review
+that already exists, the remote side is embargoed for far longer than a local
+review takes, and starvation does not extend a job's deadline, so a backlog of
+pending patchsets must never delay a due job. Dispatch therefore claims only
+review capacity that is free at that moment and never waits for a permit.
+
 The scheduler periodically claims a bounded batch of jobs using an atomic
 state transition, a lease timestamp, and a unique fencing token. Every retry,
 completion, and persistence mutation must still own that token. A crashed or

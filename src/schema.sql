@@ -426,6 +426,36 @@ CREATE TABLE IF NOT EXISTS patchwork_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_status ON patchwork_outbox(status);
 
+-- Patch state observed on patchwork, pushed in by the nipa poller.  One row per
+-- patch we reviewed; patches patchwork knows about but we never reviewed are
+-- dropped at ingest rather than stored.  'state' is the raw patchwork slug and
+-- is authoritative, 'outcome' is the derived bucket (see state_outcome() in
+-- src/patchwork.rs) so re-bucketing is a plain UPDATE.
+CREATE TABLE IF NOT EXISTS patchwork_patch_state (
+    patch_id INTEGER PRIMARY KEY,
+    pw_patch_id INTEGER,
+    pw_series_id INTEGER,
+    state TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    previous_state TEXT,
+    initial_state TEXT,
+    actor TEXT,
+    state_changed_at INTEGER,
+    last_event_id INTEGER,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(patch_id) REFERENCES patches(id)
+);
+CREATE INDEX IF NOT EXISTS idx_patchwork_patch_state_outcome ON patchwork_patch_state(outcome);
+
+-- Single-row watermark for the poller's patch-state-changed event sweep.  The
+-- date is fed back to patchwork as the sweep's "since" parameter.
+CREATE TABLE IF NOT EXISTS patchwork_sync (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_event_date TEXT,
+    last_event_id INTEGER,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS json_decode_events (
     id INTEGER PRIMARY KEY,
     review_id INTEGER,

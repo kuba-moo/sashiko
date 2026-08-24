@@ -3733,19 +3733,20 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 if (!state.statsData) {
-                    const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode] = await Promise.all([
+                    const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode, patchwork] = await Promise.all([
                         apiFetch('api/stats/timeline').then(r => r.json()),
                         apiFetch('api/stats/reviews').then(r => r.json()),
                         apiFetch('api/stats/tools').then(r => r.json()),
                         apiFetch('api/stats/cost').then(r => r.json()),
                         apiFetch('api/stats/model-experiments').then(r => r.json()),
                         apiFetch('api/stats/cross-reviews').then(r => r.json()),
-                        apiFetch('api/stats/json-decode').then(r => r.json())
+                        apiFetch('api/stats/json-decode').then(r => r.json()),
+                        apiFetch('api/stats/patchwork').then(r => r.json())
                     ]);
-                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode };
+                    state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode, patchwork };
                 }
 
-                const { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode } = state.statsData;
+                const { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode, patchwork } = state.statsData;
                 const reviews = reviewsData.reviews;
                 const historicalTotal = reviewsData.total_reviews;
                 const historicalFailed = reviewsData.total_failures;
@@ -3855,6 +3856,53 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += '<h3>Monthly LLM Cost by Model</h3><div class="chart-section"><div id="chart-model-cost-monthly" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Per-patch cost &amp; time (with vs without findings)</h3><div class="chart-section"><div id="chart-cost-perpatch" style="width:100%; height:300px;"></div></div>';
                 html += '<h3>Throughput &amp; signal</h3><div class="chart-section"><div id="chart-throughput" style="width:100%; height:300px;"></div></div>';
+
+                // Patchwork outcomes — what the maintainers did with the patches we
+                // reviewed, cross-tabbed against the severity we assigned.
+                const pwDaily = (patchwork && patchwork.daily) || [];
+                const pwSeverities = [
+                    { key: 'none', label: 'No findings', color: '#91cc75' },
+                    { key: 'low', label: 'Low', color: '#2e7d32' },
+                    { key: 'medium', label: 'Medium', color: '#f9a825' },
+                    { key: 'high', label: 'High', color: '#e64a19' },
+                    { key: 'critical', label: 'Critical', color: '#b71c1c' }
+                ];
+                const pwRowTotal = (row) => pwSeverities.reduce((total, s) => total + (row[s.key] || 0), 0);
+                // 'main' scope only: 'other' covers the same patches, so summing both would double count.
+                const pwOutcomeTotal = (outcome, days) => pwDaily
+                    .filter(row => row.scope === 'main' && row.outcome === outcome && daysAgo(row.day) < days)
+                    .reduce((total, row) => total + pwRowTotal(row), 0);
+
+                html += '<h2>Patchwork Outcomes</h2>';
+                if (pwDaily.length) {
+                    html += '<p style="opacity:0.8; font-size:0.9em;">What netdev maintainers did with the patches we' +
+                        ' reviewed. <em>Accepted</em> means the patch was merged as posted, so anything we flagged was' +
+                        ' ignored or was a false positive; <em>changes requested</em> (also rejected and superseded)' +
+                        ' means it was sent back, so the review was probably right. Each chart shows the composition of' +
+                        ' one outcome over a 7-day trailing window, so its lines sum to 100%. Buckets are anchored on' +
+                        ' the patch\'s own date and recent patches are still in flight, so the newest days are computed' +
+                        ' from fewer settled patches.</p>';
+                    html += '<div class="stat-card-grid">';
+                    html += renderStatCard('Still active (7 days)', pwOutcomeTotal('active', 7));
+                    html += renderStatCard('Still active (30 days)', pwOutcomeTotal('active', 30));
+                    html += renderStatCard('Not ours (7 days)', pwOutcomeTotal('not_applicable', 7));
+                    html += renderStatCard('Not ours (30 days)', pwOutcomeTotal('not_applicable', 30));
+                    html += '</div>';
+                    html += '<h3>Accepted — main model</h3><div class="chart-section">' +
+                        '<div id="chart-pw-accepted-main" style="width:100%; height:300px;"></div></div>';
+                    html += '<h3>Changes requested — main model</h3><div class="chart-section">' +
+                        '<div id="chart-pw-changes-main" style="width:100%; height:300px;"></div></div>';
+                    html += '<p style="opacity:0.8; font-size:0.9em;">The next two pool every additional experiment' +
+                        ' model that ran alongside the main review, over the patches where one actually ran. Their' +
+                        ' findings carry no pre-existing flag, so unlike the main-model charts above they cannot' +
+                        ' exclude pre-existing findings.</p>';
+                    html += '<h3>Accepted — other models</h3><div class="chart-section">' +
+                        '<div id="chart-pw-accepted-other" style="width:100%; height:300px;"></div></div>';
+                    html += '<h3>Changes requested — other models</h3><div class="chart-section">' +
+                        '<div id="chart-pw-changes-other" style="width:100%; height:300px;"></div></div>';
+                } else {
+                    html += '<p class="loading">No patchwork state recorded yet.</p>';
+                }
 
                 const experimentPairs = (modelExperiments && modelExperiments.paired_cost) || [];
                 if (experimentPairs.length) {
@@ -4605,6 +4653,88 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     document.getElementById('chart-model-cost-monthly').innerHTML = '<p class="loading">No monthly cost data available.</p>';
                     document.getElementById('chart-cost-perpatch').innerHTML = '<p class="loading">No cost data available.</p>';
                     document.getElementById('chart-throughput').innerHTML = '<p class="loading">No cost data available.</p>';
+                }
+
+                // --- 6. Patchwork outcome composition charts ---
+                if (pwDaily.length) {
+                    // Walk every calendar day between the first and last row so the
+                    // trailing window really is 7 days rather than 7 populated rows.
+                    const pwPresent = [...new Set(pwDaily.map(row => row.day))].sort();
+                    const pwAxis = [];
+                    const pwLast = new Date(pwPresent[pwPresent.length - 1] + 'T00:00:00Z').getTime();
+                    for (let t = new Date(pwPresent[0] + 'T00:00:00Z').getTime(); t <= pwLast; t += 86400000) {
+                        pwAxis.push(new Date(t).toISOString().slice(0, 10));
+                    }
+
+                    [
+                        { id: 'chart-pw-accepted-main', scope: 'main', outcome: 'accepted' },
+                        { id: 'chart-pw-changes-main', scope: 'main', outcome: 'changes_requested' },
+                        { id: 'chart-pw-accepted-other', scope: 'other', outcome: 'accepted' },
+                        { id: 'chart-pw-changes-other', scope: 'other', outcome: 'changes_requested' }
+                    ].forEach(spec => {
+                        const target = document.getElementById(spec.id);
+                        if (!target) return;
+                        const byDay = new Map();
+                        pwDaily
+                            .filter(row => row.scope === spec.scope && row.outcome === spec.outcome)
+                            .forEach(row => {
+                                const entry = byDay.get(row.day) ||
+                                    Object.fromEntries(pwSeverities.map(s => [s.key, 0]));
+                                pwSeverities.forEach(s => { entry[s.key] += row[s.key] || 0; });
+                                byDay.set(row.day, entry);
+                            });
+                        // Sum the window's raw counts first, then take the composition:
+                        // a day with two Critical patches must not read as 100% Critical.
+                        const windows = pwAxis.map((_, i) => {
+                            const acc = Object.fromEntries(pwSeverities.map(s => [s.key, 0]));
+                            for (let j = Math.max(0, i - 6); j <= i; j++) {
+                                const entry = byDay.get(pwAxis[j]);
+                                if (entry) pwSeverities.forEach(s => { acc[s.key] += entry[s.key]; });
+                            }
+                            return acc;
+                        });
+                        const windowTotals = windows.map(w => pwRowTotal(w));
+                        const chart = echarts.init(target, isDark ? 'dark' : null);
+                        chart.setOption({
+                            backgroundColor: 'transparent',
+                            tooltip: {
+                                trigger: 'axis',
+                                formatter: params => {
+                                    if (!params.length) return '';
+                                    const i = params[0].dataIndex;
+                                    let out = escapeHtml(params[0].axisValue) +
+                                        ' — 7 days to here, ' + windowTotals[i] + ' patches';
+                                    params.forEach(p => {
+                                        const key = pwSeverities[p.seriesIndex].key;
+                                        out += '<br/>' + p.marker + escapeHtml(p.seriesName) + ': ' +
+                                            (p.value === null || p.value === undefined
+                                                ? '-' : Number(p.value).toFixed(1) + '%') +
+                                            ' (' + windows[i][key] + ')';
+                                    });
+                                    return out;
+                                }
+                            },
+                            legend: { data: pwSeverities.map(s => s.label), bottom: 0 },
+                            grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
+                            xAxis: { type: 'category', data: pwAxis, axisLine: { lineStyle: { color: themeAxis } } },
+                            yAxis: {
+                                type: 'value', min: 0, max: 100,
+                                axisLabel: { formatter: '{value}%' },
+                                splitLine: { lineStyle: { type: 'dashed' } }
+                            },
+                            series: pwSeverities.map(s => ({
+                                name: s.label,
+                                type: 'line',
+                                smooth: true,
+                                showSymbol: false,
+                                connectNulls: false,
+                                itemStyle: { color: s.color },
+                                data: windows.map((w, i) => windowTotals[i]
+                                    ? Number((w[s.key] / windowTotals[i] * 100).toFixed(1)) : null)
+                            }))
+                        });
+                        state.activeCharts.push(chart);
+                    });
                 }
 
             } catch (e) {

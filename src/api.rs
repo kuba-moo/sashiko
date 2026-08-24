@@ -139,6 +139,7 @@ pub struct AppState {
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
     stats_cost_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
+    stats_patchwork_cache: AsyncCache<serde_json::Value>,
     messages_count_cache: AsyncCache<usize>,
     patchsets_count_cache: AsyncCache<usize>,
     patchsets_homepage_cache: AsyncCache<Vec<crate::db::PatchsetRow>>,
@@ -356,6 +357,7 @@ pub fn build_router(
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_cost_cache: AsyncMapCache::new(Duration::from_secs(60)),
+        stats_patchwork_cache: AsyncCache::new(Duration::from_secs(60)),
         messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
@@ -381,6 +383,9 @@ pub fn build_router(
         .route("/api/stats/model-experiments", get(stats_model_experiments))
         .route("/api/stats/cross-reviews", get(stats_cross_reviews))
         .route("/api/stats/json-decode", get(stats_json_decode))
+        .route("/api/stats/patchwork", get(stats_patchwork))
+        .route("/api/patchwork/sync", get(patchwork_sync))
+        .route("/api/patchwork/state", post(ingest_patchwork_state))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
@@ -1146,6 +1151,110 @@ async fn stats_json_decode(
             info!("Error getting JSON decode stats: {}", error);
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// How much history the patchwork outcome dashboard covers.  Wider than the
+/// initial 30-day backfill so the charts keep growing without a code change.
+const PATCHWORK_STATS_WINDOW_DAYS: i64 = 90;
+
+async fn stats_patchwork(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let data = state
+        .stats_patchwork_cache
+        .get_or_fetch(|| async {
+            state
+                .db
+                .get_patchwork_stats(PATCHWORK_STATS_WINDOW_DAYS)
+                .await
+                .map_err(|e| {
+                    info!("Error getting patchwork stats: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
+        })
+        .await?;
+    Ok(Json(data))
+}
+
+/// The poller's sweep watermark, read once at poller startup so a restart
+/// neither rescans nor skips patchwork events.  The poller passes the date back
+/// to patchwork as the event sweep's `since` parameter.
+async fn patchwork_sync(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    state
+        .db
+        .get_patchwork_sync()
+        .await
+        .map(Json)
+        .map_err(|error| {
+            info!("Error getting patchwork sync watermark: {}", error);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct PatchworkStateRequest {
+    /// Date of the newest event in this batch, stored as the new watermark.
+    #[serde(default)]
+    last_event_date: Option<String>,
+    #[serde(default)]
+    last_event_id: Option<i64>,
+    #[serde(default)]
+    records: Vec<crate::patchwork::PatchworkStateRecord>,
+}
+
+/// Ingest patch states observed on patchwork.
+///
+/// The poller cannot see sashiko's database, so it pushes the project's whole
+/// `patch-state-changed` stream and we do the join here.  Records for patches
+/// sashiko never reviewed are dropped, not stored — most of the stream is series
+/// we never submitted (excluded tags, series that failed the CI-check gate), so
+/// `unknown` normally dwarfs `stored` and is logged as a batch count rather than
+/// per record.
+async fn ingest_patchwork_state(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PatchworkStateRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        info!(
+            "Refused patchwork state ingest from non-localhost: {}",
+            addr
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let summary = state
+        .db
+        .record_patchwork_states(
+            &payload.records,
+            payload.last_event_date.as_deref(),
+            payload.last_event_id,
+        )
+        .await
+        .map_err(|error| {
+            error!("Error recording patchwork states: {}", error);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    info!(
+        "Patchwork state ingest: {} stored, {} not ours, {} stale (through {})",
+        summary.stored,
+        summary.unknown,
+        summary.stale,
+        payload.last_event_date.as_deref().unwrap_or("unchanged")
+    );
+
+    Ok(Json(serde_json::json!({
+        "stored": summary.stored,
+        "unknown": summary.unknown,
+        "stale": summary.stale,
+    })))
 }
 
 async fn stats_cross_reviews(

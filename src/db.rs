@@ -18,7 +18,7 @@ use anyhow::Result;
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct Database {
     database: libsql::Database,
@@ -581,6 +581,9 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS review_merge_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL UNIQUE, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE TABLE IF NOT EXISTS json_decode_events (id INTEGER PRIMARY KEY, review_id INTEGER, source TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)",
             "CREATE INDEX IF NOT EXISTS idx_json_decode_events_day ON json_decode_events(created_at)",
+            "CREATE TABLE IF NOT EXISTS patchwork_patch_state (patch_id INTEGER PRIMARY KEY, pw_patch_id INTEGER, pw_series_id INTEGER, state TEXT NOT NULL, outcome TEXT NOT NULL, previous_state TEXT, initial_state TEXT, actor TEXT, state_changed_at INTEGER, last_event_id INTEGER, updated_at INTEGER NOT NULL, FOREIGN KEY(patch_id) REFERENCES patches(id))",
+            "CREATE INDEX IF NOT EXISTS idx_patchwork_patch_state_outcome ON patchwork_patch_state(outcome)",
+            "CREATE TABLE IF NOT EXISTS patchwork_sync (id INTEGER PRIMARY KEY CHECK (id = 1), last_event_date TEXT, last_event_id INTEGER, updated_at INTEGER NOT NULL)",
         ] {
             let _ = self.conn.execute(sql, ()).await;
         }
@@ -6624,6 +6627,316 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    // -- Patchwork patch state (feedback from patchwork back into sashiko) --
+
+    /// Record patch states observed on patchwork and advance the sweep
+    /// watermark.
+    ///
+    /// Records whose message-id is not a patch sashiko reviewed are dropped and
+    /// counted in `unknown`: no row is written and no placeholder patch or
+    /// patchset is created.  That is the normal case, since the poller pushes
+    /// the whole project's event stream and most of it is series we never
+    /// submitted.
+    ///
+    /// Ordering is guarded by the patchwork event id, which increases with the
+    /// event date, so re-sweeping a date range is a no-op and an out-of-order
+    /// event cannot move a patch backwards.
+    pub async fn record_patchwork_states(
+        &self,
+        records: &[crate::patchwork::PatchworkStateRecord],
+        last_event_date: Option<&str>,
+        last_event_id: Option<i64>,
+    ) -> Result<crate::patchwork::PatchworkIngestSummary> {
+        use crate::patchwork::{is_known_state, parse_patchwork_timestamp, state_outcome};
+
+        let mut summary = crate::patchwork::PatchworkIngestSummary::default();
+        let now = chrono::Utc::now().timestamp();
+        let mut unknown_states: std::collections::BTreeSet<String> = Default::default();
+
+        self.begin_transaction().await?;
+
+        for record in records {
+            let msgid = record
+                .msgid
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>');
+            if msgid.is_empty() || record.state.trim().is_empty() {
+                summary.unknown += 1;
+                continue;
+            }
+
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patches WHERE message_id = ?",
+                    libsql::params![msgid],
+                )
+                .await?;
+            let patch_id: i64 = match rows.next().await? {
+                Some(row) => row.get(0)?,
+                None => {
+                    summary.unknown += 1;
+                    continue;
+                }
+            };
+            drop(rows);
+
+            let state = record.state.trim();
+            if !is_known_state(state) {
+                unknown_states.insert(state.to_string());
+            }
+            let outcome = state_outcome(state);
+            let changed_at = record
+                .changed_at
+                .as_deref()
+                .and_then(parse_patchwork_timestamp)
+                .unwrap_or(now);
+
+            if record.seed {
+                // A seed only establishes the baseline.  If an event already
+                // moved this patch, leave the current state alone and just
+                // backfill what the seed uniquely knows.
+                self.conn
+                    .execute(
+                        "INSERT INTO patchwork_patch_state
+                             (patch_id, pw_patch_id, pw_series_id, state, outcome,
+                              initial_state, state_changed_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT(patch_id) DO UPDATE SET
+                             pw_patch_id = COALESCE(patchwork_patch_state.pw_patch_id, excluded.pw_patch_id),
+                             pw_series_id = COALESCE(patchwork_patch_state.pw_series_id, excluded.pw_series_id),
+                             initial_state = COALESCE(patchwork_patch_state.initial_state, excluded.initial_state),
+                             updated_at = excluded.updated_at",
+                        libsql::params![
+                            patch_id,
+                            record.pw_patch_id,
+                            record.pw_series_id,
+                            state,
+                            outcome,
+                            state,
+                            changed_at,
+                            now,
+                        ],
+                    )
+                    .await?;
+                summary.stored += 1;
+                continue;
+            }
+
+            // Transition.  Skip it if we have already applied this event or a
+            // later one for the same patch.
+            if let Some(event_id) = record.event_id {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT last_event_id FROM patchwork_patch_state WHERE patch_id = ?",
+                        libsql::params![patch_id],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await?
+                    && row
+                        .get::<Option<i64>>(0)?
+                        .is_some_and(|seen| seen >= event_id)
+                {
+                    summary.stale += 1;
+                    continue;
+                }
+            }
+
+            self.conn
+                .execute(
+                    "INSERT INTO patchwork_patch_state
+                         (patch_id, pw_patch_id, pw_series_id, state, outcome,
+                          previous_state, actor, state_changed_at, last_event_id, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(patch_id) DO UPDATE SET
+                         pw_patch_id = COALESCE(excluded.pw_patch_id, patchwork_patch_state.pw_patch_id),
+                         pw_series_id = COALESCE(excluded.pw_series_id, patchwork_patch_state.pw_series_id),
+                         state = excluded.state,
+                         outcome = excluded.outcome,
+                         previous_state = excluded.previous_state,
+                         actor = excluded.actor,
+                         state_changed_at = excluded.state_changed_at,
+                         last_event_id = excluded.last_event_id,
+                         updated_at = excluded.updated_at",
+                    libsql::params![
+                        patch_id,
+                        record.pw_patch_id,
+                        record.pw_series_id,
+                        state,
+                        outcome,
+                        record.previous_state.as_deref(),
+                        record.actor.as_deref(),
+                        changed_at,
+                        record.event_id,
+                        now,
+                    ],
+                )
+                .await?;
+            summary.stored += 1;
+        }
+
+        // The watermark moves in the same transaction as the records, so a
+        // crash cannot leave it ahead of the data it describes.
+        if last_event_date.is_some() || last_event_id.is_some() {
+            self.conn
+                .execute(
+                    "INSERT INTO patchwork_sync (id, last_event_date, last_event_id, updated_at)
+                     VALUES (1, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET
+                         last_event_date = MAX(
+                             COALESCE(excluded.last_event_date, patchwork_sync.last_event_date),
+                             COALESCE(patchwork_sync.last_event_date, excluded.last_event_date)
+                         ),
+                         last_event_id = MAX(
+                             COALESCE(excluded.last_event_id, 0),
+                             COALESCE(patchwork_sync.last_event_id, 0)
+                         ),
+                         updated_at = excluded.updated_at",
+                    libsql::params![last_event_date, last_event_id, now],
+                )
+                .await?;
+        }
+
+        self.commit_transaction().await?;
+
+        if !unknown_states.is_empty() {
+            warn!(
+                "Unrecognised patchwork state(s) bucketed as active: {}",
+                unknown_states.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        Ok(summary)
+    }
+
+    /// Daily patchwork outcome counts, split by severity group.
+    ///
+    /// Returns raw counts and lets the UI derive percentages, the same way the
+    /// cost dashboard works off raw token counts.  One row per
+    /// (day, scope, outcome); `day` is the series date so every patch in a
+    /// series lands on the same day.
+    ///
+    /// A patch's severity group is the *maximum* severity of its findings, so
+    /// the groups are disjoint and composition percentages sum to 100%.
+    ///
+    /// `scope = 'main'` uses the stored review's findings, excluding
+    /// pre-existing ones to match the per-patch aggregation the UI already does.
+    /// `scope = 'other'` pools the additional experiment models and is
+    /// restricted to patches where an additional model actually ran — otherwise
+    /// "ran and found nothing" would be conflated with "never ran".  A source
+    /// row alone does not mean it ran: every candidate model gets one, most of
+    /// them 'not_selected', and a selected one can still fail.
+    /// model_experiment_findings has no preexisting flag, so that filter cannot
+    /// be applied on the 'other' side; the asymmetry is deliberate.
+    pub async fn get_patchwork_stats(&self, window_days: i64) -> Result<serde_json::Value> {
+        let cutoff = chrono::Utc::now().timestamp() - window_days * 86400;
+
+        let sql = "
+            WITH pat AS (
+                SELECT p.id AS patch_id,
+                       strftime('%Y-%m-%d', s.date, 'unixepoch') AS day
+                FROM patches p
+                JOIN patchsets s ON s.id = p.patchset_id
+                WHERE s.status = 'Reviewed' AND s.date >= ?
+            ),
+            main_sev AS (
+                SELECT r.patch_id AS patch_id, MAX(f.severity) AS sev
+                FROM reviews r
+                JOIN findings f ON f.review_id = r.id
+                WHERE r.status = 'Reviewed'
+                  AND r.patch_id IS NOT NULL
+                  AND COALESCE(f.preexisting, 0) = 0
+                GROUP BY r.patch_id
+            ),
+            other_ran AS (
+                SELECT DISTINCT r.patch_id AS patch_id
+                FROM model_experiment_sources ms
+                JOIN reviews r ON r.id = ms.review_id
+                WHERE r.patch_id IS NOT NULL
+                  AND ms.selected = 1
+                  AND ms.status = 'completed'
+            ),
+            other_sev AS (
+                SELECT r.patch_id AS patch_id, MAX(CASE lower(COALESCE(mf.severity, ''))
+                           WHEN 'critical' THEN 4
+                           WHEN 'high' THEN 3
+                           WHEN 'medium' THEN 2
+                           WHEN 'low' THEN 1
+                           ELSE 0 END) AS sev
+                FROM model_experiment_findings mf
+                JOIN reviews r ON r.id = mf.review_id
+                WHERE r.patch_id IS NOT NULL
+                  AND mf.outcome IN ('both', 'additional_only', 'additional_hallucination')
+                GROUP BY r.patch_id
+            )
+            SELECT pat.day, 'main' AS scope, st.outcome,
+                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) <= 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 2 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 3 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) >= 4 THEN 1 ELSE 0 END)
+            FROM pat
+            JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+            LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
+            GROUP BY pat.day, st.outcome
+            UNION ALL
+            SELECT pat.day, 'other' AS scope, st.outcome,
+                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) <= 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 2 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 3 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) >= 4 THEN 1 ELSE 0 END)
+            FROM pat
+            JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+            JOIN other_ran ON other_ran.patch_id = pat.patch_id
+            LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
+            GROUP BY pat.day, st.outcome
+            ORDER BY 1, 2, 3";
+
+        let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
+        let mut daily = Vec::new();
+        while let Some(row) = rows.next().await? {
+            daily.push(json!({
+                "day": row.get::<String>(0)?,
+                "scope": row.get::<String>(1)?,
+                "outcome": row.get::<String>(2)?,
+                "none": row.get::<i64>(3)?,
+                "low": row.get::<i64>(4)?,
+                "medium": row.get::<i64>(5)?,
+                "high": row.get::<i64>(6)?,
+                "critical": row.get::<i64>(7)?,
+            }));
+        }
+
+        Ok(json!({
+            "window_days": window_days,
+            "daily": daily,
+        }))
+    }
+
+    /// The poller's durable sweep watermark: the date of the newest event we
+    /// have ingested, which the poller feeds back to patchwork as `since`.
+    pub async fn get_patchwork_sync(&self) -> Result<serde_json::Value> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT last_event_date, last_event_id, updated_at
+                 FROM patchwork_sync WHERE id = 1",
+                (),
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            return Ok(json!({
+                "last_event_date": row.get::<Option<String>>(0)?,
+                "last_event_id": row.get::<Option<i64>>(1)?,
+                "updated_at": row.get::<Option<i64>>(2)?,
+            }));
+        }
+        Ok(json!({"last_event_date": null, "last_event_id": null, "updated_at": null}))
+    }
 }
 
 #[cfg(test)]
@@ -10817,5 +11130,346 @@ mod tests {
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             1
         );
+    }
+
+    // -- Patchwork patch state ingest --
+
+    fn pw_event(msgid: &str, state: &str, event_id: i64) -> crate::patchwork::PatchworkStateRecord {
+        crate::patchwork::PatchworkStateRecord {
+            msgid: msgid.to_string(),
+            state: state.to_string(),
+            previous_state: Some("new".to_string()),
+            actor: Some("maintainer".to_string()),
+            changed_at: Some("2026-08-24T20:11:10.614568".to_string()),
+            event_id: Some(event_id),
+            pw_patch_id: Some(1000 + event_id),
+            pw_series_id: Some(7),
+            seed: false,
+        }
+    }
+
+    fn pw_seed(msgid: &str, state: &str) -> crate::patchwork::PatchworkStateRecord {
+        crate::patchwork::PatchworkStateRecord {
+            msgid: msgid.to_string(),
+            state: state.to_string(),
+            previous_state: None,
+            actor: None,
+            changed_at: None,
+            event_id: None,
+            pw_patch_id: Some(555),
+            pw_series_id: Some(7),
+            seed: true,
+        }
+    }
+
+    async fn setup_patchwork_db() -> Arc<Database> {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id, status, date)
+                     VALUES (1, 1, 'Reviewed', unixepoch('now', '-3 days'));
+                 -- patches.message_id is a foreign key into messages.
+                 INSERT INTO messages (id, message_id, thread_id) VALUES
+                     (1, 'patch-one@example.com', 1),
+                     (2, 'patch-two@example.com', 1),
+                     (3, 'patch-three@example.com', 1),
+                     (4, 'patch-four@example.com', 1);
+                 INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES
+                     (1, 1, 'patch-one@example.com', 1),
+                     (2, 1, 'patch-two@example.com', 2);",
+            )
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn pw_state_row(
+        db: &Database,
+        patch_id: i64,
+    ) -> Option<(String, String, Option<String>, Option<i64>)> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT state, outcome, initial_state, last_event_id
+                 FROM patchwork_patch_state WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap()?;
+        Some((
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get(3).unwrap(),
+        ))
+    }
+
+    /// Patches sashiko never reviewed are dropped outright: nothing is stored,
+    /// no placeholder rows appear, and the watermark still advances so the
+    /// poller does not re-fetch the same events forever.
+    #[tokio::test]
+    async fn patchwork_ingest_drops_patches_we_do_not_know() {
+        let db = setup_patchwork_db().await;
+        let records = vec![
+            pw_event("<someone-elses@example.com>", "accepted", 10),
+            pw_event("<also-not-ours@example.com>", "superseded", 11),
+        ];
+
+        let summary = db
+            .record_patchwork_states(&records, Some("2026-08-24T20:11:10"), Some(11))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.stored, 0);
+        assert_eq!(summary.unknown, 2);
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchwork_patch_state", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
+        );
+        // No patch or patchset was invented for the unknown message-ids.
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patches", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2
+        );
+
+        let sync = db.get_patchwork_sync().await.unwrap();
+        assert_eq!(sync["last_event_date"], "2026-08-24T20:11:10");
+        assert_eq!(sync["last_event_id"], 11);
+    }
+
+    /// Angle brackets are optional on the wire; sashiko stores message-ids bare.
+    #[tokio::test]
+    async fn patchwork_ingest_normalises_angle_brackets() {
+        let db = setup_patchwork_db().await;
+        let summary = db
+            .record_patchwork_states(
+                &[pw_event("<patch-one@example.com>", "accepted", 5)],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.stored, 1);
+        assert_eq!(
+            pw_state_row(&db, 1).await.unwrap(),
+            ("accepted".into(), "accepted".into(), None, Some(5))
+        );
+    }
+
+    /// Re-sweeping a date range must be a no-op, and a late-arriving older
+    /// event must not move a patch backwards.
+    #[tokio::test]
+    async fn patchwork_ingest_guards_event_ordering() {
+        let db = setup_patchwork_db().await;
+
+        let summary = db
+            .record_patchwork_states(
+                &[pw_event("patch-one@example.com", "changes-requested", 100)],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.stored, 1);
+
+        // Same event again — replay after a crash.
+        let summary = db
+            .record_patchwork_states(
+                &[pw_event("patch-one@example.com", "changes-requested", 100)],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!((summary.stored, summary.stale), (0, 1));
+
+        // Older event arriving late must not overwrite.
+        let summary = db
+            .record_patchwork_states(&[pw_event("patch-one@example.com", "new", 90)], None, None)
+            .await
+            .unwrap();
+        assert_eq!((summary.stored, summary.stale), (0, 1));
+        assert_eq!(pw_state_row(&db, 1).await.unwrap().0, "changes-requested");
+
+        // A newer event applies, and superseded rolls into changes_requested.
+        let summary = db
+            .record_patchwork_states(
+                &[pw_event("patch-one@example.com", "superseded", 110)],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.stored, 1);
+        let (state, outcome, _, last_event) = pw_state_row(&db, 1).await.unwrap();
+        assert_eq!(
+            (state.as_str(), outcome.as_str(), last_event),
+            ("superseded", "changes_requested", Some(110))
+        );
+    }
+
+    /// A seed snapshot establishes the baseline but must never clobber a state
+    /// an event already recorded.
+    #[tokio::test]
+    async fn patchwork_seed_never_overwrites_event_state() {
+        let db = setup_patchwork_db().await;
+
+        db.record_patchwork_states(
+            &[pw_event("patch-one@example.com", "accepted", 42)],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Seed arrives afterwards (poller restarted mid-series, say).
+        db.record_patchwork_states(&[pw_seed("patch-one@example.com", "new")], None, None)
+            .await
+            .unwrap();
+
+        let (state, outcome, initial, last_event) = pw_state_row(&db, 1).await.unwrap();
+        assert_eq!(state, "accepted");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(initial.as_deref(), Some("new"));
+        assert_eq!(last_event, Some(42));
+    }
+
+    /// The normal order: seed at review time, then events move the patch while
+    /// initial_state keeps recording what we reviewed against.
+    #[tokio::test]
+    async fn patchwork_seed_then_event_keeps_initial_state() {
+        let db = setup_patchwork_db().await;
+
+        db.record_patchwork_states(&[pw_seed("patch-two@example.com", "new")], None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pw_state_row(&db, 2).await.unwrap(),
+            ("new".into(), "active".into(), Some("new".into()), None)
+        );
+
+        db.record_patchwork_states(
+            &[pw_event("patch-two@example.com", "changes-requested", 7)],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (state, outcome, initial, _) = pw_state_row(&db, 2).await.unwrap();
+        assert_eq!(state, "changes-requested");
+        assert_eq!(outcome, "changes_requested");
+        assert_eq!(initial.as_deref(), Some("new"));
+    }
+
+    /// The watermark only ever moves forward, even if a batch reports an older
+    /// position — a `--backfill-states` run over an old range must not rewind
+    /// the live sweep.
+    #[tokio::test]
+    async fn patchwork_watermark_never_moves_backwards() {
+        let db = setup_patchwork_db().await;
+        db.record_patchwork_states(&[], Some("2026-08-24T00:00:00"), Some(500))
+            .await
+            .unwrap();
+        db.record_patchwork_states(&[], Some("2026-08-20T00:00:00"), Some(400))
+            .await
+            .unwrap();
+        let sync = db.get_patchwork_sync().await.unwrap();
+        assert_eq!(sync["last_event_id"], 500);
+        assert_eq!(sync["last_event_date"], "2026-08-24T00:00:00");
+    }
+
+    /// Severity groups must be disjoint (max severity wins) so the UI's
+    /// composition percentages sum to 100%, pre-existing findings must not
+    /// count, and the 'other' scope must only include patches where an
+    /// additional model actually ran.
+    #[tokio::test]
+    async fn patchwork_stats_group_by_max_severity() {
+        let db = setup_patchwork_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES
+                     (3, 1, 'patch-three@example.com', 3),
+                     (4, 1, 'patch-four@example.com', 4);
+                 INSERT INTO reviews (id, patchset_id, patch_id, status, created_at) VALUES
+                     (1, 1, 1, 'Reviewed', unixepoch('now')),
+                     (2, 1, 2, 'Reviewed', unixepoch('now')),
+                     (3, 1, 3, 'Reviewed', unixepoch('now')),
+                     (4, 1, 4, 'Reviewed', unixepoch('now'));
+                 -- patch 1: Low + High -> High group.  patch 2: only a
+                 -- pre-existing Critical, so it belongs in the 'none' group.
+                 INSERT INTO findings (id, review_id, severity, problem, preexisting) VALUES
+                     (1, 1, 1, 'low', 0),
+                     (2, 1, 3, 'high', 0),
+                     (3, 2, 4, 'preexisting critical', 1);
+                 -- An additional model ran on patches 1 and 2 only.  Patch 4
+                 -- has source rows but nothing that ran: every candidate model
+                 -- gets a row, and a selected one can still fail.
+                 INSERT INTO model_experiment_sources (id, review_id, experiment_name, selected, status) VALUES
+                     (1, 1, 'sonnet-5', 1, 'completed'),
+                     (2, 2, 'sonnet-5', 1, 'completed'),
+                     (3, 4, 'sonnet-5', 0, 'not_selected'),
+                     (4, 4, 'fable-5', 1, 'failed');
+                 INSERT INTO model_experiment_findings (id, review_id, additional_model, finding_id, outcome, severity) VALUES
+                     (1, 1, 'sonnet-5', 'f1', 'additional_only', 'Medium'),
+                     -- main_only is the main model's finding, not the peer's.
+                     (2, 2, 'sonnet-5', 'f2', 'main_only', 'Critical');",
+            )
+            .await
+            .unwrap();
+        db.record_patchwork_states(
+            &[
+                pw_event("patch-one@example.com", "accepted", 1),
+                pw_event("patch-two@example.com", "accepted", 2),
+                pw_event("patch-three@example.com", "accepted", 3),
+                pw_event("patch-four@example.com", "accepted", 4),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_patchwork_stats(90).await.unwrap();
+        let daily = stats["daily"].as_array().unwrap();
+
+        let main = daily
+            .iter()
+            .find(|row| row["scope"] == "main" && row["outcome"] == "accepted")
+            .expect("main row");
+        // patch 1 -> high, patches 2 (pre-existing only), 3 and 4 -> none
+        assert_eq!(main["high"], 1);
+        assert_eq!(
+            main["low"], 0,
+            "max severity wins, so Low must not double count"
+        );
+        assert_eq!(main["critical"], 0, "pre-existing findings must not count");
+        assert_eq!(main["none"], 3);
+
+        let other = daily
+            .iter()
+            .find(|row| row["scope"] == "other" && row["outcome"] == "accepted")
+            .expect("other row");
+        // Only patches 1 and 2 had an additional model run.  Patch 3 has no
+        // source row at all and patch 4's sources never produced a review, so
+        // neither may be counted as "ran and found nothing".
+        assert_eq!(other["medium"], 1);
+        assert_eq!(other["none"], 1);
+        assert_eq!(other["critical"], 0, "main_only is not the peer's finding");
+        let other_total: i64 = ["none", "low", "medium", "high", "critical"]
+            .iter()
+            .map(|k| other[*k].as_i64().unwrap())
+            .sum();
+        assert_eq!(other_total, 2);
     }
 }

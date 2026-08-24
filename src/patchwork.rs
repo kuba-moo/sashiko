@@ -272,6 +272,109 @@ pub fn compose_patchwork_email(
     (subject, body)
 }
 
+/// One patch-state observation pushed in by the nipa poller, either a
+/// transition read from patchwork's `patch-state-changed` event stream or a
+/// `seed` snapshot taken when we finished reviewing the series.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchworkStateRecord {
+    /// Patch message-id, with or without angle brackets.
+    pub msgid: String,
+    /// Raw patchwork state slug, e.g. "changes-requested".
+    pub state: String,
+    /// State the patch moved from, straight out of the event payload.
+    #[serde(default)]
+    pub previous_state: Option<String>,
+    /// Who made the change; distinguishes maintainers from patchwork's bot.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Event date as patchwork reports it, e.g. "2026-08-24T20:11:10.614568".
+    #[serde(default)]
+    pub changed_at: Option<String>,
+    /// Patchwork event id.  Absent on seed snapshots, which have no event.
+    #[serde(default)]
+    pub event_id: Option<i64>,
+    #[serde(default)]
+    pub pw_patch_id: Option<i64>,
+    #[serde(default)]
+    pub pw_series_id: Option<i64>,
+    /// True for a snapshot of the state at review time rather than a
+    /// transition.  Seeds never overwrite event-derived state.
+    #[serde(default)]
+    pub seed: bool,
+}
+
+/// Ingest tally.  `unknown` counts records for patches sashiko never reviewed,
+/// which is the common case and not an error — see the ingest handler.
+#[derive(Debug, Default, Serialize)]
+pub struct PatchworkIngestSummary {
+    pub stored: u64,
+    pub unknown: u64,
+    pub stale: u64,
+}
+
+/// Parse a patchwork timestamp into a unix timestamp.
+///
+/// Patchwork reports naive UTC, usually with microseconds
+/// ("2026-08-24T20:11:10.614568") but without them on some objects.
+pub fn parse_patchwork_timestamp(value: &str) -> Option<i64> {
+    let trimmed = value.trim().trim_end_matches('Z');
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
+            return Some(dt.and_utc().timestamp());
+        }
+    }
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// Broad outcome bucket for a patchwork patch state, used to analyse whether a
+/// review was acted on.  The raw slug stays authoritative in the DB; this is a
+/// derived label, so re-bucketing later is an UPDATE and not a re-import.
+///
+/// The four buckets, and what they mean for review quality:
+///   - `active`            — not resolved yet, no signal
+///   - `accepted`          — merged as-is, so our comments were ignored
+///   - `changes_requested` — sent back or revised, so the review was likely right
+///   - `not_applicable`    — netdev's verdict says nothing about our review
+///
+/// Unknown slugs fall back to `active` (the caller logs them) so that a state
+/// added to patchwork later cannot silently be counted as a real outcome.
+pub fn state_outcome(state: &str) -> &'static str {
+    match state {
+        "new" | "under-review" | "needs-ack" => "active",
+        "accepted" => "accepted",
+        // superseded means a new version was posted, i.e. the author revised.
+        "changes-requested" | "rejected" | "superseded" => "changes_requested",
+        // deferred is postponed rather than judged; awaiting-upstream goes in
+        // via another tree; rfc was never meant to be applied.
+        "not-applicable" | "handled-elsewhere" | "awaiting-upstream" | "deferred" | "rfc" => {
+            "not_applicable"
+        }
+        _ => "active",
+    }
+}
+
+/// Whether `state_outcome` recognised the slug, so callers can log new
+/// patchwork states once instead of silently bucketing them as `active`.
+pub fn is_known_state(state: &str) -> bool {
+    matches!(
+        state,
+        "new"
+            | "under-review"
+            | "needs-ack"
+            | "accepted"
+            | "changes-requested"
+            | "rejected"
+            | "superseded"
+            | "not-applicable"
+            | "handled-elsewhere"
+            | "awaiting-upstream"
+            | "deferred"
+            | "rfc"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +622,56 @@ mod tests {
         assert!(lines[2].starts_with("description: "));
         assert!(lines[3].starts_with("target_url: "));
         assert!(lines[4].starts_with("context: "));
+    }
+
+    /// Every state slug observed live on netdev (project 399), sampled both from
+    /// 750 recent patches and 2000 recent patch-state-changed events.
+    #[test]
+    fn test_state_outcome_all_live_states() {
+        for state in ["new", "under-review", "needs-ack"] {
+            assert_eq!(state_outcome(state), "active", "{}", state);
+        }
+        assert_eq!(state_outcome("accepted"), "accepted");
+        for state in ["changes-requested", "rejected", "superseded"] {
+            assert_eq!(state_outcome(state), "changes_requested", "{}", state);
+        }
+        for state in [
+            "not-applicable",
+            "handled-elsewhere",
+            "awaiting-upstream",
+            "deferred",
+            "rfc",
+        ] {
+            assert_eq!(state_outcome(state), "not_applicable", "{}", state);
+        }
+    }
+
+    #[test]
+    fn test_state_outcome_unknown_state_is_active() {
+        // A state patchwork adds later must not be counted as a real outcome.
+        assert_eq!(state_outcome("queued-for-next"), "active");
+        assert_eq!(state_outcome(""), "active");
+        assert!(!is_known_state("queued-for-next"));
+    }
+
+    #[test]
+    fn test_is_known_state_covers_every_bucketed_state() {
+        // is_known_state and state_outcome must not drift apart.
+        for state in [
+            "new",
+            "under-review",
+            "needs-ack",
+            "accepted",
+            "changes-requested",
+            "rejected",
+            "superseded",
+            "not-applicable",
+            "handled-elsewhere",
+            "awaiting-upstream",
+            "deferred",
+            "rfc",
+        ] {
+            assert!(is_known_state(state), "{}", state);
+        }
     }
 }

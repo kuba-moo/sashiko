@@ -43,6 +43,18 @@ pub struct CrossReviewJob {
     pub attempts: i64,
 }
 
+/// Per-patch inputs for rendering an accepted remote finding into its report.
+#[derive(Debug, Clone, Default)]
+pub struct CrossRenderInput {
+    /// The prepared context stage 11 was given, which already carries the patch
+    /// and the code it touches. This is why the render needs no worktree.
+    pub context: String,
+    /// The patch as applied, used as the authoritative source of anchor lines.
+    pub diff: String,
+    /// The report as it stands, handed to the model as the house style to match.
+    pub inline_review: String,
+}
+
 fn append_unique_string(value: &mut serde_json::Value, item: &str) {
     if !value.is_array() {
         *value = serde_json::Value::Array(Vec::new());
@@ -1730,11 +1742,51 @@ impl Database {
         Ok((findings, context))
     }
 
+    /// Loads what rendering an accepted remote finding into a report needs, keyed
+    /// by patch message ID.
+    ///
+    /// `inline_review` here is only the sample of house style handed to the model;
+    /// the copy that gets spliced is re-read inside the publishing transaction so
+    /// several findings in one job splice onto each other's output.
+    pub async fn load_cross_review_render_inputs(
+        &self,
+        patchset_id: i64,
+    ) -> Result<std::collections::HashMap<String, CrossRenderInput>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.message_id, ai.input_context, p.diff, r.inline_review
+                 FROM reviews r
+                 JOIN patches p ON p.id = r.patch_id
+                 LEFT JOIN ai_interactions ai ON ai.id = r.interaction_id
+                 WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                   AND r.id = (SELECT MAX(current.id) FROM reviews current
+                               WHERE current.patchset_id = r.patchset_id
+                                 AND current.patch_id = r.patch_id
+                                 AND current.status = 'Reviewed')",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut inputs = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            inputs.insert(
+                row.get::<String>(0)?,
+                CrossRenderInput {
+                    context: row.get(1).unwrap_or_default(),
+                    diff: row.get(2).unwrap_or_default(),
+                    inline_review: row.get(3).unwrap_or_default(),
+                },
+            );
+        }
+        Ok(inputs)
+    }
+
     pub async fn persist_cross_review_result(
         &self,
         job: &CrossReviewJob,
         remote: &crate::cross_review::RemoteReviewResult,
         analysis: &crate::cross_review::CrossReviewAnalysis,
+        rendered: &std::collections::HashMap<String, crate::cross_render::RenderedComment>,
         usage: &crate::cross_review::CrossReviewUsage,
         now: i64,
     ) -> Result<()> {
@@ -1742,7 +1794,9 @@ impl Database {
             let _transaction_guard = self.in_memory_transaction.lock().await;
             self.conn.execute("BEGIN IMMEDIATE", ()).await?;
             let result = self
-                .persist_cross_review_records(&self.conn, job, remote, analysis, usage, now)
+                .persist_cross_review_records(
+                    &self.conn, job, remote, analysis, rendered, usage, now,
+                )
                 .await;
             return match result {
                 Ok(()) => {
@@ -1765,7 +1819,7 @@ impl Database {
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await?;
         let result = self
-            .persist_cross_review_records(&transaction, job, remote, analysis, usage, now)
+            .persist_cross_review_records(&transaction, job, remote, analysis, rendered, usage, now)
             .await;
         match result {
             Ok(()) => {
@@ -1779,12 +1833,14 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn persist_cross_review_records(
         &self,
         connection: &libsql::Connection,
         job: &CrossReviewJob,
         remote: &crate::cross_review::RemoteReviewResult,
         analysis: &crate::cross_review::CrossReviewAnalysis,
+        rendered: &std::collections::HashMap<String, crate::cross_render::RenderedComment>,
         usage: &crate::cross_review::CrossReviewUsage,
         now: i64,
     ) -> Result<()> {
@@ -1853,8 +1909,13 @@ impl Database {
                 .await?;
         }
         for finding in &analysis.accepted_remote {
-            self.publish_cross_review_finding(connection, job, finding)
-                .await?;
+            self.publish_cross_review_finding(
+                connection,
+                job,
+                finding,
+                rendered.get(&finding.finding_id),
+            )
+            .await?;
         }
         for matched in &analysis.matched_local {
             self.merge_local_cross_review_provenance(connection, job, matched)
@@ -1905,10 +1966,11 @@ impl Database {
         connection: &libsql::Connection,
         job: &CrossReviewJob,
         finding: &crate::cross_review::RemoteFinding,
+        rendered: Option<&crate::cross_render::RenderedComment>,
     ) -> Result<()> {
         let mut rows = connection
             .query(
-                "SELECT r.id, r.interaction_id, r.inline_review, ai.output_raw
+                "SELECT r.id, r.interaction_id, r.inline_review, ai.output_raw, p.diff
                  FROM reviews r
                  JOIN patches p ON p.id = r.patch_id
                  LEFT JOIN ai_interactions ai ON ai.id = r.interaction_id
@@ -1926,7 +1988,12 @@ impl Database {
         let interaction_id: Option<String> = row.get(1).ok();
         let inline_review: Option<String> = row.get(2).ok();
         let output_raw: Option<String> = row.get(3).ok();
+        let patch_diff: String = row.get(4).unwrap_or_default();
         drop(rows);
+        // The report tag and the stored provenance must agree, so both use the
+        // shortened display form rather than the sha256 join key.
+        let display_id =
+            crate::cross_render::display_finding_id(&job.source_name, &finding.finding_id);
 
         connection
             .execute(
@@ -1970,7 +2037,7 @@ impl Database {
                     "preexisting": false,
                     "locations": finding.locations,
                     "source_models": [job.source_name],
-                    "finding_ids": [finding.finding_id],
+                    "finding_ids": [display_id],
                     "cross_review_source": job.source_name,
                     "cross_review_finding_id": finding.finding_id,
                     "confirmed_by": "main",
@@ -1983,28 +2050,32 @@ impl Database {
                     .await?;
             }
         }
-        let marker = format!(
-            "Cross-instance finding from {} ({})",
-            job.source_name, finding.finding_id
-        );
-        if !inline_review
-            .as_deref()
-            .unwrap_or_default()
-            .contains(&marker)
-        {
-            let rendered = format!(
-                "{}\n\n{}:\n[Severity: {}]\n[Finding: {}]\n[Sources: {}]\n{}",
-                inline_review.unwrap_or_default(),
-                marker,
-                finding.severity,
-                finding.finding_id,
-                job.source_name,
-                finding.problem,
+        // The finding tag doubles as the idempotency guard. It is derived from the
+        // remote finding's content hash, so re-publishing the same finding, or a
+        // second source's alias of it, cannot duplicate the comment block.
+        let guard = format!("[Finding: {display_id}]");
+        let current = inline_review.unwrap_or_default();
+        if !current.contains(&guard) {
+            let comment = rendered
+                .map(|entry| entry.comment.clone())
+                .unwrap_or_else(|| crate::cross_render::fallback_comment(finding));
+            let block = crate::cross_render::comment_block(
+                &finding.severity,
+                &display_id,
+                &job.source_name,
+                &comment,
+            );
+            let updated = crate::cross_render::splice_comment_block(
+                &current,
+                &patch_diff,
+                &block,
+                rendered.and_then(|entry| entry.anchor.as_deref()),
+                &finding.locations,
             );
             connection
                 .execute(
                     "UPDATE reviews SET inline_review = ? WHERE id = ?",
-                    libsql::params![rendered, review_id],
+                    libsql::params![updated, review_id],
                 )
                 .await?;
         }
@@ -9768,12 +9839,24 @@ mod tests {
                     (id, thread_id, cover_letter_message_id, status, provider, model_name)
                     VALUES (1, 1, 'patch@example', 'Reviewed', 'local-provider', 'local-model');
                  INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
-                    VALUES (10, 1, 'patch@example', 1, 'diff');
+                    VALUES (10, 1, 'patch@example', 1,
+                    'diff --git a/foo.c b/foo.c
+--- a/foo.c
++++ b/foo.c
+@@ -1,2 +1,3 @@
+ int foo(void)
++	kfree(ring);
+ 	return 0;
+');
                  INSERT INTO ai_interactions (id, input_context, output_raw)
                     VALUES ('interaction', 'prepared context', '{\"review\":{\"findings\":[]}}');
                  INSERT INTO reviews
                     (id, patchset_id, patch_id, interaction_id, status, created_at, inline_review)
-                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000, 'Initial review');",
+                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000,
+                    '> @@ -1,2 +1,3 @@
+> +	kfree(ring);
+
+[ ... ]');",
             )
             .await
             .unwrap();
@@ -9823,10 +9906,18 @@ mod tests {
             }],
         };
 
+        let rendered = std::collections::HashMap::from([(
+            "remote".to_string(),
+            crate::cross_render::RenderedComment {
+                comment: "Should this free happen before the reset?".to_string(),
+                anchor: Some("+\tkfree(ring);".to_string()),
+            },
+        )]);
         db.persist_cross_review_result(
             &job,
             &remote,
             &analysis,
+            &rendered,
             &crate::cross_review::CrossReviewUsage::default(),
             1100,
         )
@@ -9857,14 +9948,26 @@ mod tests {
         assert!(output.contains("remote problem"));
         let output: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(output["review"]["findings"][0]["confirmed_by"], "main");
+        // The display ID in the report has to be the one stored for the UI join.
+        assert_eq!(
+            output["review"]["findings"][0]["finding_ids"][0],
+            "peer-remote"
+        );
         let mut rows = db
             .conn
             .query("SELECT inline_review FROM reviews WHERE id = 20", ())
             .await
             .unwrap();
         let inline: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert!(inline.contains("[Finding: remote]"));
+        assert!(inline.contains("[Finding: peer-remote]"));
         assert!(inline.contains("[Sources: peer]"));
+        assert!(inline.contains("Should this free happen before the reset?"));
+        // The block lands under the line it is about, not after the whole report.
+        let anchor = inline.find("> +\tkfree(ring);").unwrap();
+        let block = inline.find("[Severity: Medium]").unwrap();
+        assert!(anchor < block && block < inline.find("[ ... ]").unwrap());
+        // No internal marker line and no raw content hash in the mail text.
+        assert!(!inline.contains("Cross-instance finding from"));
         let stats = db.get_cross_review_stats().await.unwrap();
         assert_eq!(stats["outcomes"][0]["outcome"], "remote_only");
         assert_eq!(stats["outcomes"][0]["local_model"], "local-model");
@@ -9879,6 +9982,103 @@ mod tests {
         let stats = db.get_cross_review_stats().await.unwrap();
         assert_eq!(stats["outcomes"][0]["local_model"], "local-model");
         assert_eq!(stats["outcomes"][0]["local_provider"], "local-provider");
+    }
+
+    #[tokio::test]
+    async fn unrendered_remote_findings_still_publish_anchored_and_tagged() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('patch@example', 1);
+                 INSERT INTO patchsets (id, thread_id, cover_letter_message_id, status)
+                    VALUES (1, 1, 'patch@example', 'Reviewed');
+                 INSERT INTO patches (id, patchset_id, message_id, part_index, diff)
+                    VALUES (10, 1, 'patch@example', 1,
+                    'diff --git a/foo.c b/foo.c
+--- a/foo.c
++++ b/foo.c
+@@ -1,2 +1,3 @@
+ int foo(void)
++	kfree(ring);
+ 	return 0;
+');
+                 INSERT INTO ai_interactions (id, input_context, output_raw)
+                    VALUES ('interaction', 'context', '{\"review\":{\"findings\":[]}}');
+                 INSERT INTO reviews
+                    (id, patchset_id, patch_id, interaction_id, status, created_at, inline_review)
+                    VALUES (20, 1, 10, 'interaction', 'Reviewed', 1000, 'No issues found.');",
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .claim_due_cross_reviews(1000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let finding = crate::cross_review::RemoteFinding {
+            finding_id: "abcdef01".to_string(),
+            patch_message_id: "patch@example".to_string(),
+            severity: "High".to_string(),
+            problem: "The ring is freed twice.".to_string(),
+            reasoning: "Consequence: the allocator poisons the pool.".to_string(),
+            locations: json!([{"file": "foo.c", "line": 2}]),
+        };
+        let remote = crate::cross_review::RemoteReviewResult {
+            model: "remote-model".to_string(),
+            provider: "remote-provider".to_string(),
+            payload_hash: "hash".to_string(),
+            findings: vec![finding.clone()],
+        };
+        let analysis = crate::cross_review::CrossReviewAnalysis {
+            accepted_remote: vec![finding],
+            matched_local: Vec::new(),
+            matched_remote: Vec::new(),
+            comparisons: vec![crate::cross_review::CrossComparison {
+                finding_id: "abcdef01".to_string(),
+                matched_finding_id: None,
+                outcome: "remote_only".to_string(),
+                severity: "High".to_string(),
+            }],
+        };
+
+        // An empty render map is what a failed or budget-starved render call
+        // leaves behind; publication must not depend on it.
+        db.persist_cross_review_result(
+            &job,
+            &remote,
+            &analysis,
+            &std::collections::HashMap::new(),
+            &crate::cross_review::CrossReviewUsage::default(),
+            1100,
+        )
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query("SELECT inline_review FROM reviews WHERE id = 20", ())
+            .await
+            .unwrap();
+        let inline: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        // The report may no longer claim there is nothing to report.
+        assert!(!inline.contains("No issues found."));
+        assert!(inline.contains("[Finding: peer-abcdef01]"));
+        // The whole remote finding is carried over, not just its first sentence.
+        assert!(inline.contains("The ring is freed twice."));
+        assert!(inline.contains("Consequence: the allocator poisons the pool."));
+        // locations alone are enough to quote and anchor the hunk.
+        assert!(inline.contains("> @@ -1,2 +1,3 @@"));
+        let anchor = inline.find("> +\tkfree(ring);").unwrap();
+        assert!(anchor < inline.find("[Severity: High]").unwrap());
     }
 
     #[tokio::test]
@@ -9971,6 +10171,7 @@ mod tests {
             &job,
             &remote,
             &analysis,
+            &std::collections::HashMap::new(),
             &crate::cross_review::CrossReviewUsage::default(),
             1100,
         )
@@ -10556,7 +10757,8 @@ mod tests {
         };
         let (remote_a, analysis_a) = make_result("remote-a");
         let usage = crate::cross_review::CrossReviewUsage::default();
-        db.persist_cross_review_result(&first, &remote_a, &analysis_a, &usage, 1100)
+        let rendered = std::collections::HashMap::new();
+        db.persist_cross_review_result(&first, &remote_a, &analysis_a, &rendered, &usage, 1100)
             .await
             .unwrap();
         let second = db
@@ -10581,7 +10783,7 @@ mod tests {
                 severity: "Medium".to_string(),
             }],
         };
-        db.persist_cross_review_result(&second, &remote_b, &analysis_b, &usage, 1200)
+        db.persist_cross_review_result(&second, &remote_b, &analysis_b, &rendered, &usage, 1200)
             .await
             .unwrap();
 

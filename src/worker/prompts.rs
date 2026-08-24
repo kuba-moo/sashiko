@@ -1882,6 +1882,11 @@ Example Output:
         }
 
         // Stage 11
+        //
+        // This is the only place the inline report is written from scratch. It
+        // needs the tools and the patch worktree, so cross-review results that
+        // arrive days later cannot re-run it; they render a single comment block
+        // instead (see crate::cross_render).
         if let Some(progress_cb) = progress {
             progress_cb(WorkerProgressEvent::StageStarted { stage: 11 });
         }

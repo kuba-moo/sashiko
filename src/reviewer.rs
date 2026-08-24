@@ -471,10 +471,10 @@ impl Reviewer {
         for attempt in 1..=3 {
             let merge_budget = crate::ai::review_budget::ReviewBudget::new(merge_budget_config);
             let mut usage = crate::cross_review::CrossReviewUsage::default();
-            let result = async {
+            let result: Result<_> = async {
                 let (local, patch_context) = db.load_cross_review_inputs(job.patchset_id).await?;
                 let _permit = llm_semaphore.acquire().await?;
-                analyze_remote_result(
+                let analysis = analyze_remote_result(
                     provider.as_ref(),
                     &patch_context,
                     &local,
@@ -482,7 +482,20 @@ impl Reviewer {
                     Some(&merge_budget),
                     &mut usage,
                 )
-                .await
+                .await?;
+                // Report text for the accepted findings is rendered here rather
+                // than in the publishing transaction: it is a model call, and the
+                // fenced transaction must not hold a write lock across one.
+                let rendered = Self::render_cross_review_comments(
+                    &db,
+                    provider.as_ref(),
+                    &job,
+                    &analysis,
+                    Some(&merge_budget),
+                    &mut usage,
+                )
+                .await;
+                Ok((analysis, rendered))
             }
             .await;
             usage.budget_flags |= merge_budget.flags();
@@ -498,10 +511,17 @@ impl Reviewer {
             }
 
             let result = match result {
-                Ok(analysis) => {
+                Ok((analysis, rendered)) => {
                     let now = chrono::Utc::now().timestamp();
-                    db.persist_cross_review_result(&job, &remote, &analysis, &total_usage, now)
-                        .await
+                    db.persist_cross_review_result(
+                        &job,
+                        &remote,
+                        &analysis,
+                        &rendered,
+                        &total_usage,
+                        now,
+                    )
+                    .await
                 }
                 Err(error) => Err(error),
             };
@@ -529,6 +549,75 @@ impl Reviewer {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Renders the report text for the remote findings this job is about to
+    /// publish, one model call per patch.
+    ///
+    /// Failures are logged and swallowed rather than propagated. A remote finding
+    /// that local verification accepted has to reach the report even when the
+    /// render model is unreachable or the merge budget is spent, so anything
+    /// missing from the returned map falls back to the remote's own wording in
+    /// `publish_cross_review_finding`.
+    async fn render_cross_review_comments(
+        db: &Database,
+        provider: &dyn AiProvider,
+        job: &crate::db::CrossReviewJob,
+        analysis: &crate::cross_review::CrossReviewAnalysis,
+        budget: Option<&crate::ai::review_budget::ReviewBudget>,
+        usage: &mut crate::cross_review::CrossReviewUsage,
+    ) -> std::collections::HashMap<String, crate::cross_render::RenderedComment> {
+        let mut rendered = std::collections::HashMap::new();
+        if analysis.accepted_remote.is_empty() {
+            return rendered;
+        }
+        let inputs = match db.load_cross_review_render_inputs(job.patchset_id).await {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                warn!(
+                    "Failed to load cross-review render inputs for {}: {}",
+                    job.source_name, error
+                );
+                return rendered;
+            }
+        };
+        // The prepared context dominates the prompt, so a patch's findings are
+        // batched into one call and pay for it once.
+        let mut by_patch: std::collections::BTreeMap<
+            &str,
+            Vec<&crate::cross_review::RemoteFinding>,
+        > = std::collections::BTreeMap::new();
+        for finding in &analysis.accepted_remote {
+            by_patch
+                .entry(finding.patch_message_id.as_str())
+                .or_default()
+                .push(finding);
+        }
+        for (patch_message_id, findings) in by_patch {
+            let Some(input) = inputs.get(patch_message_id) else {
+                warn!("Cross-review render has no reviewed patch for {patch_message_id}");
+                continue;
+            };
+            match crate::cross_render::render_remote_comments(
+                provider,
+                &job.source_name,
+                &input.context,
+                &input.diff,
+                &input.inline_review,
+                &findings,
+                budget,
+                usage,
+            )
+            .await
+            {
+                Ok(comments) => rendered.extend(comments),
+                Err(error) => warn!(
+                    "Cross-review render failed for {} on {}: {}",
+                    job.source_name, patch_message_id, error
+                ),
+            }
+        }
+        rendered
     }
 
     async fn release_embargoed_results(&self) -> Result<()> {

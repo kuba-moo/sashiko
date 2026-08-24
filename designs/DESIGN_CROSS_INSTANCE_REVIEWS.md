@@ -252,13 +252,13 @@ Malformed or failed confirmation consumes one of the three immediate
 integration attempts. It is never interpreted as acceptance and never returns
 the job to hourly polling.
 
-Confirmed remote-only findings are appended to the local persisted findings
-and included in regenerated web and API output. Rejected findings are retained
-only as comparison evidence. Existing local findings are never removed.
+Confirmed remote-only findings are appended to the local persisted findings and
+to the structured review output that the web and API surfaces read. Rejected
+findings are retained only as comparison evidence. Existing local findings are
+never removed.
 
-Email already sent by the initial review cannot be edited. The initial
-implementation updates database-backed web and API rendering only; a separate
-follow-up email policy may be added later.
+A remote finding also reaches the inline report, which is a separate artifact
+from the structured output. See Report Rendering.
 
 ## Merge Budget
 
@@ -273,8 +273,10 @@ remote result arrives later
   -> fresh cross merge ledger
 ```
 
-The cross merge ledger covers semantic deduplication and remote-only
-confirmation, including retry attempts. It never consumes a discovery ledger.
+The cross merge ledger covers semantic deduplication, remote-only confirmation
+and report rendering, including retry attempts. It never consumes a discovery
+ledger. Rendering is charged last, so exhausting the ledger degrades report
+prose rather than losing a verified finding.
 Usage and budget flags are persisted on `cross_review_jobs`; initial stages
 8-11 usage is persisted in `review_merge_runs`. Budget exhaustion fails only
 the cross-review job and cannot change the already published `Reviewed` result.
@@ -283,9 +285,12 @@ Configuration uses `[ai.merge_budget]`, which accepts the same per-stage and
 per-run input/output fields as `[ai.budget]` and inherits `[ai.budget]` when
 omitted.
 
-Cross-result persistence and rerendering are one fenced transaction. Multiple
-patchsets may finish concurrently, while remotes for the same patchset
-generation are serialized so semantic publication deduplication is stable.
+Cross-result persistence and report splicing are one fenced transaction.
+Rendering happens before that transaction opens, because it is a model call and
+the transaction must not hold a write lock across one. Multiple patchsets may
+finish concurrently, while remotes for the same patchset generation are
+serialized so semantic publication deduplication is stable and so a render
+observes the report that its splice will edit.
 
 ## Comparison Statistics
 
@@ -317,7 +322,95 @@ shows the pending sources. After each fenced integration transaction completes,
 the existing structured finding provenance is authoritative: matched findings
 include the remote source and confirmed remote-only findings are published with
 that source. Stable finding-ID annotations associate inline comments with this
-updated provenance without rerunning Stage 11.
+updated provenance.
+
+## Report Rendering
+
+The inline report is the LKML-style text a review sends and the web UI displays.
+Stage 11 writes it during the initial review with review tools and the patch
+worktree available. A cross-review result arrives up to three days later, when
+that worktree is gone, so stage 11 cannot be re-run for it. Cross-review renders
+only the comment block for each newly published remote finding and splices that
+block into the existing report.
+
+Rendering is triggered by a non-empty accepted-remote set, which covers both
+novel remote findings and remote findings that corroborate a local candidate
+stage 10 had rejected. It is not triggered for `remote_hallucination`, for a
+`both` match against an already accepted local finding, or for a remote finding
+that aliases an earlier import; those cases change provenance only, which the
+structured output already carries.
+
+One model call is made per patch, batching that patch's findings, because the
+prepared context dominates the prompt. The prepared context stored on the review
+interaction is exactly the system prompt stage 11 was given, and it already
+carries the patch and the surrounding code, which is why no worktree or baseline
+re-apply is needed. The call also receives the patch diff as the authoritative
+source of anchor lines and the current report as the house style to match.
+
+Responsibilities are split so that a bad render degrades text but never
+correctness:
+
+- The model returns prose and a suggested anchor line, nothing else.
+- Rust owns the `[Severity:]`, `[Finding:]` and `[Sources:]` tag lines, so
+  untrusted remote text cannot forge a severity, a finding ID or a source
+  attribution in the UI's block parser. Tag-shaped text inside returned prose is
+  defused, and backticks are stripped because the report template forbids them.
+- Rust owns placement. The anchor is resolved against the report's quoted lines,
+  then against the diff, using the model's suggestion first and the remote
+  finding's own locations as a deterministic fallback. Placement degrades from
+  after the quoted hunk holding the anchored line, to after a freshly quoted copy
+  of that hunk, to the end of the report.
+- Rust owns the display finding ID, derived from the remote finding's content
+  hash. The full hash stays the join and idempotency key in the database; the
+  report and the stored `finding_ids` array both carry the shortened form, so the
+  UI join cannot break and the same finding cannot be spliced twice.
+- A report that previously said there were no issues stops saying so.
+
+Within a location, the code snippet is load bearing and the line number is not.
+Remote line numbers are routinely a few lines off; the case that motivated this
+work pointed at a blank context line three lines above the code it described. A
+line number that resolves to a line too short to be distinctive is discarded
+rather than trusted, which is also what keeps a finding from anchoring on a bare
+brace. The comment is placed after the whole quoted hunk rather than beside the
+one anchored line, matching how the local report and LKML replies read; a report
+that quotes without snipping keeps the comment beside the anchor instead, so an
+untrimmed quote cannot separate a comment from its subject.
+
+Rendering is best effort. A model, budget or transport failure is logged and the
+finding is published with the remote's own problem and reasoning text, still
+anchored and still tagged. Publication of a verified remote finding never
+depends on a model being reachable.
+
+Email already sent by the initial review cannot be edited, so a spliced comment
+reaches the web and API surfaces only. A separate follow-up email policy may be
+added later.
+
+### If A Full Re-render Is Revisited
+
+Rendering one block was chosen over re-running the whole report because the
+existing local prose was written with tool access and a toolless re-render would
+rewrite it with less information than it was written with. Provisioning a
+worktree and the review tools for cross-review would remove that objection.
+Anyone attempting it should know:
+
+- Tool provisioning is a prerequisite, not an optimization. The vendored report
+  template requires the quoted diff to be obtained through git tools rather than
+  generated from context, and it requires supporting-code lookup that a context
+  window alone cannot serve.
+- The baseline commit a review was taken against may be garbage collected within
+  the three-day cross-review window, so the worktree may not be re-creatable and
+  the fallback path still has to exist.
+- Re-applying the patch introduces apply failures into a path that currently
+  cannot fail that way, and an apply failure must not fail the cross-review job
+  or the already published review.
+- The per-patch report header that the combined report is assembled from has to
+  be reconstructed, because a full re-render replaces the whole per-patch body.
+- The re-render must stay outside the fenced transaction, relying on the
+  per-generation job serialization that already guarantees a single in-flight
+  render per patchset generation.
+- A full re-render rewrites text that may already have been mailed. The mailed
+  and displayed versions would then diverge in wording, not just in content,
+  which is a larger change in behaviour than adding a block.
 
 ## Failure Isolation
 
@@ -335,6 +428,12 @@ patchset or review status from `Reviewed` to `Failed`.
 - Request timeouts prevent scheduler starvation.
 - Remote strings are treated as untrusted data and validated before storage or
   prompt construction.
+- Report rendering turns untrusted remote text into text that is displayed and,
+  on a later review, mailed. The render prompt forbids following instructions
+  found in finding or patch text, and the tag lines that drive severity, finding
+  identity and source attribution are emitted by Rust rather than by the model,
+  so a hostile remote cannot escalate its own severity or impersonate another
+  source. Returned prose has tag-shaped text defused and is length bounded.
 - The remote API has no peer authentication in origin/main, so embargoed
   results are polled until publicly available.
 

@@ -301,6 +301,8 @@ CREATE TABLE IF NOT EXISTS model_experiment_findings (
     finding_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
     severity TEXT,
+    confirmed_by TEXT,
+    preexisting INTEGER, -- 0 = false, 1 = true, NULL = unknown (see findings.preexisting)
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_model_experiment_findings_review ON model_experiment_findings(review_id);

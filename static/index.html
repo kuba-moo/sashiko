@@ -3893,9 +3893,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     html += '<h3>Changes requested — main model</h3><div class="chart-section">' +
                         '<div id="chart-pw-changes-main" style="width:100%; height:300px;"></div></div>';
                     html += '<p style="opacity:0.8; font-size:0.9em;">The next two pool every additional experiment' +
-                        ' model that ran alongside the main review, over the patches where one actually ran. Their' +
-                        ' findings carry no pre-existing flag, so unlike the main-model charts above they cannot' +
-                        ' exclude pre-existing findings.</p>';
+                        ' model that ran alongside the main review, over the patches where one actually ran.' +
+                        ' Pre-existing findings are excluded on both sides.</p>';
                     html += '<h3>Accepted — other models</h3><div class="chart-section">' +
                         '<div id="chart-pw-accepted-other" style="width:100%; height:300px;"></div></div>';
                     html += '<h3>Changes requested — other models</h3><div class="chart-section">' +
@@ -3907,6 +3906,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const experimentPairs = (modelExperiments && modelExperiments.paired_cost) || [];
                 if (experimentPairs.length) {
                     html += '<h2>Live Model Comparisons</h2>';
+                    html += '<p style="opacity:0.8; font-size:0.9em;">Finding counts below exclude pre-existing' +
+                        ' findings, matching the main-model counts elsewhere. Comparison rows recorded before that' +
+                        ' flag was tracked, and rows for findings confirmation rejected, are counted.</p>';
                     experimentPairs.forEach((pair, index) => {
                         const mainCost = estimateCost(pair.main.model, pair.main.tokens_in || 0, pair.main.tokens_out || 0, pair.main.tokens_cached || 0);
                         const additionalCost = estimateCost(pair.additional.model, pair.additional.tokens_in || 0, pair.additional.tokens_out || 0, pair.additional.tokens_cached || 0);

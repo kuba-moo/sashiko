@@ -2353,6 +2353,7 @@ Example:
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
+            let preexisting = concern["preexisting"].as_bool();
             let source_stages: Vec<u64> = concern["source_stages"]
                 .as_array()
                 .into_iter()
@@ -2384,6 +2385,7 @@ Example:
                             "additional_provider_id": provider_ids.get(model).copied().unwrap_or("unknown"),
                             "outcome": if models.contains(model) { "both" } else { "main_only" },
                             "severity": severity,
+                            "preexisting": preexisting,
                         }));
                     }
                 } else {
@@ -2397,6 +2399,7 @@ Example:
                             "additional_provider_id": provider_ids.get(model).copied().unwrap_or("unknown"),
                             "outcome": "additional_only",
                             "severity": severity,
+                            "preexisting": preexisting,
                         }));
                     }
                 }
@@ -2515,6 +2518,7 @@ Example:
                                 "outcome": outcome,
                                 "confirmed_by": confirmer,
                                 "severity": items[target.index]["severity"].as_str().unwrap_or("unknown"),
+                                "preexisting": items[target.index]["preexisting"].as_bool(),
                             }));
                         }
                     }
@@ -2554,6 +2558,7 @@ Example:
                         "outcome": outcome,
                         "confirmed_by": confirmer,
                         "severity": items[target.index]["severity"].as_str().unwrap_or("unknown"),
+                        "preexisting": items[target.index]["preexisting"].as_bool(),
                     }));
                 }
             }
@@ -5023,7 +5028,8 @@ mod tests {
             "finding_ids": ["main-3-0", "variant-3-0"],
             "source_models": ["main", "variant"],
             "source_stages": [3],
-            "severity": "High"
+            "severity": "High",
+            "preexisting": false
         }]);
         let runs = json!([
             {"model": "main", "stage": 3, "status": "completed"},
@@ -5040,6 +5046,7 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.as_array().unwrap().len(), 1);
         assert_eq!(comparisons[0]["outcome"], "both");
+        assert_eq!(comparisons[0]["preexisting"], false);
         assert!(confirmation_runs.is_empty());
         assert_eq!(main.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(variant.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -5087,7 +5094,8 @@ mod tests {
             "finding_ids": ["main-3-0"],
             "source_models": ["main"],
             "source_stages": [3],
-            "severity": "High"
+            "severity": "High",
+            "preexisting": true
         }]);
         let runs = json!([
             {"model": "main", "stage": 3, "status": "completed"},
@@ -5110,6 +5118,77 @@ mod tests {
         assert_eq!(comparisons[0]["finding_id"], "main-3-0");
         assert_eq!(comparisons[0]["additional_model"], "variant");
         assert_eq!(comparisons[0]["severity"], "High");
+        assert_eq!(comparisons[0]["preexisting"], true);
+    }
+
+    /// The stats queries exclude pre-existing findings on both sides of a
+    /// comparison, which only works if the flag survives confirmation.
+    #[tokio::test]
+    async fn confirmed_comparisons_carry_the_preexisting_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let variant = Arc::new(ConfirmationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let worker = Worker::new(
+            Arc::new(FailingConfirmationProvider),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            PromptRegistry::new(temp.path().to_path_buf()),
+            WorkerConfig {
+                main_model: "model-a".to_string(),
+                max_input_tokens: 1000,
+                max_interactions: 2,
+                analysis_stage_parallelism: 1,
+                temperature: 0.0,
+                custom_prompt: None,
+                series_range: None,
+                baseline_sha: None,
+                stages: None,
+                dump_conversation: None,
+                budget: None,
+                merge_budget: None,
+                retry_provider: None,
+                additional_models: vec![AdditionalModelRunner {
+                    name: "variant".to_string(),
+                    provider: variant.clone(),
+                    temperature: 0.0,
+                    max_interactions: 2,
+                    model_id: "model-b".to_string(),
+                    provider_id: "test".to_string(),
+                    budget: None,
+                    alternative_prompts: false,
+                }],
+                cohort: test_variant_cohort(),
+                validation_budget: None,
+            },
+        );
+        // Discovered by main alone, so the variant confirms it and the mock says
+        // yes to the id 'a'.
+        let findings = json!([{
+            "finding_ids": ["a"],
+            "source_models": ["main"],
+            "source_stages": [3],
+            "severity": "High",
+            "preexisting": true
+        }]);
+        let runs = json!([
+            {"model": "main", "stage": 3, "status": "completed"},
+            {"model": "variant", "stage": 3, "status": "completed"}
+        ]);
+
+        let (accepted, comparisons, _) = worker
+            .confirm_unique_findings(
+                "context",
+                &findings,
+                runs.as_array().unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(accepted.as_array().unwrap().len(), 1);
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0]["outcome"], "main_only");
+        assert_eq!(comparisons[0]["preexisting"], true);
     }
 
     #[tokio::test]
@@ -5152,7 +5231,8 @@ mod tests {
             "finding_ids": ["variant-3-0"],
             "source_models": ["variant"],
             "source_stages": [3],
-            "severity": "Medium"
+            "severity": "Medium",
+            "preexisting": false
         }]);
         let runs = json!([
             {"model": "main", "stage": 3, "status": "completed"},
@@ -5175,6 +5255,7 @@ mod tests {
         assert_eq!(comparisons[0]["outcome"], "additional_unconfirmed");
         assert_eq!(comparisons[0]["additional_model"], "variant");
         assert_eq!(comparisons[0]["severity"], "Medium");
+        assert_eq!(comparisons[0]["preexisting"], false);
     }
 
     #[test]

@@ -581,7 +581,7 @@ impl Database {
         for sql in [
             "CREATE TABLE IF NOT EXISTS model_experiment_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', stage INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE TABLE IF NOT EXISTS model_experiment_sources (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, experiment_name TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', model_id TEXT NOT NULL DEFAULT '', selected INTEGER NOT NULL, status TEXT NOT NULL, error TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id), UNIQUE(review_id, experiment_name))",
-            "CREATE TABLE IF NOT EXISTS model_experiment_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, additional_model TEXT NOT NULL, main_model_id TEXT NOT NULL DEFAULT '', additional_model_id TEXT NOT NULL DEFAULT '', main_provider_id TEXT NOT NULL DEFAULT '', additional_provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, outcome TEXT NOT NULL, severity TEXT, confirmed_by TEXT, FOREIGN KEY(review_id) REFERENCES reviews(id))",
+            "CREATE TABLE IF NOT EXISTS model_experiment_findings (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, additional_model TEXT NOT NULL, main_model_id TEXT NOT NULL DEFAULT '', additional_model_id TEXT NOT NULL DEFAULT '', main_provider_id TEXT NOT NULL DEFAULT '', additional_provider_id TEXT NOT NULL DEFAULT '', finding_id TEXT NOT NULL, outcome TEXT NOT NULL, severity TEXT, confirmed_by TEXT, preexisting INTEGER, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE TABLE IF NOT EXISTS model_confirmation_runs (id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL, model TEXT NOT NULL, model_id TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'completed', error TEXT, tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT 0, tokens_cached INTEGER NOT NULL DEFAULT 0, budget_input INTEGER NOT NULL DEFAULT 0, budget_output INTEGER NOT NULL DEFAULT 0, budget_flags INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, FOREIGN KEY(review_id) REFERENCES reviews(id))",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_runs_review ON model_experiment_runs(review_id)",
             "CREATE INDEX IF NOT EXISTS idx_model_experiment_sources_review ON model_experiment_sources(review_id)",
@@ -704,6 +704,36 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("model_experiment_findings", "confirmed_by", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("model_experiment_findings", "preexisting", "INTEGER")
+            .await;
+        // Comparison rows written before the preexisting column existed can be
+        // resolved from the review's stored output JSON, which still carries both
+        // finding_ids and the flag.  Findings the confirmer rejected are absent
+        // from that array by construction, so those rows stay NULL and are
+        // treated as "not pre-existing" by the stats queries.
+        let _ = self
+            .conn
+            .execute(
+                "UPDATE model_experiment_findings
+                 SET preexisting = (
+                         SELECT json_extract(f.value, '$.preexisting')
+                         FROM reviews r
+                         JOIN ai_interactions ai ON ai.id = r.interaction_id,
+                              json_each(json_extract(ai.output_raw, '$.findings')) f,
+                              json_each(json_extract(f.value, '$.finding_ids')) fid
+                         WHERE r.id = model_experiment_findings.review_id
+                           AND ai.output_raw IS NOT NULL
+                           AND json_valid(ai.output_raw)
+                           AND json_type(ai.output_raw, '$.findings') = 'array'
+                           AND json_type(f.value, '$.finding_ids') = 'array'
+                           AND fid.value = model_experiment_findings.finding_id
+                         LIMIT 1
+                     )
+                 WHERE preexisting IS NULL",
+                (),
+            )
             .await;
         let _ = self
             .conn
@@ -2447,20 +2477,27 @@ impl Database {
                 .await?;
         }
 
-        let mut severities = HashMap::new();
+        // Fallback for comparisons that arrive without the fields, keyed by the
+        // synthetic ids of the findings that survived confirmation.
+        let mut published: HashMap<&str, (&str, Option<bool>)> = HashMap::new();
         for finding in findings.as_array().into_iter().flatten() {
             let severity = finding["severity"].as_str().unwrap_or("unknown");
+            let preexisting = finding["preexisting"].as_bool();
             for id in finding["finding_ids"].as_array().into_iter().flatten() {
                 if let Some(id) = id.as_str() {
-                    severities.insert(id, severity);
+                    published.insert(id, (severity, preexisting));
                 }
             }
         }
         for comparison in experiment["comparisons"].as_array().into_iter().flatten() {
             let finding_id = comparison["finding_id"].as_str().unwrap_or("unknown");
+            let preexisting = comparison["preexisting"]
+                .as_bool()
+                .or_else(|| published.get(finding_id).and_then(|entry| entry.1))
+                .map(i64::from);
             connection
                 .execute(
-                    "INSERT INTO model_experiment_findings (review_id, additional_model, main_model_id, additional_model_id, main_provider_id, additional_provider_id, finding_id, outcome, severity, confirmed_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO model_experiment_findings (review_id, additional_model, main_model_id, additional_model_id, main_provider_id, additional_provider_id, finding_id, outcome, severity, confirmed_by, preexisting) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     libsql::params![
                         review_id,
                         comparison["additional_model"].as_str().unwrap_or("unknown"),
@@ -2472,8 +2509,9 @@ impl Database {
                         comparison["outcome"].as_str().unwrap_or("unknown"),
                         comparison["severity"]
                             .as_str()
-                            .or_else(|| severities.get(finding_id).copied()),
+                            .or_else(|| published.get(finding_id).map(|entry| entry.0)),
                         comparison["confirmed_by"].as_str(),
+                        preexisting,
                     ],
                 )
                 .await?;
@@ -2510,6 +2548,12 @@ impl Database {
         Ok(())
     }
 
+    /// Aggregates for the model-experiment dashboard.
+    ///
+    /// The finding-level breakdowns (`confirmation_outcomes`, `outcomes`) exclude
+    /// pre-existing findings, matching what the main-model charts count.  Rows
+    /// written before `preexisting` was carried out of confirmation, and rows for
+    /// findings the confirmer rejected, have no value and are counted.
     pub async fn get_model_experiment_stats(&self) -> Result<serde_json::Value> {
         let mut run_status = Vec::new();
         let mut rows = self
@@ -2540,6 +2584,7 @@ impl Database {
                         lower(COALESCE(severity, 'unknown')) AS severity
                  FROM model_experiment_findings
                  WHERE confirmed_by IS NOT NULL
+                   AND COALESCE(preexisting, 0) = 0
              )
              GROUP BY confirmed_by, outcome, severity
              ORDER BY confirmed_by, outcome, severity",
@@ -2578,7 +2623,7 @@ impl Database {
 
         let mut outcomes = Vec::new();
         let mut rows = self.conn.query(
-            "SELECT additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')), count(*) FROM model_experiment_findings GROUP BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')) ORDER BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome",
+            "SELECT additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')), count(*) FROM model_experiment_findings WHERE COALESCE(preexisting, 0) = 0 GROUP BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome, lower(COALESCE(severity, 'unknown')) ORDER BY additional_model, main_provider_id, main_model_id, additional_provider_id, additional_model_id, outcome",
             (),
         ).await?;
         while let Ok(Some(row)) = rows.next().await {
@@ -6934,9 +6979,10 @@ impl Database {
     /// restricted to patches where an additional model actually ran — otherwise
     /// "ran and found nothing" would be conflated with "never ran".  A source
     /// row alone does not mean it ran: every candidate model gets one, most of
-    /// them 'not_selected', and a selected one can still fail.
-    /// model_experiment_findings has no preexisting flag, so that filter cannot
-    /// be applied on the 'other' side; the asymmetry is deliberate.
+    /// them 'not_selected', and a selected one can still fail.  Pre-existing
+    /// findings are excluded on that side too; comparison rows for findings the
+    /// confirmer rejected, written before the flag was carried through, have no
+    /// value and are counted.
     pub async fn get_patchwork_stats(&self, window_days: i64) -> Result<serde_json::Value> {
         let cutoff = chrono::Utc::now().timestamp() - window_days * 86400;
 
@@ -6976,6 +7022,7 @@ impl Database {
                 JOIN reviews r ON r.id = mf.review_id
                 WHERE r.patch_id IS NOT NULL
                   AND mf.outcome IN ('both', 'additional_only', 'additional_hallucination')
+                  AND COALESCE(mf.preexisting, 0) = 0
                 GROUP BY r.patch_id
             )
             SELECT pat.day, 'main' AS scope, st.outcome,
@@ -10191,10 +10238,23 @@ mod tests {
                 {"model": "variant", "provider_id": "claude", "model_id": "model-b", "status": "failed", "error": "unparseable reply", "tokens_in": 30, "tokens_out": 3, "tokens_cached": 0, "budget_input": 30, "budget_output": 3, "budget_flags": 0}
             ]
         });
-        let findings = json!([{"finding_ids": ["f1"], "severity": "High"}]);
+        let findings = json!([{"finding_ids": ["f1"], "severity": "High", "preexisting": false}]);
         db.save_model_experiment(99, &experiment, &findings)
             .await
             .unwrap();
+        // The comparisons above carry neither severity nor preexisting, so both
+        // come from the published finding they point at.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT DISTINCT preexisting FROM model_experiment_findings WHERE review_id = 99",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), Some(0));
+        drop(rows);
         let stats = db.get_model_experiment_stats().await.unwrap();
         assert_eq!(stats["outcomes"][0]["severity"], "high");
         assert_eq!(stats["paired_cost"][0]["main"]["model"], "model-a");
@@ -10283,6 +10343,56 @@ mod tests {
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             5
         );
+    }
+
+    #[tokio::test]
+    async fn model_experiment_stats_exclude_preexisting_findings() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO reviews (id, patchset_id, status, created_at) VALUES (99, 1, 'Reviewed', 1000)",
+            )
+            .await
+            .unwrap();
+        let comparison = |finding_id: &str, preexisting: bool| {
+            json!({
+                "additional_model": "variant",
+                "main_provider_id": "openai",
+                "main_model_id": "model-a",
+                "additional_provider_id": "claude",
+                "additional_model_id": "model-b",
+                "finding_id": finding_id,
+                "outcome": "both",
+                "severity": "High",
+                "confirmed_by": "variant",
+                "preexisting": preexisting,
+            })
+        };
+        let experiment = json!({
+            "cohort": {
+                "main": {"name": "main", "provider": "openai", "model": "model-a"},
+                "variants": [{
+                    "source": {"name": "variant", "provider": "claude", "model": "model-b"},
+                    "selected": true
+                }]
+            },
+            "runs": [],
+            "comparisons": [comparison("f-new", false), comparison("f-old", true)],
+            "confirmation_runs": []
+        });
+        db.save_model_experiment(99, &experiment, &json!([]))
+            .await
+            .unwrap();
+
+        let stats = db.get_model_experiment_stats().await.unwrap();
+        let outcomes = stats["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["count"], 1);
+        let confirmation = stats["confirmation_outcomes"].as_array().unwrap();
+        assert_eq!(confirmation.len(), 1);
+        assert_eq!(confirmation[0]["count"], 1);
     }
 
     #[tokio::test]
@@ -10884,17 +10994,99 @@ mod tests {
             columns.insert(row.get::<String>(1).unwrap());
         }
         assert!(columns.contains("confirmed_by"));
+        assert!(columns.contains("preexisting"));
 
         let mut rows = db
             .conn
             .query(
-                "SELECT confirmed_by FROM model_experiment_findings WHERE id = 1",
+                "SELECT confirmed_by, preexisting FROM model_experiment_findings WHERE id = 1",
                 (),
             )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         assert!(row.get::<Option<String>>(0).unwrap().is_none());
+        // No stored review output to resolve the finding id against.
+        assert!(row.get::<Option<i64>>(1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn model_experiment_migration_backfills_preexisting_from_stored_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = DatabaseSettings {
+            url: temp
+                .path()
+                .join("backfill-experiment.db")
+                .display()
+                .to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db.conn
+            .execute_batch(
+                r#"DROP TABLE model_experiment_findings;
+                 CREATE TABLE model_experiment_findings (
+                    id INTEGER PRIMARY KEY,
+                    review_id INTEGER NOT NULL,
+                    additional_model TEXT NOT NULL,
+                    main_model_id TEXT NOT NULL DEFAULT '',
+                    additional_model_id TEXT NOT NULL DEFAULT '',
+                    main_provider_id TEXT NOT NULL DEFAULT '',
+                    additional_provider_id TEXT NOT NULL DEFAULT '',
+                    finding_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    severity TEXT
+                 );
+                 INSERT INTO ai_interactions (id, output_raw) VALUES
+                    ('int-1', '{"findings": [
+                         {"finding_ids": ["f-pre"], "preexisting": true},
+                         {"finding_ids": ["f-new", "f-alias"], "preexisting": false}
+                     ]}'),
+                    ('int-2', 'not json at all');
+                 INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO reviews (id, patchset_id, interaction_id) VALUES
+                    (1, 1, 'int-1'), (2, 1, 'int-2');
+                 INSERT INTO model_experiment_findings
+                    (id, review_id, additional_model, finding_id, outcome) VALUES
+                    (1, 1, 'variant', 'f-pre', 'both'),
+                    (2, 1, 'variant', 'f-alias', 'both'),
+                    (3, 1, 'variant', 'f-dropped', 'main_hallucination'),
+                    (4, 2, 'variant', 'f-pre', 'both');"#,
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT id, preexisting FROM model_experiment_findings ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut resolved = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            resolved.push((
+                row.get::<i64>(0).unwrap(),
+                row.get::<Option<i64>>(1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            resolved,
+            vec![
+                (1, Some(1)),
+                // Resolves through a secondary id in the same finding.
+                (2, Some(0)),
+                // Rejected by confirmation, so absent from the published findings.
+                (3, None),
+                // Unparseable output must not abort the statement for the rest.
+                (4, None),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -11654,10 +11846,14 @@ mod tests {
                      (2, 2, 'sonnet-5', 1, 'completed'),
                      (3, 4, 'sonnet-5', 0, 'not_selected'),
                      (4, 4, 'fable-5', 1, 'failed');
-                 INSERT INTO model_experiment_findings (id, review_id, additional_model, finding_id, outcome, severity) VALUES
-                     (1, 1, 'sonnet-5', 'f1', 'additional_only', 'Medium'),
+                 -- Rows 1 and 2 predate the preexisting column, so their NULL
+                 -- must read as 'not pre-existing' and keep counting.
+                 INSERT INTO model_experiment_findings (id, review_id, additional_model, finding_id, outcome, severity, preexisting) VALUES
+                     (1, 1, 'sonnet-5', 'f1', 'additional_only', 'Medium', NULL),
                      -- main_only is the main model's finding, not the peer's.
-                     (2, 2, 'sonnet-5', 'f2', 'main_only', 'Critical');",
+                     (2, 2, 'sonnet-5', 'f2', 'main_only', 'Critical', NULL),
+                     -- Pre-existing, so patch 2 stays in the 'none' group.
+                     (3, 2, 'sonnet-5', 'f3', 'additional_only', 'Critical', 1);",
             )
             .await
             .unwrap();
@@ -11699,7 +11895,10 @@ mod tests {
         // neither may be counted as "ran and found nothing".
         assert_eq!(other["medium"], 1);
         assert_eq!(other["none"], 1);
-        assert_eq!(other["critical"], 0, "main_only is not the peer's finding");
+        assert_eq!(
+            other["critical"], 0,
+            "main_only is not the peer's finding, and pre-existing must not count"
+        );
         let other_total: i64 = ["none", "low", "medium", "high", "critical"]
             .iter()
             .map(|k| other[*k].as_i64().unwrap())

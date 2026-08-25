@@ -3860,16 +3860,20 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 // Patchwork outcomes — what the maintainers did with the patches we
                 // reviewed, cross-tabbed against the severity we assigned.
                 const pwDaily = (patchwork && patchwork.daily) || [];
-                // The disjoint buckets the endpoint returns: a patch is counted
+                // The disjoint buckets the endpoint returns: a unit is counted
                 // once, under the highest severity we flagged on it.
                 const pwSeverityKeys = ['none', 'low', 'medium', 'high', 'critical'];
                 const pwRowTotal = (row) => pwSeverityKeys.reduce((total, key) => total + (row[key] || 0), 0);
+                // The endpoint counts accepted per patch and changes-requested per
+                // series, and says which on every row, so read the unit off the data
+                // rather than restating the rule here.
+                const pwUnitLabel = (unit) => unit === 'series' ? 'series' : 'patches';
                 // Two views of those buckets.  Solid lines are cumulative: "max
-                // Medium" is every patch where we flagged nothing worse than
-                // Medium, patches with no findings included, which is the shape
+                // Medium" is every unit where we flagged nothing worse than
+                // Medium, units with no findings included, which is the shape
                 // you want when picking a severity threshold.  Dashed lines are
                 // the buckets themselves.  "Max Critical" is left out because it
-                // is every patch, i.e. a flat 100%, and "No findings" needs no
+                // is every unit, i.e. a flat 100%, and "No findings" needs no
                 // dashed twin because the bucket and the cumulative line are the
                 // same number.
                 const pwLines = [
@@ -3894,28 +3898,36 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         ' reviewed. <em>Accepted</em> means the patch was merged as posted, so anything we flagged was' +
                         ' ignored or was a false positive; <em>changes requested</em> (also rejected and superseded)' +
                         ' means it was sent back, so the review was probably right. Each chart shows the severity' +
-                        ' composition of one outcome over a 7-day trailing window; a patch counts once, under the' +
-                        ' highest severity we flagged on it. Solid lines are cumulative — <em>max Medium</em> is every' +
-                        ' patch we flagged no higher than Medium, including the ones we flagged not at all — so read' +
-                        ' them as "where would a threshold land". Dashed lines are the individual severities those' +
-                        ' are built from, and sum to 100%. Buckets are anchored on the patch\'s own date and recent' +
-                        ' patches are still in flight, so the newest days are computed from fewer settled patches.</p>';
+                        ' composition of one outcome over a 7-day trailing window, counting each unit once under the' +
+                        ' highest severity we flagged on it. The two outcomes count different units because they ask' +
+                        ' different questions. Accepted counts <em>patches</em>: a patch merged as posted judges the' +
+                        ' findings on that patch alone, so it reads as a per-patch false-positive rate. Changes' +
+                        ' requested counts <em>series</em>, taking the worst severity we flagged anywhere in the' +
+                        ' sent-back patches — patchwork records that a series went back, not which patch was at' +
+                        ' fault, so scoring a clean patch beside a flagged sibling as a miss would penalise us more' +
+                        ' the longer the series. Read it as an upper bound on what we caught: what we flagged need' +
+                        ' not be why the series was sent back. Solid lines are cumulative — <em>max Medium</em> is' +
+                        ' every unit we flagged no higher than Medium, including the ones we flagged not at all — so' +
+                        ' read them as "where would a threshold land". Dashed lines are the individual severities' +
+                        ' those are built from, and sum to 100%. Buckets are anchored on the series\' posting date' +
+                        ' rather than when the outcome landed, and recent patches are still in flight, so the newest' +
+                        ' days are computed from fewer settled units.</p>';
                     html += '<div class="stat-card-grid">';
                     html += renderStatCard('Still active (7 days)', pwOutcomeTotal('active', 7));
                     html += renderStatCard('Still active (30 days)', pwOutcomeTotal('active', 30));
                     html += renderStatCard('Not ours (7 days)', pwOutcomeTotal('not_applicable', 7));
                     html += renderStatCard('Not ours (30 days)', pwOutcomeTotal('not_applicable', 30));
                     html += '</div>';
-                    html += '<h3>Accepted — main model</h3><div class="chart-section">' +
+                    html += '<h3>Accepted — main model (per patch)</h3><div class="chart-section">' +
                         '<div id="chart-pw-accepted-main" style="width:100%; height:300px;"></div></div>';
-                    html += '<h3>Changes requested — main model</h3><div class="chart-section">' +
+                    html += '<h3>Changes requested — main model (per series)</h3><div class="chart-section">' +
                         '<div id="chart-pw-changes-main" style="width:100%; height:300px;"></div></div>';
                     html += '<p style="opacity:0.8; font-size:0.9em;">The next two pool every additional experiment' +
                         ' model that ran alongside the main review, over the patches where one actually ran.' +
                         ' Pre-existing findings are excluded on both sides.</p>';
-                    html += '<h3>Accepted — other models</h3><div class="chart-section">' +
+                    html += '<h3>Accepted — other models (per patch)</h3><div class="chart-section">' +
                         '<div id="chart-pw-accepted-other" style="width:100%; height:300px;"></div></div>';
-                    html += '<h3>Changes requested — other models</h3><div class="chart-section">' +
+                    html += '<h3>Changes requested — other models (per series)</h3><div class="chart-section">' +
                         '<div id="chart-pw-changes-other" style="width:100%; height:300px;"></div></div>';
                 } else {
                     html += '<p class="loading">No patchwork state recorded yet.</p>';
@@ -4695,9 +4707,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         const target = document.getElementById(spec.id);
                         if (!target) return;
                         const byDay = new Map();
+                        let unit = 'patch';
                         pwDaily
                             .filter(row => row.scope === spec.scope && row.outcome === spec.outcome)
                             .forEach(row => {
+                                if (row.unit) unit = row.unit;
                                 const entry = byDay.get(row.day) ||
                                     Object.fromEntries(pwSeverityKeys.map(key => [key, 0]));
                                 pwSeverityKeys.forEach(key => { entry[key] += row[key] || 0; });
@@ -4723,7 +4737,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     if (!params.length) return '';
                                     const i = params[0].dataIndex;
                                     let out = escapeHtml(params[0].axisValue) +
-                                        ' — 7 days to here, ' + windowTotals[i] + ' patches';
+                                        ' — 7 days to here, ' + windowTotals[i] + ' ' + pwUnitLabel(unit);
                                     params.forEach(p => {
                                         const count = pwLineCount(windows[i], pwLines[p.seriesIndex]);
                                         out += '<br/>' + p.marker + escapeHtml(p.seriesName) + ': ' +

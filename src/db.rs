@@ -6970,8 +6970,26 @@ impl Database {
     /// (day, scope, outcome); `day` is the series date so every patch in a
     /// series lands on the same day.
     ///
-    /// A patch's severity group is the *maximum* severity of its findings, so
+    /// A unit's severity group is the *maximum* severity of its findings, so
     /// the groups are disjoint and composition percentages sum to 100%.
+    ///
+    /// The counting unit differs by outcome, and `unit` on every row says
+    /// which it is, so the UI never has to re-derive the rule:
+    ///
+    /// - `unit = 'patch'` for every outcome but `changes_requested`.  A patch
+    ///   merged as posted judges the findings on *that* patch, so the patch is
+    ///   the thing being scored.
+    /// - `unit = 'series'` for `changes_requested`, taking the maximum
+    ///   severity over the series' sent-back patches.  Patchwork records that
+    ///   a series went back, not which patch was at fault, so counting each
+    ///   patch separately would score a clean patch sitting beside a flagged
+    ///   sibling as a miss — an error that grows with series length.  The
+    ///   aggregate masks out patches in any other state rather than special
+    ///   casing the few partly-applied series, so a series that was split
+    ///   contributes its applied patches to `accepted` and only the rest
+    ///   here.  Note this is an upper bound on what we caught: a finding
+    ///   anywhere in the series counts, and it need not be the reason the
+    ///   series was sent back.
     ///
     /// `scope = 'main'` uses the stored review's findings, excluding
     /// pre-existing ones to match the per-patch aggregation the UI already does.
@@ -6982,13 +7000,16 @@ impl Database {
     /// them 'not_selected', and a selected one can still fail.  Pre-existing
     /// findings are excluded on that side too; comparison rows for findings the
     /// confirmer rejected, written before the flag was carried through, have no
-    /// value and are counted.
+    /// value and are counted.  That restriction stays per patch, so a series
+    /// where an additional model ran on only some of the sent-back patches is
+    /// aggregated from the ones it did run on.
     pub async fn get_patchwork_stats(&self, window_days: i64) -> Result<serde_json::Value> {
         let cutoff = chrono::Utc::now().timestamp() - window_days * 86400;
 
         let sql = "
             WITH pat AS (
                 SELECT p.id AS patch_id,
+                       p.patchset_id AS patchset_id,
                        strftime('%Y-%m-%d', s.date, 'unixepoch') AS day
                 FROM patches p
                 JOIN patchsets s ON s.id = p.patchset_id
@@ -7024,29 +7045,60 @@ impl Database {
                   AND mf.outcome IN ('both', 'additional_only', 'additional_hallucination')
                   AND COALESCE(mf.preexisting, 0) = 0
                 GROUP BY r.patch_id
+            ),
+            -- One row per counted unit, so the severity bucketing below is the
+            -- same arithmetic whether the unit is a patch or a whole series.
+            main_unit AS (
+                SELECT pat.day AS day, st.outcome AS outcome, 'patch' AS unit,
+                       COALESCE(main_sev.sev, 0) AS sev
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
+                WHERE st.outcome <> 'changes_requested'
+                UNION ALL
+                SELECT pat.day, 'changes_requested', 'series',
+                       MAX(COALESCE(main_sev.sev, 0))
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
+                WHERE st.outcome = 'changes_requested'
+                GROUP BY pat.patchset_id, pat.day
+            ),
+            other_unit AS (
+                SELECT pat.day AS day, st.outcome AS outcome, 'patch' AS unit,
+                       COALESCE(other_sev.sev, 0) AS sev
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                JOIN other_ran ON other_ran.patch_id = pat.patch_id
+                LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
+                WHERE st.outcome <> 'changes_requested'
+                UNION ALL
+                SELECT pat.day, 'changes_requested', 'series',
+                       MAX(COALESCE(other_sev.sev, 0))
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                JOIN other_ran ON other_ran.patch_id = pat.patch_id
+                LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
+                WHERE st.outcome = 'changes_requested'
+                GROUP BY pat.patchset_id, pat.day
             )
-            SELECT pat.day, 'main' AS scope, st.outcome,
-                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) <= 0 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 1 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 2 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) = 3 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(main_sev.sev, 0) >= 4 THEN 1 ELSE 0 END)
-            FROM pat
-            JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-            LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
-            GROUP BY pat.day, st.outcome
+            SELECT day, 'main' AS scope, outcome, unit,
+                   SUM(CASE WHEN sev <= 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 2 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 3 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev >= 4 THEN 1 ELSE 0 END)
+            FROM main_unit
+            GROUP BY day, outcome, unit
             UNION ALL
-            SELECT pat.day, 'other' AS scope, st.outcome,
-                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) <= 0 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 1 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 2 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) = 3 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN COALESCE(other_sev.sev, 0) >= 4 THEN 1 ELSE 0 END)
-            FROM pat
-            JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-            JOIN other_ran ON other_ran.patch_id = pat.patch_id
-            LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
-            GROUP BY pat.day, st.outcome
+            SELECT day, 'other' AS scope, outcome, unit,
+                   SUM(CASE WHEN sev <= 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 2 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev = 3 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN sev >= 4 THEN 1 ELSE 0 END)
+            FROM other_unit
+            GROUP BY day, outcome, unit
             ORDER BY 1, 2, 3";
 
         let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
@@ -7056,11 +7108,12 @@ impl Database {
                 "day": row.get::<String>(0)?,
                 "scope": row.get::<String>(1)?,
                 "outcome": row.get::<String>(2)?,
-                "none": row.get::<i64>(3)?,
-                "low": row.get::<i64>(4)?,
-                "medium": row.get::<i64>(5)?,
-                "high": row.get::<i64>(6)?,
-                "critical": row.get::<i64>(7)?,
+                "unit": row.get::<String>(3)?,
+                "none": row.get::<i64>(4)?,
+                "low": row.get::<i64>(5)?,
+                "medium": row.get::<i64>(6)?,
+                "high": row.get::<i64>(7)?,
+                "critical": row.get::<i64>(8)?,
             }));
         }
 
@@ -11904,5 +11957,101 @@ mod tests {
             .map(|k| other[*k].as_i64().unwrap())
             .sum();
         assert_eq!(other_total, 2);
+        assert_eq!(main["unit"], "patch", "accepted is scored per patch");
+        assert_eq!(other["unit"], "patch");
+    }
+
+    /// Changes-requested collapses to one unit per series, because patchwork
+    /// says the series went back without saying which patch was at fault.  The
+    /// aggregate covers only the sent-back patches, so a partly-applied series
+    /// cannot borrow a finding from the patches that were merged as posted.
+    #[tokio::test]
+    async fn patchwork_stats_aggregate_changes_requested_per_series() {
+        let db = setup_patchwork_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO messages (id, message_id, thread_id) VALUES
+                     (5, 'patch-five@example.com', 1),
+                     (6, 'patch-six@example.com', 1);
+                 INSERT INTO patchsets (id, thread_id, status, date)
+                     VALUES (2, 1, 'Reviewed', unixepoch('now', '-3 days'));
+                 -- Series 1 keeps patches 1 and 2 from the fixture and adds 3.
+                 INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES
+                     (3, 1, 'patch-three@example.com', 3),
+                     (4, 2, 'patch-four@example.com', 1),
+                     (5, 2, 'patch-five@example.com', 2),
+                     (6, 2, 'patch-six@example.com', 3);
+                 INSERT INTO reviews (id, patchset_id, patch_id, status, created_at) VALUES
+                     (1, 1, 1, 'Reviewed', unixepoch('now')),
+                     (2, 1, 2, 'Reviewed', unixepoch('now')),
+                     (3, 1, 3, 'Reviewed', unixepoch('now')),
+                     (4, 2, 4, 'Reviewed', unixepoch('now')),
+                     (5, 2, 5, 'Reviewed', unixepoch('now')),
+                     (6, 2, 6, 'Reviewed', unixepoch('now'));
+                 -- Series 1: one High on patch 2, nothing on 1 and 3.
+                 -- Series 2: a Low on patch 4, which is the one that got applied.
+                 INSERT INTO findings (id, review_id, severity, problem, preexisting) VALUES
+                     (1, 2, 3, 'high', 0),
+                     (2, 4, 1, 'low', 0);",
+            )
+            .await
+            .unwrap();
+        db.record_patchwork_states(
+            &[
+                // Series 1 went back whole.
+                pw_event("patch-one@example.com", "changes-requested", 1),
+                pw_event("patch-two@example.com", "superseded", 2),
+                pw_event("patch-three@example.com", "changes-requested", 3),
+                // Series 2 was applied in part: patch 4 landed, 5 and 6 did not.
+                pw_event("patch-four@example.com", "accepted", 4),
+                pw_event("patch-five@example.com", "changes-requested", 5),
+                pw_event("patch-six@example.com", "changes-requested", 6),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_patchwork_stats(90).await.unwrap();
+        let daily = stats["daily"].as_array().unwrap();
+        let row = |outcome: &str| {
+            daily
+                .iter()
+                .find(|row| row["scope"] == "main" && row["outcome"] == outcome)
+                .cloned()
+                .unwrap_or_else(|| panic!("no main row for {}", outcome))
+        };
+        let total = |row: &serde_json::Value| -> i64 {
+            ["none", "low", "medium", "high", "critical"]
+                .iter()
+                .map(|k| row[*k].as_i64().unwrap())
+                .sum()
+        };
+
+        let changes = row("changes_requested");
+        assert_eq!(changes["unit"], "series");
+        assert_eq!(
+            total(&changes),
+            2,
+            "five sent-back patches, but only two series"
+        );
+        assert_eq!(
+            changes["high"], 1,
+            "series 1 takes the worst severity in the series"
+        );
+        assert_eq!(
+            changes["none"], 1,
+            "series 2's only finding is on the patch that was applied"
+        );
+        assert_eq!(changes["low"], 0);
+
+        let accepted = row("accepted");
+        assert_eq!(accepted["unit"], "patch");
+        assert_eq!(total(&accepted), 1);
+        assert_eq!(
+            accepted["low"], 1,
+            "the applied patch is still scored on its own finding"
+        );
     }
 }

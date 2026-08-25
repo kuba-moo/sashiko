@@ -123,12 +123,29 @@ pub struct ReleaseReview {
     pub findings: Vec<serde_json::Value>,
 }
 
+/// An embargoed patchset whose release time can still be revised, as needed by
+/// the dynamic embargo schedule.
+#[derive(Debug, Clone)]
+pub struct DynamicEmbargoCandidate {
+    pub id: i64,
+    /// Cover-letter message-ID, which is the schedule's lookup key. For a
+    /// single-patch series this is that patch's message-ID.
+    pub message_id: String,
+    /// Date header of the series, used as the base for the maximum-hold cap.
+    pub date: i64,
+    pub embargo_until: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchsetReviewOutcome {
     Clean,
     HasFindings,
     Incomplete,
 }
+
+/// How long an embargo release claim (`embargo_release_started_at`) is honoured
+/// before it is treated as abandoned and the patchset becomes eligible again.
+const EMBARGO_RELEASE_CLAIM_STALE_SECS: i64 = 600;
 
 const CLEAN_PATCHSET_PREDICATE: &str = "
     EXISTS (
@@ -5777,7 +5794,15 @@ impl Database {
         );
         let mut rows = self
             .conn
-            .query(&sql, libsql::params![now - 600, now, now, limit as i64])
+            .query(
+                &sql,
+                libsql::params![
+                    now - EMBARGO_RELEASE_CLAIM_STALE_SECS,
+                    now,
+                    now,
+                    limit as i64
+                ],
+            )
             .await?;
 
         let mut patchsets = Vec::new();
@@ -5927,7 +5952,10 @@ impl Database {
         );
         let updated = self
             .conn
-            .execute(&sql, libsql::params![now, id, now - 600, now])
+            .execute(
+                &sql,
+                libsql::params![now, id, now - EMBARGO_RELEASE_CLAIM_STALE_SECS, now],
+            )
             .await?;
         Ok(updated == 1)
     }
@@ -5940,6 +5968,84 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    /// Embargoed patchsets whose release time the dynamic schedule may still
+    /// revise.
+    ///
+    /// Rows whose `embargo_until` already passed are included on purpose: the
+    /// static policy window routinely expires while a review is still running,
+    /// and extending exactly those rows is the point of dynamic scheduling.
+    /// Rows with a live release claim are excluded so we never move a target
+    /// out from under a release in flight, but a claim older than
+    /// `EMBARGO_RELEASE_CLAIM_STALE_SECS` is abandoned and eligible again,
+    /// matching `get_releasable_embargoed_patchsets`.
+    ///
+    /// `since` bounds the scan by series date; rows that never release
+    /// (Failed, Cancelled) keep `embargo_until` set forever, and the schedule
+    /// only ever covers recent series anyway.
+    pub async fn get_dynamic_embargo_candidates(
+        &self,
+        now: i64,
+        since: i64,
+    ) -> Result<Vec<DynamicEmbargoCandidate>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, cover_letter_message_id, date, embargo_until
+                 FROM patchsets
+                 WHERE embargo_until IS NOT NULL
+                   AND cover_letter_message_id IS NOT NULL
+                   AND date >= ?
+                   AND (embargo_release_started_at IS NULL OR embargo_release_started_at <= ?)
+                 ORDER BY date ASC, id ASC",
+                libsql::params![since, now - EMBARGO_RELEASE_CLAIM_STALE_SECS],
+            )
+            .await?;
+
+        let mut candidates = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let Ok(message_id) = row.get::<String>(1) else {
+                continue;
+            };
+            candidates.push(DynamicEmbargoCandidate {
+                id: row.get(0).unwrap_or_default(),
+                message_id,
+                date: row.get(2).unwrap_or_default(),
+                embargo_until: row.get(3).unwrap_or_default(),
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Move an embargo's release time, unless it is already gone or being acted
+    /// on. Returns whether the row was updated.
+    ///
+    /// Two invariants the `WHERE` clause enforces, both of which would leak or
+    /// re-hide published findings if dropped:
+    ///   - `embargo_until IS NOT NULL` — a released embargo is cleared, and
+    ///     re-arming one would re-hide findings that already went out.
+    ///   - the claim check — a release in flight has already begun queueing
+    ///     notifications, so its window must not be pushed back.
+    ///
+    /// Prefer this over [`Self::set_patchset_embargo_until`], which is the
+    /// unguarded ingestion-time setter.
+    pub async fn set_patchset_embargo_until_if_unclaimed(
+        &self,
+        id: i64,
+        embargo_until: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE patchsets SET embargo_until = ?
+                 WHERE id = ? AND embargo_until IS NOT NULL
+                   AND (embargo_release_started_at IS NULL OR embargo_release_started_at <= ?)",
+                libsql::params![embargo_until, id, now - EMBARGO_RELEASE_CLAIM_STALE_SECS],
+            )
+            .await?;
+        Ok(updated == 1)
     }
 
     pub async fn get_completed_reviews_for_release(
@@ -7955,6 +8061,134 @@ mod tests {
             .await
             .unwrap();
         assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    /// Seeds patchsets directly: the dynamic embargo path only reads the
+    /// embargo columns, so the full ingestion flow would add noise.
+    async fn setup_dynamic_embargo_db(now: i64) -> Arc<Database> {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root_dyn');
+                 INSERT INTO messages (message_id, thread_id, date) VALUES
+                    ('future@example.com', 1, {now}),
+                    ('expired@example.com', 1, {now}),
+                    ('released@example.com', 1, {now}),
+                    ('claimed@example.com', 1, {now}),
+                    ('stale@example.com', 1, {now}),
+                    ('ancient@example.com', 1, {ancient});
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, date, status,
+                     embargo_until, embargo_release_started_at)
+                 VALUES
+                    (1, 1, 'future@example.com',  {now}, 'Reviewed',  {future},  NULL),
+                    (2, 1, 'expired@example.com', {now}, 'In Review', {past},    NULL),
+                    (3, 1, 'released@example.com',{now}, 'Reviewed',  NULL,      NULL),
+                    (4, 1, 'claimed@example.com', {now}, 'Reviewed',  {future},  {now}),
+                    (5, 1, 'stale@example.com',   {now}, 'Reviewed',  {future},  {stale}),
+                    (6, 1, 'ancient@example.com', {ancient}, 'Reviewed', {future}, NULL),
+                    (7, 1, NULL,                  {now}, 'Reviewed',  {future},  NULL);",
+                now = now,
+                future = now + 3600,
+                past = now - 3600,
+                stale = now - EMBARGO_RELEASE_CLAIM_STALE_SECS - 60,
+                ancient = now - 60 * 86400,
+            ))
+            .await
+            .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn dynamic_embargo_candidates_skip_released_and_in_flight_rows() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        let ids: Vec<i64> = db
+            .get_dynamic_embargo_candidates(now, now - 30 * 86400)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.id)
+            .collect();
+
+        // 1: embargoed and untouched. 2: embargo already expired but never
+        // released -- the case dynamic extension exists for. 5: claim old
+        // enough to be abandoned.
+        assert_eq!(ids, vec![1, 2, 5]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_embargo_candidate_carries_lookup_and_cap_inputs() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        let candidates = db
+            .get_dynamic_embargo_candidates(now, now - 30 * 86400)
+            .await
+            .unwrap();
+        let first = candidates.first().unwrap();
+        assert_eq!(first.message_id, "future@example.com");
+        assert_eq!(first.date, now);
+        assert_eq!(first.embargo_until, now + 3600);
+    }
+
+    #[tokio::test]
+    async fn guarded_embargo_update_refuses_released_and_claimed_rows() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+        let target = now + 5 * 86400;
+
+        let embargo_until = |id: i64| {
+            let db = db.clone();
+            async move {
+                let mut rows = db
+                    .conn
+                    .query(
+                        "SELECT embargo_until FROM patchsets WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await
+                    .unwrap();
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<Option<i64>>(0)
+                    .unwrap()
+            }
+        };
+
+        assert!(
+            db.set_patchset_embargo_until_if_unclaimed(1, target, now)
+                .await
+                .unwrap()
+        );
+        assert_eq!(embargo_until(1).await, Some(target));
+
+        // Already released: re-arming would re-hide published findings.
+        assert!(
+            !db.set_patchset_embargo_until_if_unclaimed(3, target, now)
+                .await
+                .unwrap()
+        );
+        assert_eq!(embargo_until(3).await, None);
+
+        // Release in flight: notifications are already being queued.
+        assert!(
+            !db.set_patchset_embargo_until_if_unclaimed(4, target, now)
+                .await
+                .unwrap()
+        );
+        assert_eq!(embargo_until(4).await, Some(now + 3600));
+
+        // Abandoned claim: eligible again, like the release path treats it.
+        assert!(
+            db.set_patchset_embargo_until_if_unclaimed(5, target, now)
+                .await
+                .unwrap()
+        );
+        assert_eq!(embargo_until(5).await, Some(target));
     }
 
     #[tokio::test]

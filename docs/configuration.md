@@ -278,6 +278,47 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+### `[embargo]`
+
+Optional. Ties the embargo to an external schedule instead of a fixed offset
+from receipt. Disabled unless `schedule_url` is set, in which case
+`embargo_hours` (see [email_policy.toml](#email_policytoml)) only decides
+*whether* a patchset is embargoed and the schedule decides *until when*.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `schedule_url` | string | -- | URL of a JSON map from series message-ID to target release time. Must be HTTP(S); an invalid URL fails at startup. |
+| `release_lead_hours` | integer | `24` | How far ahead of a series' target release time to lift its embargo. |
+| `refresh_minutes` | integer | `15` | How often to re-read the schedule. Targets move as the file is regenerated, so this is a poll rather than a one-shot load. |
+| `max_hold_hours` | integer | `168` | Upper bound on the hold, measured from the series' `Date` header, so a stale or bogus far-future target cannot withhold findings indefinitely. |
+| `dry_run` | bool | `false` | Log the changes each cycle would make without writing them. |
+
+```toml
+[embargo]
+schedule_url = "https://netdev-ctrl.bots.linux.dev/suie-scores.json"
+release_lead_hours = 24
+max_hold_hours = 168
+```
+
+The schedule file is expected to look like this; only `by_message_id` is read,
+keyed by the message-ID of the series' cover letter (or of the sole patch, for a
+single-patch series):
+
+```json
+{ "generated_at": "2026-08-24T22:44:13Z",
+  "by_message_id": { "20260824175938.11143-1-dev@example.com": "2026-08-26T17:27:19Z" } }
+```
+
+**Precedence.** For every series the file lists, `embargo_until` becomes
+`target - release_lead_hours` (capped by `max_hold_hours`), whether that is
+earlier or later than the static policy value — a target already in the past
+releases as soon as the review completes. A series the file does *not* list keeps
+the static value, so entries ageing out of the file never move an existing hold.
+A failed fetch changes nothing at all.
+
+As today, a review that finds nothing is published as soon as it completes; the
+target only gates reviews that have findings.
+
 ### `[subsystems]`
 
 Controls how patches and emails are categorized into subsystems for targeted reviews and specific email policies. By default, this section is empty, meaning the system relies on fallback heuristics (like identifying `@vger.kernel.org` addresses) to determine subsystems.

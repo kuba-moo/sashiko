@@ -792,6 +792,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Start Embargo Schedule Worker (no-op unless embargo.schedule_url is set)
+    if let Some(embargo_worker) =
+        sashiko::worker::embargo::EmbargoScheduleWorker::new(db.clone(), settings.embargo.clone())
+    {
+        tokio::spawn(async move {
+            embargo_worker.run().await;
+        });
+    }
+
     // Initialize custom remotes
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
 

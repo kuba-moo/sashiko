@@ -21,6 +21,7 @@ pub mod cross_review;
 pub mod db;
 pub mod email_policy;
 pub mod email_router;
+pub mod embargo_schedule;
 pub mod events;
 pub mod fetcher;
 pub mod forge;

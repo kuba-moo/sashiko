@@ -752,6 +752,81 @@ pub struct SemcodeSettings {
     pub enabled: bool,
 }
 
+/// Dynamic embargo scheduling from an external master file.
+///
+/// Off unless `schedule_url` is set, in which case the static
+/// `embargo_hours` from `email_policy.toml` only decides *whether* a patchset
+/// is embargoed; for every series the file lists, the target release time
+/// decides *until when*. See `crate::embargo_schedule`.
+#[derive(Debug, Deserialize, Clone)]
+#[allow(unused)]
+pub struct EmbargoSettings {
+    /// URL of the series-to-target-release-time JSON map. Unset disables
+    /// dynamic scheduling and leaves the static policy embargo in place.
+    #[serde(default, deserialize_with = "deserialize_optional_http_url")]
+    pub schedule_url: Option<String>,
+    /// How far ahead of a series' target release time to lift the embargo.
+    #[serde(default = "default_release_lead_hours")]
+    pub release_lead_hours: u32,
+    /// How often to re-read the schedule. Targets move as the file is
+    /// regenerated, so this is a poll, not a one-shot load.
+    #[serde(default = "default_embargo_refresh_minutes")]
+    pub refresh_minutes: u64,
+    /// Upper bound on the hold, measured from the series date, so a stale or
+    /// bogus far-future target cannot withhold findings indefinitely.
+    #[serde(default = "default_max_hold_hours")]
+    pub max_hold_hours: u32,
+    /// Log the embargo changes each cycle would make without writing them.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for EmbargoSettings {
+    fn default() -> Self {
+        Self {
+            schedule_url: None,
+            release_lead_hours: default_release_lead_hours(),
+            refresh_minutes: default_embargo_refresh_minutes(),
+            max_hold_hours: default_max_hold_hours(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_release_lead_hours() -> u32 {
+    24
+}
+
+fn default_embargo_refresh_minutes() -> u64 {
+    15
+}
+
+fn default_max_hold_hours() -> u32 {
+    168
+}
+
+/// Validate an optional HTTP(S) URL at config-load time, so a typo fails
+/// loudly at startup rather than as a fetch error every refresh cycle.
+fn deserialize_optional_http_url<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.filter(|url| !url.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let parsed = reqwest::Url::parse(raw.trim())
+        .map_err(|_| serde::de::Error::custom(format!("invalid URL: {}", raw)))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(serde::de::Error::custom(format!(
+            "URL must use HTTP or HTTPS and name a host: {}",
+            raw
+        )));
+    }
+    Ok(Some(raw.trim().to_string()))
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 #[allow(unused)]
 pub struct CrossReviewSettings {
@@ -822,6 +897,8 @@ pub struct Settings {
     pub semcode: Option<SemcodeSettings>,
     #[serde(default)]
     pub cross_review: CrossReviewSettings,
+    #[serde(default)]
+    pub embargo: EmbargoSettings,
 }
 
 fn default_subsystems() -> SubsystemsSettings {

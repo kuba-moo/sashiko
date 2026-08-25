@@ -3860,14 +3860,29 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 // Patchwork outcomes — what the maintainers did with the patches we
                 // reviewed, cross-tabbed against the severity we assigned.
                 const pwDaily = (patchwork && patchwork.daily) || [];
-                const pwSeverities = [
-                    { key: 'none', label: 'No findings', color: '#91cc75' },
-                    { key: 'low', label: 'Low', color: '#2e7d32' },
-                    { key: 'medium', label: 'Medium', color: '#f9a825' },
-                    { key: 'high', label: 'High', color: '#e64a19' },
-                    { key: 'critical', label: 'Critical', color: '#b71c1c' }
+                // The disjoint buckets the endpoint returns: a patch is counted
+                // once, under the highest severity we flagged on it.
+                const pwSeverityKeys = ['none', 'low', 'medium', 'high', 'critical'];
+                const pwRowTotal = (row) => pwSeverityKeys.reduce((total, key) => total + (row[key] || 0), 0);
+                // Two views of those buckets.  Solid lines are cumulative: "max
+                // Medium" is every patch where we flagged nothing worse than
+                // Medium, patches with no findings included, which is the shape
+                // you want when picking a severity threshold.  Dashed lines are
+                // the buckets themselves.  "Max Critical" is left out because it
+                // is every patch, i.e. a flat 100%, and "No findings" needs no
+                // dashed twin because the bucket and the cumulative line are the
+                // same number.
+                const pwLines = [
+                    { label: 'No findings', color: '#91cc75', keys: ['none'] },
+                    { label: 'Max Low', color: '#2e7d32', keys: ['none', 'low'] },
+                    { label: 'Max Medium', color: '#f9a825', keys: ['none', 'low', 'medium'] },
+                    { label: 'Max High', color: '#e64a19', keys: ['none', 'low', 'medium', 'high'] },
+                    { label: 'Exactly Low', color: '#2e7d32', keys: ['low'], dashed: true },
+                    { label: 'Exactly Medium', color: '#f9a825', keys: ['medium'], dashed: true },
+                    { label: 'Exactly High', color: '#e64a19', keys: ['high'], dashed: true },
+                    { label: 'Exactly Critical', color: '#b71c1c', keys: ['critical'], dashed: true }
                 ];
-                const pwRowTotal = (row) => pwSeverities.reduce((total, s) => total + (row[s.key] || 0), 0);
+                const pwLineCount = (row, line) => line.keys.reduce((total, key) => total + (row[key] || 0), 0);
                 // 'main' scope only: 'other' covers the same patches, so summing both would double count.
                 const pwOutcomeTotal = (outcome, days) => pwDaily
                     .filter(row => row.scope === 'main' && row.outcome === outcome && daysAgo(row.day) < days)
@@ -3878,10 +3893,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     html += '<p style="opacity:0.8; font-size:0.9em;">What netdev maintainers did with the patches we' +
                         ' reviewed. <em>Accepted</em> means the patch was merged as posted, so anything we flagged was' +
                         ' ignored or was a false positive; <em>changes requested</em> (also rejected and superseded)' +
-                        ' means it was sent back, so the review was probably right. Each chart shows the composition of' +
-                        ' one outcome over a 7-day trailing window, so its lines sum to 100%. Buckets are anchored on' +
-                        ' the patch\'s own date and recent patches are still in flight, so the newest days are computed' +
-                        ' from fewer settled patches.</p>';
+                        ' means it was sent back, so the review was probably right. Each chart shows the severity' +
+                        ' composition of one outcome over a 7-day trailing window; a patch counts once, under the' +
+                        ' highest severity we flagged on it. Solid lines are cumulative — <em>max Medium</em> is every' +
+                        ' patch we flagged no higher than Medium, including the ones we flagged not at all — so read' +
+                        ' them as "where would a threshold land". Dashed lines are the individual severities those' +
+                        ' are built from, and sum to 100%. Buckets are anchored on the patch\'s own date and recent' +
+                        ' patches are still in flight, so the newest days are computed from fewer settled patches.</p>';
                     html += '<div class="stat-card-grid">';
                     html += renderStatCard('Still active (7 days)', pwOutcomeTotal('active', 7));
                     html += renderStatCard('Still active (30 days)', pwOutcomeTotal('active', 30));
@@ -4681,17 +4699,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             .filter(row => row.scope === spec.scope && row.outcome === spec.outcome)
                             .forEach(row => {
                                 const entry = byDay.get(row.day) ||
-                                    Object.fromEntries(pwSeverities.map(s => [s.key, 0]));
-                                pwSeverities.forEach(s => { entry[s.key] += row[s.key] || 0; });
+                                    Object.fromEntries(pwSeverityKeys.map(key => [key, 0]));
+                                pwSeverityKeys.forEach(key => { entry[key] += row[key] || 0; });
                                 byDay.set(row.day, entry);
                             });
                         // Sum the window's raw counts first, then take the composition:
                         // a day with two Critical patches must not read as 100% Critical.
                         const windows = pwAxis.map((_, i) => {
-                            const acc = Object.fromEntries(pwSeverities.map(s => [s.key, 0]));
+                            const acc = Object.fromEntries(pwSeverityKeys.map(key => [key, 0]));
                             for (let j = Math.max(0, i - 6); j <= i; j++) {
                                 const entry = byDay.get(pwAxis[j]);
-                                if (entry) pwSeverities.forEach(s => { acc[s.key] += entry[s.key]; });
+                                if (entry) pwSeverityKeys.forEach(key => { acc[key] += entry[key]; });
                             }
                             return acc;
                         });
@@ -4707,32 +4725,33 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     let out = escapeHtml(params[0].axisValue) +
                                         ' — 7 days to here, ' + windowTotals[i] + ' patches';
                                     params.forEach(p => {
-                                        const key = pwSeverities[p.seriesIndex].key;
+                                        const count = pwLineCount(windows[i], pwLines[p.seriesIndex]);
                                         out += '<br/>' + p.marker + escapeHtml(p.seriesName) + ': ' +
                                             (p.value === null || p.value === undefined
                                                 ? '-' : Number(p.value).toFixed(1) + '%') +
-                                            ' (' + windows[i][key] + ')';
+                                            ' (' + count + ')';
                                     });
                                     return out;
                                 }
                             },
-                            legend: { data: pwSeverities.map(s => s.label), bottom: 0 },
-                            grid: { left: '3%', right: '4%', bottom: '15%', top: '10%', containLabel: true },
+                            legend: { data: pwLines.map(l => l.label), bottom: 0 },
+                            grid: { left: '3%', right: '4%', bottom: '20%', top: '10%', containLabel: true },
                             xAxis: { type: 'category', data: pwAxis, axisLine: { lineStyle: { color: themeAxis } } },
                             yAxis: {
                                 type: 'value', min: 0, max: 100,
                                 axisLabel: { formatter: '{value}%' },
                                 splitLine: { lineStyle: { type: 'dashed' } }
                             },
-                            series: pwSeverities.map(s => ({
-                                name: s.label,
+                            series: pwLines.map(l => ({
+                                name: l.label,
                                 type: 'line',
                                 smooth: true,
                                 showSymbol: false,
                                 connectNulls: false,
-                                itemStyle: { color: s.color },
+                                itemStyle: { color: l.color },
+                                lineStyle: l.dashed ? { type: 'dashed', width: 1 } : { width: 2 },
                                 data: windows.map((w, i) => windowTotals[i]
-                                    ? Number((w[s.key] / windowTotals[i] * 100).toFixed(1)) : null)
+                                    ? Number((pwLineCount(w, l) / windowTotals[i] * 100).toFixed(1)) : null)
                             }))
                         });
                         state.activeCharts.push(chart);

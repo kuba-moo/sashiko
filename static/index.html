@@ -2130,6 +2130,102 @@
             `;
         }
 
+        // Per-model attribution for the patchwork outcomes.  Two column groups
+        // (accepted counts patches, changes-requested counts series) and two row
+        // groups: did this model find the worst thing on the unit, and was it
+        // alone in finding it.  Rows have different denominators because each
+        // model ran on a different set of units, so `n` is always on screen.
+        function renderPatchworkModelTable(rows) {
+            if (!rows.length) return '';
+            const outcomes = [
+                { key: 'accepted', label: 'Accepted (patches)' },
+                { key: 'changes_requested', label: 'Changes requested (series)' }
+            ];
+            // The severity buckets, ordered worst first.  'missed' closes the
+            // row: with it the five add up to n, without it the shortfall is
+            // invisible.
+            const columns = [
+                { key: 'high_plus', label: 'High+' },
+                { key: 'medium', label: 'Medium' },
+                { key: 'low', label: 'Low' },
+                { key: 'none', label: 'None' },
+                { key: 'missed', label: 'Missed' }
+            ];
+            const byModel = new Map();
+            rows.forEach(row => {
+                const entry = byModel.get(row.experiment) ||
+                    { modelId: row.model_id || '', outcomes: {} };
+                entry.outcomes[row.outcome] = row;
+                if (!entry.modelId && row.model_id) entry.modelId = row.model_id;
+                byModel.set(row.experiment, entry);
+            });
+            // Main first, then the peers alphabetically: main is the row every
+            // other row is implicitly compared against.
+            const names = [...byModel.keys()].sort((a, b) =>
+                a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b));
+
+            const cell = (count, total) => {
+                if (count === null) return '<td style="opacity:0.4;">—</td>';
+                if (!total) return '<td style="opacity:0.4;">-</td>';
+                return '<td title="' + count + ' of ' + total + '">' +
+                    (count / total * 100).toFixed(1) + '%</td>';
+            };
+            const modelRows = (unique) => names.map(name => {
+                const entry = byModel.get(name);
+                let out = '<tr><td>' + escapeHtml(name) +
+                    (entry.modelId
+                        ? ' <span style="opacity:0.5;" title="' + escapeHtml(entry.modelId) + '">ⓘ</span>'
+                        : '') + '</td>';
+                outcomes.forEach(outcome => {
+                    const row = entry.outcomes[outcome.key];
+                    // The unique block only counts units where a second model
+                    // ran, so it carries its own denominator.
+                    const total = row ? (unique ? row.multi_units : row.units) : 0;
+                    out += '<td style="opacity:0.7;">' + (total || 0) + '</td>';
+                    columns.forEach(column => {
+                        if (!row) { out += cell(0, 0); return; }
+                        if (unique && column.key === 'missed') { out += cell(null, 0); return; }
+                        const count = unique
+                            ? (column.key === 'none' ? 0 : row['unique_' + column.key] || 0)
+                            : row[column.key] || 0;
+                        out += cell(count, total);
+                    });
+                });
+                return out + '</tr>';
+            }).join('');
+
+            const span = 1 + outcomes.length * (columns.length + 1);
+            let html = '<h3>Which model found it</h3>';
+            html += '<p style="opacity:0.8; font-size:0.9em;">Each unit\'s top severity is the worst thing any' +
+                ' model that ran on it found. A model lands in the column for that severity when it reported a' +
+                ' finding at exactly that level, in <em>Missed</em> when something was found but not by it, and in' +
+                ' <em>None</em> when nobody found anything — so the five columns sum to <em>n</em>. <em>High+</em>' +
+                ' merges High and Critical but still wants an exact match, so reporting High where the top was' +
+                ' Critical counts as missed. <em>n</em> is the model\'s own denominator, the units it actually ran' +
+                ' on, so rows cover different populations and only compare fairly within their overlap. The lower' +
+                ' block additionally requires the model to have been the only one to reach the top severity, and is' +
+                ' counted against the units where a second model ran — on a single-model unit "the only one who' +
+                ' found it" cannot be falsified. Findings are post-confirmation on every side: what the confirmer' +
+                ' dropped was never shown to anyone. Main is attributed from the comparison rows rather than the' +
+                ' published findings, which are the union across models and would credit it with its peers\'' +
+                ' discoveries.</p>';
+            html += '<table style="font-size:0.9em;"><thead><tr><th rowspan="2">Model</th>';
+            outcomes.forEach(outcome => {
+                html += '<th colspan="' + (columns.length + 1) + '">' + escapeHtml(outcome.label) + '</th>';
+            });
+            html += '</tr><tr>';
+            outcomes.forEach(() => {
+                html += '<th>n</th>' + columns.map(column => '<th>' + column.label + '</th>').join('');
+            });
+            html += '</tr></thead><tbody>';
+            html += '<tr><td colspan="' + span + '" style="font-weight:bold;">Found the top severity</td></tr>';
+            html += modelRows(false);
+            html += '<tr><td colspan="' + span + '" style="font-weight:bold;">…and was the only one to find it</td></tr>';
+            html += modelRows(true);
+            html += '</tbody></table>';
+            return html;
+        }
+
         function formatSize(bytes) {
             if (bytes === 0) return '0 B';
             const k = 1024;
@@ -3887,9 +3983,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     { label: 'Exactly Critical', color: '#b71c1c', keys: ['critical'], dashed: true }
                 ];
                 const pwLineCount = (row, line) => line.keys.reduce((total, key) => total + (row[key] || 0), 0);
-                // 'main' scope only: 'other' covers the same patches, so summing both would double count.
                 const pwOutcomeTotal = (outcome, days) => pwDaily
-                    .filter(row => row.scope === 'main' && row.outcome === outcome && daysAgo(row.day) < days)
+                    .filter(row => row.outcome === outcome && daysAgo(row.day) < days)
                     .reduce((total, row) => total + pwRowTotal(row), 0);
 
                 html += '<h2>Patchwork Outcomes</h2>';
@@ -3911,24 +4006,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         ' read them as "where would a threshold land". Dashed lines are the individual severities' +
                         ' those are built from, and sum to 100%. Buckets are anchored on the series\' posting date' +
                         ' rather than when the outcome landed, and recent patches are still in flight, so the newest' +
-                        ' days are computed from fewer settled units.</p>';
+                        ' days are computed from fewer settled units. Severity here is what the review published,' +
+                        ' which is the union across every model that ran — an additional model\'s discovery is' +
+                        ' published once confirmation accepts it. Per-model attribution is in the table below;' +
+                        ' models were never distinguishable on these lines.</p>';
                     html += '<div class="stat-card-grid">';
                     html += renderStatCard('Still active (7 days)', pwOutcomeTotal('active', 7));
                     html += renderStatCard('Still active (30 days)', pwOutcomeTotal('active', 30));
                     html += renderStatCard('Not ours (7 days)', pwOutcomeTotal('not_applicable', 7));
                     html += renderStatCard('Not ours (30 days)', pwOutcomeTotal('not_applicable', 30));
                     html += '</div>';
-                    html += '<h3>Accepted — main model (per patch)</h3><div class="chart-section">' +
-                        '<div id="chart-pw-accepted-main" style="width:100%; height:300px;"></div></div>';
-                    html += '<h3>Changes requested — main model (per series)</h3><div class="chart-section">' +
-                        '<div id="chart-pw-changes-main" style="width:100%; height:300px;"></div></div>';
-                    html += '<p style="opacity:0.8; font-size:0.9em;">The next two pool every additional experiment' +
-                        ' model that ran alongside the main review, over the patches where one actually ran.' +
-                        ' Pre-existing findings are excluded on both sides.</p>';
-                    html += '<h3>Accepted — other models (per patch)</h3><div class="chart-section">' +
-                        '<div id="chart-pw-accepted-other" style="width:100%; height:300px;"></div></div>';
-                    html += '<h3>Changes requested — other models (per series)</h3><div class="chart-section">' +
-                        '<div id="chart-pw-changes-other" style="width:100%; height:300px;"></div></div>';
+                    html += '<h3>Accepted (per patch)</h3><div class="chart-section">' +
+                        '<div id="chart-pw-accepted" style="width:100%; height:300px;"></div></div>';
+                    html += '<h3>Changes requested (per series)</h3><div class="chart-section">' +
+                        '<div id="chart-pw-changes" style="width:100%; height:300px;"></div></div>';
+                    html += renderPatchworkModelTable((patchwork && patchwork.models) || []);
                 } else {
                     html += '<p class="loading">No patchwork state recorded yet.</p>';
                 }
@@ -4699,17 +4791,15 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     }
 
                     [
-                        { id: 'chart-pw-accepted-main', scope: 'main', outcome: 'accepted' },
-                        { id: 'chart-pw-changes-main', scope: 'main', outcome: 'changes_requested' },
-                        { id: 'chart-pw-accepted-other', scope: 'other', outcome: 'accepted' },
-                        { id: 'chart-pw-changes-other', scope: 'other', outcome: 'changes_requested' }
+                        { id: 'chart-pw-accepted', outcome: 'accepted' },
+                        { id: 'chart-pw-changes', outcome: 'changes_requested' }
                     ].forEach(spec => {
                         const target = document.getElementById(spec.id);
                         if (!target) return;
                         const byDay = new Map();
                         let unit = 'patch';
                         pwDaily
-                            .filter(row => row.scope === spec.scope && row.outcome === spec.outcome)
+                            .filter(row => row.outcome === spec.outcome)
                             .forEach(row => {
                                 if (row.unit) unit = row.unit;
                                 const entry = byDay.get(row.day) ||

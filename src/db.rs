@@ -6963,12 +6963,13 @@ impl Database {
         Ok(summary)
     }
 
-    /// Daily patchwork outcome counts, split by severity group.
+    /// Daily patchwork outcome counts, split by severity group, plus the
+    /// per-model attribution table under `models`.
     ///
     /// Returns raw counts and lets the UI derive percentages, the same way the
-    /// cost dashboard works off raw token counts.  One row per
-    /// (day, scope, outcome); `day` is the series date so every patch in a
-    /// series lands on the same day.
+    /// cost dashboard works off raw token counts.  One `daily` row per
+    /// (day, outcome); `day` is the series date so every patch in a series
+    /// lands on the same day.
     ///
     /// A unit's severity group is the *maximum* severity of its findings, so
     /// the groups are disjoint and composition percentages sum to 100%.
@@ -6991,18 +6992,13 @@ impl Database {
     ///   anywhere in the series counts, and it need not be the reason the
     ///   series was sent back.
     ///
-    /// `scope = 'main'` uses the stored review's findings, excluding
-    /// pre-existing ones to match the per-patch aggregation the UI already does.
-    /// `scope = 'other'` pools the additional experiment models and is
-    /// restricted to patches where an additional model actually ran — otherwise
-    /// "ran and found nothing" would be conflated with "never ran".  A source
-    /// row alone does not mean it ran: every candidate model gets one, most of
-    /// them 'not_selected', and a selected one can still fail.  Pre-existing
-    /// findings are excluded on that side too; comparison rows for findings the
-    /// confirmer rejected, written before the flag was carried through, have no
-    /// value and are counted.  That restriction stays per patch, so a series
-    /// where an additional model ran on only some of the sent-back patches is
-    /// aggregated from the ones it did run on.
+    /// Severity comes from the stored `findings`, excluding pre-existing ones.
+    /// That is the *published* review, which is the union across every model
+    /// that ran: a finding only an additional model discovered is published
+    /// once it survives confirmation (`additional_only`), so these counts say
+    /// what the system as a whole flagged, not what one model did.  Splitting
+    /// them per model is what `models` is for — reading a model's contribution
+    /// off a line chart never worked.
     pub async fn get_patchwork_stats(&self, window_days: i64) -> Result<serde_json::Value> {
         let cutoff = chrono::Utc::now().timestamp() - window_days * 86400;
 
@@ -7015,7 +7011,7 @@ impl Database {
                 JOIN patchsets s ON s.id = p.patchset_id
                 WHERE s.status = 'Reviewed' AND s.date >= ?
             ),
-            main_sev AS (
+            published_sev AS (
                 SELECT r.patch_id AS patch_id, MAX(f.severity) AS sev
                 FROM reviews r
                 JOIN findings f ON f.review_id = r.id
@@ -7024,103 +7020,261 @@ impl Database {
                   AND COALESCE(f.preexisting, 0) = 0
                 GROUP BY r.patch_id
             ),
-            other_ran AS (
-                SELECT DISTINCT r.patch_id AS patch_id
-                FROM model_experiment_sources ms
-                JOIN reviews r ON r.id = ms.review_id
-                WHERE r.patch_id IS NOT NULL
-                  AND ms.selected = 1
-                  AND ms.status = 'completed'
-            ),
-            other_sev AS (
-                SELECT r.patch_id AS patch_id, MAX(CASE lower(COALESCE(mf.severity, ''))
-                           WHEN 'critical' THEN 4
-                           WHEN 'high' THEN 3
-                           WHEN 'medium' THEN 2
-                           WHEN 'low' THEN 1
-                           ELSE 0 END) AS sev
-                FROM model_experiment_findings mf
-                JOIN reviews r ON r.id = mf.review_id
-                WHERE r.patch_id IS NOT NULL
-                  AND mf.outcome IN ('both', 'additional_only', 'additional_hallucination')
-                  AND COALESCE(mf.preexisting, 0) = 0
-                GROUP BY r.patch_id
-            ),
             -- One row per counted unit, so the severity bucketing below is the
             -- same arithmetic whether the unit is a patch or a whole series.
-            main_unit AS (
+            unit AS (
                 SELECT pat.day AS day, st.outcome AS outcome, 'patch' AS unit,
-                       COALESCE(main_sev.sev, 0) AS sev
+                       COALESCE(published_sev.sev, 0) AS sev
                 FROM pat
                 JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-                LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
+                LEFT JOIN published_sev ON published_sev.patch_id = pat.patch_id
                 WHERE st.outcome <> 'changes_requested'
                 UNION ALL
                 SELECT pat.day, 'changes_requested', 'series',
-                       MAX(COALESCE(main_sev.sev, 0))
+                       MAX(COALESCE(published_sev.sev, 0))
                 FROM pat
                 JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-                LEFT JOIN main_sev ON main_sev.patch_id = pat.patch_id
-                WHERE st.outcome = 'changes_requested'
-                GROUP BY pat.patchset_id, pat.day
-            ),
-            other_unit AS (
-                SELECT pat.day AS day, st.outcome AS outcome, 'patch' AS unit,
-                       COALESCE(other_sev.sev, 0) AS sev
-                FROM pat
-                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-                JOIN other_ran ON other_ran.patch_id = pat.patch_id
-                LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
-                WHERE st.outcome <> 'changes_requested'
-                UNION ALL
-                SELECT pat.day, 'changes_requested', 'series',
-                       MAX(COALESCE(other_sev.sev, 0))
-                FROM pat
-                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
-                JOIN other_ran ON other_ran.patch_id = pat.patch_id
-                LEFT JOIN other_sev ON other_sev.patch_id = pat.patch_id
+                LEFT JOIN published_sev ON published_sev.patch_id = pat.patch_id
                 WHERE st.outcome = 'changes_requested'
                 GROUP BY pat.patchset_id, pat.day
             )
-            SELECT day, 'main' AS scope, outcome, unit,
+            SELECT day, outcome, unit,
                    SUM(CASE WHEN sev <= 0 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN sev = 1 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN sev = 2 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN sev = 3 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN sev >= 4 THEN 1 ELSE 0 END)
-            FROM main_unit
+            FROM unit
             GROUP BY day, outcome, unit
-            UNION ALL
-            SELECT day, 'other' AS scope, outcome, unit,
-                   SUM(CASE WHEN sev <= 0 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN sev = 1 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN sev = 2 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN sev = 3 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN sev >= 4 THEN 1 ELSE 0 END)
-            FROM other_unit
-            GROUP BY day, outcome, unit
-            ORDER BY 1, 2, 3";
+            ORDER BY 1, 2";
 
         let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
         let mut daily = Vec::new();
         while let Some(row) = rows.next().await? {
             daily.push(json!({
                 "day": row.get::<String>(0)?,
-                "scope": row.get::<String>(1)?,
-                "outcome": row.get::<String>(2)?,
-                "unit": row.get::<String>(3)?,
-                "none": row.get::<i64>(4)?,
-                "low": row.get::<i64>(5)?,
-                "medium": row.get::<i64>(6)?,
-                "high": row.get::<i64>(7)?,
-                "critical": row.get::<i64>(8)?,
+                "outcome": row.get::<String>(1)?,
+                "unit": row.get::<String>(2)?,
+                "none": row.get::<i64>(3)?,
+                "low": row.get::<i64>(4)?,
+                "medium": row.get::<i64>(5)?,
+                "high": row.get::<i64>(6)?,
+                "critical": row.get::<i64>(7)?,
             }));
         }
 
         Ok(json!({
             "window_days": window_days,
             "daily": daily,
+            "models": self.patchwork_model_rows(cutoff).await?,
         }))
+    }
+
+    /// Per-model attribution for the patchwork outcomes: how often each model
+    /// was the one that found the worst thing we flagged on a unit.
+    ///
+    /// One row per (experiment, outcome).  The unit is the same as `daily`
+    /// uses — a patch for `accepted`, a series for `changes_requested` — and
+    /// `units` is that model's own denominator: the units it actually ran on.
+    /// Rows therefore cover different populations and are only comparable
+    /// within their overlap, which is why `units` ships alongside the counts.
+    ///
+    /// A unit's top severity is the maximum any model that ran on it found.
+    /// Each model then lands in exactly one bucket per unit, so
+    /// none + low + medium + high_plus + missed = units:
+    ///
+    /// - `none`      — nobody found anything on the unit
+    /// - `low` / `medium` / `high_plus` — the top severity was that, and this
+    ///   model found a finding at it.  `high_plus` merges High and Critical
+    ///   but still demands an exact match, so a model that reported High where
+    ///   the top was Critical counts as missed, not as a contributor.
+    /// - `missed`    — something was found, but not by this model at that level
+    ///
+    /// `unique_*` additionally require this model to have been the *only* one
+    /// to reach the top severity, and are counted against `multi_units` rather
+    /// than `units`: on a unit where only one model ran, "the only one who
+    /// found it" cannot be falsified, so those units are excluded.
+    ///
+    /// Attribution rules, which are not interchangeable with the published
+    /// `findings` table:
+    ///
+    /// - `findings` is the *union* across models.  A finding only an additional
+    ///   model discovered is published once confirmation accepts it, so using
+    ///   it for the main model would credit main with its peers' discoveries.
+    ///   Main is therefore attributed from the comparison rows
+    ///   (`both` / `main_only`) whenever a comparison exists, falling back to
+    ///   `findings` only for reviews that had no peer to compare against.
+    /// - Everything is post-confirmation: `*_hallucination` outcomes were
+    ///   dropped and never shown to anyone, and counting them on the peer side
+    ///   while main's dropped findings are invisible would flatter the peers.
+    /// - A source row does not mean a model ran: every candidate gets one, most
+    ///   'not_selected', and a selected one can still fail.  `main` is itself a
+    ///   source row, so it must be excluded there and taken from `reviews`,
+    ///   which is also the only way to count the reviews that had no experiment
+    ///   configured at all.
+    ///
+    /// For a series the model needs to have run on only one of the sent-back
+    /// patches to be scored on the whole series, so a model with partial
+    /// coverage can be charged with a miss for a patch it never saw.
+    async fn patchwork_model_rows(&self, cutoff: i64) -> Result<Vec<serde_json::Value>> {
+        let sql = "
+            WITH pat AS (
+                SELECT p.id AS patch_id, p.patchset_id AS patchset_id
+                FROM patches p
+                JOIN patchsets s ON s.id = p.patchset_id
+                WHERE s.status = 'Reviewed' AND s.date >= ?
+            ),
+            -- Every patch that contributes to a unit, tagged with the unit it
+            -- rolls up into: itself for accepted, its series for the rest.
+            unit AS (
+                SELECT 'accepted' AS outcome, pat.patch_id AS unit_id,
+                       pat.patch_id AS patch_id
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                WHERE st.outcome = 'accepted'
+                UNION ALL
+                SELECT 'changes_requested', pat.patchset_id, pat.patch_id
+                FROM pat
+                JOIN patchwork_patch_state st ON st.patch_id = pat.patch_id
+                WHERE st.outcome = 'changes_requested'
+            ),
+            ran AS (
+                SELECT r.patch_id AS patch_id, 'main' AS experiment
+                FROM reviews r
+                WHERE r.patch_id IS NOT NULL AND r.status = 'Reviewed'
+                UNION
+                SELECT r.patch_id, ms.experiment_name
+                FROM model_experiment_sources ms
+                JOIN reviews r ON r.id = ms.review_id
+                WHERE r.patch_id IS NOT NULL
+                  AND ms.selected = 1
+                  AND ms.status = 'completed'
+                  AND ms.experiment_name <> 'main'
+            ),
+            compared AS (
+                SELECT DISTINCT r.patch_id AS patch_id
+                FROM model_experiment_findings mf
+                JOIN reviews r ON r.id = mf.review_id
+                WHERE r.patch_id IS NOT NULL
+            ),
+            peer_sev AS (
+                SELECT r.patch_id AS patch_id, mf.additional_model AS experiment,
+                       MAX(CASE lower(COALESCE(mf.severity, ''))
+                               WHEN 'critical' THEN 4
+                               WHEN 'high' THEN 3
+                               WHEN 'medium' THEN 2
+                               WHEN 'low' THEN 1
+                               ELSE 0 END) AS sev
+                FROM model_experiment_findings mf
+                JOIN reviews r ON r.id = mf.review_id
+                WHERE r.patch_id IS NOT NULL
+                  AND mf.outcome IN ('both', 'additional_only')
+                  AND COALESCE(mf.preexisting, 0) = 0
+                GROUP BY r.patch_id, mf.additional_model
+            ),
+            main_attributed AS (
+                SELECT r.patch_id AS patch_id,
+                       MAX(CASE lower(COALESCE(mf.severity, ''))
+                               WHEN 'critical' THEN 4
+                               WHEN 'high' THEN 3
+                               WHEN 'medium' THEN 2
+                               WHEN 'low' THEN 1
+                               ELSE 0 END) AS sev
+                FROM model_experiment_findings mf
+                JOIN reviews r ON r.id = mf.review_id
+                WHERE r.patch_id IS NOT NULL
+                  AND mf.outcome IN ('both', 'main_only')
+                  AND COALESCE(mf.preexisting, 0) = 0
+                GROUP BY r.patch_id
+            ),
+            published_sev AS (
+                SELECT r.patch_id AS patch_id, MAX(f.severity) AS sev
+                FROM reviews r
+                JOIN findings f ON f.review_id = r.id
+                WHERE r.status = 'Reviewed'
+                  AND r.patch_id IS NOT NULL
+                  AND COALESCE(f.preexisting, 0) = 0
+                GROUP BY r.patch_id
+            ),
+            sev AS (
+                SELECT patch_id, experiment, sev FROM peer_sev
+                UNION ALL
+                SELECT pat.patch_id, 'main',
+                       CASE WHEN compared.patch_id IS NOT NULL
+                            THEN COALESCE(main_attributed.sev, 0)
+                            ELSE COALESCE(published_sev.sev, 0) END
+                FROM pat
+                LEFT JOIN compared ON compared.patch_id = pat.patch_id
+                LEFT JOIN main_attributed ON main_attributed.patch_id = pat.patch_id
+                LEFT JOIN published_sev ON published_sev.patch_id = pat.patch_id
+            ),
+            unit_sev AS (
+                SELECT u.outcome AS outcome, u.unit_id AS unit_id,
+                       ran.experiment AS experiment, MAX(COALESCE(sev.sev, 0)) AS sev
+                FROM unit u
+                JOIN ran ON ran.patch_id = u.patch_id
+                LEFT JOIN sev ON sev.patch_id = u.patch_id
+                              AND sev.experiment = ran.experiment
+                GROUP BY u.outcome, u.unit_id, ran.experiment
+            ),
+            unit_top AS (
+                SELECT outcome, unit_id, MAX(sev) AS topsev, COUNT(*) AS models
+                FROM unit_sev
+                GROUP BY outcome, unit_id
+            ),
+            top_hits AS (
+                SELECT us.outcome AS outcome, us.unit_id AS unit_id, COUNT(*) AS hits
+                FROM unit_sev us
+                JOIN unit_top ut ON ut.outcome = us.outcome AND ut.unit_id = us.unit_id
+                WHERE ut.topsev > 0 AND us.sev = ut.topsev
+                GROUP BY us.outcome, us.unit_id
+            ),
+            model_ids AS (
+                SELECT experiment_name AS experiment, MAX(model_id) AS model_id
+                FROM model_experiment_sources
+                GROUP BY experiment_name
+            )
+            SELECT us.experiment, COALESCE(model_ids.model_id, ''), us.outcome,
+                   COUNT(*),
+                   SUM(CASE WHEN ut.topsev = 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.topsev = 1 AND us.sev = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.topsev = 2 AND us.sev = 2 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.topsev >= 3 AND us.sev = ut.topsev THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.topsev > 0 AND us.sev < ut.topsev THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.models > 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.models > 1 AND ut.topsev = 1
+                                 AND us.sev = 1 AND th.hits = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.models > 1 AND ut.topsev = 2
+                                 AND us.sev = 2 AND th.hits = 1 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN ut.models > 1 AND ut.topsev >= 3
+                                 AND us.sev = ut.topsev AND th.hits = 1 THEN 1 ELSE 0 END)
+            FROM unit_sev us
+            JOIN unit_top ut ON ut.outcome = us.outcome AND ut.unit_id = us.unit_id
+            LEFT JOIN top_hits th ON th.outcome = us.outcome AND th.unit_id = us.unit_id
+            LEFT JOIN model_ids ON model_ids.experiment = us.experiment
+            GROUP BY us.experiment, us.outcome
+            ORDER BY us.experiment, us.outcome";
+
+        let mut rows = self.conn.query(sql, libsql::params![cutoff]).await?;
+        let mut models = Vec::new();
+        while let Some(row) = rows.next().await? {
+            models.push(json!({
+                "experiment": row.get::<String>(0)?,
+                "model_id": row.get::<String>(1)?,
+                "outcome": row.get::<String>(2)?,
+                "units": row.get::<i64>(3)?,
+                "none": row.get::<i64>(4)?,
+                "low": row.get::<i64>(5)?,
+                "medium": row.get::<i64>(6)?,
+                "high_plus": row.get::<i64>(7)?,
+                "missed": row.get::<i64>(8)?,
+                "multi_units": row.get::<i64>(9)?,
+                "unique_low": row.get::<i64>(10)?,
+                "unique_medium": row.get::<i64>(11)?,
+                "unique_high_plus": row.get::<i64>(12)?,
+            }));
+        }
+        Ok(models)
     }
 
     /// The poller's durable sweep watermark: the date of the newest event we
@@ -11869,9 +12023,8 @@ mod tests {
     }
 
     /// Severity groups must be disjoint (max severity wins) so the UI's
-    /// composition percentages sum to 100%, pre-existing findings must not
-    /// count, and the 'other' scope must only include patches where an
-    /// additional model actually ran.
+    /// composition percentages sum to 100%, and pre-existing findings must not
+    /// count.
     #[tokio::test]
     async fn patchwork_stats_group_by_max_severity() {
         let db = setup_patchwork_db().await;
@@ -11890,23 +12043,7 @@ mod tests {
                  INSERT INTO findings (id, review_id, severity, problem, preexisting) VALUES
                      (1, 1, 1, 'low', 0),
                      (2, 1, 3, 'high', 0),
-                     (3, 2, 4, 'preexisting critical', 1);
-                 -- An additional model ran on patches 1 and 2 only.  Patch 4
-                 -- has source rows but nothing that ran: every candidate model
-                 -- gets a row, and a selected one can still fail.
-                 INSERT INTO model_experiment_sources (id, review_id, experiment_name, selected, status) VALUES
-                     (1, 1, 'sonnet-5', 1, 'completed'),
-                     (2, 2, 'sonnet-5', 1, 'completed'),
-                     (3, 4, 'sonnet-5', 0, 'not_selected'),
-                     (4, 4, 'fable-5', 1, 'failed');
-                 -- Rows 1 and 2 predate the preexisting column, so their NULL
-                 -- must read as 'not pre-existing' and keep counting.
-                 INSERT INTO model_experiment_findings (id, review_id, additional_model, finding_id, outcome, severity, preexisting) VALUES
-                     (1, 1, 'sonnet-5', 'f1', 'additional_only', 'Medium', NULL),
-                     -- main_only is the main model's finding, not the peer's.
-                     (2, 2, 'sonnet-5', 'f2', 'main_only', 'Critical', NULL),
-                     -- Pre-existing, so patch 2 stays in the 'none' group.
-                     (3, 2, 'sonnet-5', 'f3', 'additional_only', 'Critical', 1);",
+                     (3, 2, 4, 'preexisting critical', 1);",
             )
             .await
             .unwrap();
@@ -11926,39 +12063,19 @@ mod tests {
         let stats = db.get_patchwork_stats(90).await.unwrap();
         let daily = stats["daily"].as_array().unwrap();
 
-        let main = daily
+        let row = daily
             .iter()
-            .find(|row| row["scope"] == "main" && row["outcome"] == "accepted")
-            .expect("main row");
+            .find(|row| row["outcome"] == "accepted")
+            .expect("accepted row");
         // patch 1 -> high, patches 2 (pre-existing only), 3 and 4 -> none
-        assert_eq!(main["high"], 1);
+        assert_eq!(row["high"], 1);
         assert_eq!(
-            main["low"], 0,
+            row["low"], 0,
             "max severity wins, so Low must not double count"
         );
-        assert_eq!(main["critical"], 0, "pre-existing findings must not count");
-        assert_eq!(main["none"], 3);
-
-        let other = daily
-            .iter()
-            .find(|row| row["scope"] == "other" && row["outcome"] == "accepted")
-            .expect("other row");
-        // Only patches 1 and 2 had an additional model run.  Patch 3 has no
-        // source row at all and patch 4's sources never produced a review, so
-        // neither may be counted as "ran and found nothing".
-        assert_eq!(other["medium"], 1);
-        assert_eq!(other["none"], 1);
-        assert_eq!(
-            other["critical"], 0,
-            "main_only is not the peer's finding, and pre-existing must not count"
-        );
-        let other_total: i64 = ["none", "low", "medium", "high", "critical"]
-            .iter()
-            .map(|k| other[*k].as_i64().unwrap())
-            .sum();
-        assert_eq!(other_total, 2);
-        assert_eq!(main["unit"], "patch", "accepted is scored per patch");
-        assert_eq!(other["unit"], "patch");
+        assert_eq!(row["critical"], 0, "pre-existing findings must not count");
+        assert_eq!(row["none"], 3);
+        assert_eq!(row["unit"], "patch", "accepted is scored per patch");
     }
 
     /// Changes-requested collapses to one unit per series, because patchwork
@@ -12018,9 +12135,9 @@ mod tests {
         let row = |outcome: &str| {
             daily
                 .iter()
-                .find(|row| row["scope"] == "main" && row["outcome"] == outcome)
+                .find(|row| row["outcome"] == outcome)
                 .cloned()
-                .unwrap_or_else(|| panic!("no main row for {}", outcome))
+                .unwrap_or_else(|| panic!("no row for {}", outcome))
         };
         let total = |row: &serde_json::Value| -> i64 {
             ["none", "low", "medium", "high", "critical"]
@@ -12053,5 +12170,165 @@ mod tests {
             accepted["low"], 1,
             "the applied patch is still scored on its own finding"
         );
+    }
+
+    /// The per-model table splits the published review back up by who found
+    /// what.  Every model lands in exactly one bucket per unit it ran on, and
+    /// the published `findings` table — which is the union across models — must
+    /// not be used to credit the main model with a peer's discovery.
+    #[tokio::test]
+    async fn patchwork_model_rows_attribute_top_severity_per_model() {
+        let db = setup_patchwork_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO messages (id, message_id, thread_id) VALUES
+                     (5, 'patch-five@example.com', 1),
+                     (6, 'patch-six@example.com', 1),
+                     (7, 'patch-seven@example.com', 1);
+                 INSERT INTO patchsets (id, thread_id, status, date)
+                     VALUES (2, 1, 'Reviewed', unixepoch('now', '-3 days'));
+                 INSERT INTO patches (id, patchset_id, message_id, part_index) VALUES
+                     (3, 1, 'patch-three@example.com', 3),
+                     (4, 1, 'patch-four@example.com', 4),
+                     (5, 1, 'patch-five@example.com', 5),
+                     (6, 2, 'patch-six@example.com', 1),
+                     (7, 2, 'patch-seven@example.com', 2);
+                 INSERT INTO reviews (id, patchset_id, patch_id, status, created_at) VALUES
+                     (1, 1, 1, 'Reviewed', unixepoch('now')),
+                     (2, 1, 2, 'Reviewed', unixepoch('now')),
+                     (3, 1, 3, 'Reviewed', unixepoch('now')),
+                     (4, 1, 4, 'Reviewed', unixepoch('now')),
+                     (5, 1, 5, 'Reviewed', unixepoch('now')),
+                     (6, 2, 6, 'Reviewed', unixepoch('now')),
+                     (7, 2, 7, 'Reviewed', unixepoch('now'));
+                 -- sonnet-5 ran on patches 1-4 and, in series 2, on patch 7
+                 -- only.  A source row is not proof a model ran: every
+                 -- candidate gets one, most 'not_selected', and a selected one
+                 -- can still fail.  'main' has a source row of its own, which
+                 -- must not turn into a peer row.
+                 INSERT INTO model_experiment_sources (id, review_id, experiment_name, selected, status) VALUES
+                     (1, 1, 'sonnet-5', 1, 'completed'),
+                     (2, 1, 'main', 1, 'completed'),
+                     (3, 2, 'sonnet-5', 1, 'completed'),
+                     (4, 3, 'sonnet-5', 1, 'completed'),
+                     (5, 4, 'sonnet-5', 1, 'completed'),
+                     (6, 4, 'fable-5', 1, 'failed'),
+                     (7, 5, 'sonnet-5', 0, 'not_selected'),
+                     (8, 7, 'sonnet-5', 1, 'completed');
+                 INSERT INTO model_experiment_findings (id, review_id, additional_model, finding_id, outcome, severity, preexisting) VALUES
+                     -- patch 1: both models found the High.
+                     (1, 1, 'sonnet-5', 'f1', 'both', 'High', 0),
+                     -- patch 2: main alone found it.
+                     (2, 2, 'sonnet-5', 'f2', 'main_only', 'High', 0),
+                     -- patch 3: sonnet-5 alone found it.
+                     (3, 3, 'sonnet-5', 'f3', 'additional_only', 'Medium', 0),
+                     -- patch 4: the one candidate finding was dropped by
+                     -- confirmation, so nobody found anything here.
+                     (4, 4, 'sonnet-5', 'f4', 'additional_hallucination', 'Critical', 0);
+                 -- Patch 3's Medium is published even though main never found
+                 -- it, so reading main's severity off findings would credit
+                 -- main with sonnet-5's discovery.  Patches 5 and 6 had no peer
+                 -- to compare against, so findings is all we have there.
+                 INSERT INTO findings (id, review_id, severity, problem, preexisting) VALUES
+                     (1, 1, 3, 'high', 0),
+                     (2, 2, 3, 'high', 0),
+                     (3, 3, 2, 'medium', 0),
+                     (4, 5, 2, 'medium', 0),
+                     (5, 5, 4, 'preexisting critical', 1),
+                     (6, 6, 1, 'low', 0);",
+            )
+            .await
+            .unwrap();
+        db.record_patchwork_states(
+            &[
+                pw_event("patch-one@example.com", "accepted", 1),
+                pw_event("patch-two@example.com", "accepted", 2),
+                pw_event("patch-three@example.com", "accepted", 3),
+                pw_event("patch-four@example.com", "accepted", 4),
+                pw_event("patch-five@example.com", "accepted", 5),
+                pw_event("patch-six@example.com", "changes-requested", 6),
+                pw_event("patch-seven@example.com", "changes-requested", 7),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stats = db.get_patchwork_stats(90).await.unwrap();
+        let models = stats["models"].as_array().unwrap();
+        let row = |experiment: &str, outcome: &str| {
+            models
+                .iter()
+                .find(|r| r["experiment"] == experiment && r["outcome"] == outcome)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {} row for {}", experiment, outcome))
+        };
+        let buckets = |row: &serde_json::Value| -> Vec<i64> {
+            ["none", "low", "medium", "high_plus", "missed"]
+                .iter()
+                .map(|k| row[*k].as_i64().unwrap())
+                .collect()
+        };
+
+        assert_eq!(
+            models.len(),
+            4,
+            "two models times two outcomes: 'main' as a source row and a \
+             failed candidate must not become rows of their own"
+        );
+
+        let main = row("main", "accepted");
+        assert_eq!(main["units"], 5);
+        // patch 1 both -> high_plus, patch 2 main_only -> high_plus, patch 3
+        // additional_only -> missed, patch 4 all dropped -> none, patch 5 has
+        // no comparison so it falls back to findings -> medium.
+        assert_eq!(buckets(&main), vec![1, 0, 1, 2, 1]);
+        assert_eq!(
+            buckets(&main).iter().sum::<i64>(),
+            main["units"].as_i64().unwrap(),
+            "the buckets must be exhaustive so a row sums to 100%"
+        );
+        assert_eq!(
+            main["medium"], 1,
+            "patch 5's pre-existing Critical must not outrank its Medium"
+        );
+        // Only patches 1-4 had a second model; patch 5 was main alone, so
+        // "nobody else found it" is not falsifiable there.
+        assert_eq!(main["multi_units"], 4);
+        assert_eq!(
+            main["unique_high_plus"], 1,
+            "patch 2 only: patch 1 was both"
+        );
+        assert_eq!(
+            main["unique_medium"], 0,
+            "patch 5 is not a multi-model unit"
+        );
+        assert_eq!(main["unique_low"], 0);
+
+        let peer = row("sonnet-5", "accepted");
+        assert_eq!(peer["units"], 4, "sonnet-5 never ran on patch 5");
+        assert_eq!(buckets(&peer), vec![1, 0, 1, 1, 1]);
+        assert_eq!(
+            buckets(&peer).iter().sum::<i64>(),
+            peer["units"].as_i64().unwrap()
+        );
+        assert_eq!(peer["multi_units"], 4);
+        assert_eq!(peer["unique_medium"], 1, "patch 3 was sonnet-5's alone");
+        assert_eq!(peer["unique_high_plus"], 0);
+
+        // Series 2 is one unit: main found a Low on patch 6 and nothing on 7,
+        // and the series takes the worst of the two.  sonnet-5 only ran on
+        // patch 7, which is enough to be scored on the series and is why a
+        // partially covered model can be charged with a miss.
+        let main_cr = row("main", "changes_requested");
+        assert_eq!(main_cr["units"], 1);
+        assert_eq!(buckets(&main_cr), vec![0, 1, 0, 0, 0]);
+        assert_eq!(main_cr["unique_low"], 1);
+        let peer_cr = row("sonnet-5", "changes_requested");
+        assert_eq!(peer_cr["units"], 1);
+        assert_eq!(buckets(&peer_cr), vec![0, 0, 0, 0, 1]);
+        assert_eq!(peer_cr["multi_units"], 1);
+        assert_eq!(peer_cr["unique_low"], 0);
     }
 }

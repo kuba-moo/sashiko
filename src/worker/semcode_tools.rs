@@ -86,6 +86,11 @@ pub struct SemcodeToolBox {
     /// to ~95 calls, which would add up to hours of sleeping and turn a degraded
     /// review into a timed-out one. Later calls fail fast instead.
     index_wait_exhausted: AtomicBool,
+    /// Calls that got a refusal instead of an answer. Setup succeeding says
+    /// nothing about the tools working — a stale index passes setup and then
+    /// refuses every read — so the review row needs this too, not just
+    /// whether the copy and the index pass went through.
+    refusals: AtomicU64,
 }
 
 impl SemcodeToolBox {
@@ -139,10 +144,16 @@ impl SemcodeToolBox {
             request: Mutex::new(()),
             next_id: AtomicU64::new(1),
             index_wait_exhausted: AtomicBool::new(false),
+            refusals: AtomicU64::new(0),
         };
 
         toolbox.initialize().await?;
         Ok(toolbox)
+    }
+
+    /// How many tool calls got a refusal instead of an answer.
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -369,6 +380,7 @@ impl SemcodeToolBox {
 
             if refusal == Refusal::Terminal {
                 warn!("semcode-mcp refused '{}': {}", tool, message);
+                self.refusals.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow!("{}", message));
             }
 
@@ -377,11 +389,13 @@ impl SemcodeToolBox {
                     "semcode-mcp still indexing, not waiting again for '{}'",
                     tool
                 );
+                self.refusals.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow!("{}", message));
             }
 
             let Some(delay) = backoff.next() else {
                 self.index_wait_exhausted.store(true, Ordering::Relaxed);
+                self.refusals.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "semcode-mcp still indexing after {:?}, giving up on '{}' and on \
                      waiting for the rest of this review: {}",

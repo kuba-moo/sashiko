@@ -123,7 +123,10 @@ CREATE TABLE IF NOT EXISTS reviews (
     concerns_total INTEGER,
     concerns_unique INTEGER,
     findings_multi_stage INTEGER,
-    semcode_status TEXT, -- ok, setup_failed, disabled: whether semcode tools were available
+    -- ok, disabled, setup_failed, or tools_refused:<n>: whether semcode tools were
+    -- available AND answering. The last two are distinct because a stale index
+    -- copies and indexes cleanly, then refuses every read.
+    semcode_status TEXT,
     FOREIGN KEY(patchset_id) REFERENCES patchsets(id),
     FOREIGN KEY(patch_id) REFERENCES patches(id),
     FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id),

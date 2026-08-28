@@ -1509,6 +1509,29 @@
             return ` &middot; <span style="${style}" title="Token budget hit on ${labels.join(', ')}">${text}</span>`;
         }
 
+        // reviews.semcode_status. Silent for 'ok' and for 'disabled' (semcode off is
+        // the default, so a badge on every review would be noise) — this exists to
+        // show the cases where the reviewing model was flying without the code
+        // navigation tools it was told it had.
+        function formatSemcodeStatus(status) {
+            if (!status || status === 'ok' || status === 'disabled') return '';
+            let text, title;
+            const refused = /^tools_refused:(\d+)$/.exec(status);
+            if (refused) {
+                text = `semcode: ${refused[1]} call${refused[1] === '1' ? '' : 's'} refused`;
+                title = 'semcode started and the index was built, but this many tool calls got a ' +
+                        'refusal instead of an answer (usually a stale index). Check the review log.';
+            } else if (status === 'setup_failed') {
+                text = 'semcode: setup failed';
+                title = 'The semcode database could not be copied or indexed, so this review ran ' +
+                        'without code navigation tools. Check the review log.';
+            } else {
+                text = `semcode: ${status}`;
+                title = 'Unrecognized semcode status; check the review log.';
+            }
+            return `<span style="color:var(--error-text);font-weight:bold;font-size:0.85em;" title="${escapeHtml(title)}">${escapeHtml(text)}</span>`;
+        }
+
         // =====================================================================
         // ROUTER
         // =====================================================================
@@ -3276,6 +3299,7 @@
             const reviewCost = estimateCost(r.model, r.tokens_in || 0, tokensOut, tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}${formatCost(reviewCost)}`;
             const budgetIndicators = formatBudgetFlags(r.budget_flags || 0);
+            const semcodeIndicator = formatSemcodeStatus(r.semcode_status);
             const mainSourceName = outputJson?.model_experiment?.cohort?.main?.display_name || r.model || 'main';
             const sourcePresentation = buildReviewSourcePresentation(outputJson, crossReview);
             const sourceSummaryHtml = renderReviewSourceSummary(sourcePresentation);
@@ -3345,7 +3369,10 @@
                         <div class="review-meta-label">Result:</div>
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <span>${displayResult}</span>
-                            <span class="status-badge status-${(statusRaw || '').replace(/ /g, '')}">${statusRaw}</span>
+                            <span style="display:flex; align-items:center; gap:10px;">
+                                ${semcodeIndicator}
+                                <span class="status-badge status-${(statusRaw || '').replace(/ /g, '')}">${statusRaw}</span>
+                            </span>
                         </div>
                         ` : `
                         <div class="review-meta-label">Status:</div>

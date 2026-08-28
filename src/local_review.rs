@@ -571,11 +571,18 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        // Kept beside the ToolBox so the refusal count can be read back after the
+        // review: setup succeeding says nothing about the tools answering.
+        let mut semcode_box = None;
         if let Some(settings) = semcode.filter(|settings| settings.enabled) {
             match crate::worker::semcode_tools::SemcodeToolBox::start(settings, &worktree.path)
                 .await
             {
-                Ok(semcode) => tools = tools.with_semcode(semcode),
+                Ok(semcode) => {
+                    let semcode = std::sync::Arc::new(semcode);
+                    semcode_box = Some(semcode.clone());
+                    tools = tools.with_semcode(semcode);
+                }
                 // Loud: this patch is about to be reviewed without semcode.
                 Err(error) => tracing::error!("Failed to start semcode tools: {}", error),
             }
@@ -771,7 +778,8 @@ async fn review_single_patch(
                     "history": result.history,
                     "tokens_in": result.tokens_in,
                     "tokens_out": result.tokens_out,
-                    "tokens_cached": result.tokens_cached
+                    "tokens_cached": result.tokens_cached,
+                    "semcode_refusals": semcode_box.as_ref().map_or(0, |sc| sc.refusals())
                 }));
             }
             Err(e) => {
@@ -806,6 +814,7 @@ async fn review_single_patch(
                         "tokens_in": prior_merge_usage.tokens_in,
                         "tokens_out": prior_merge_usage.tokens_out,
                         "tokens_cached": prior_merge_usage.tokens_cached,
+                        "semcode_refusals": semcode_box.as_ref().map_or(0, |sc| sc.refusals()),
                     }));
                 }
                 last_error = Some(e);
@@ -995,6 +1004,21 @@ fn build_retry_provider(ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai:
 #[cfg(not(feature = "bedrock"))]
 fn build_retry_provider(_ai: &AiSettings) -> Option<std::sync::Arc<dyn crate::ai::AiProvider>> {
     None
+}
+
+/// What `reviews.semcode_status` records, from setup health plus how many tool
+/// calls were refused.
+///
+/// The two are not the same thing and one does not imply the other: an index
+/// written by an older semcode copies and indexes cleanly, so setup reports "ok",
+/// and then every read is refused. A review that got no answers must not be
+/// indistinguishable from one that did.
+fn semcode_status_label(setup: &str, refusals: u64) -> String {
+    match (setup, refusals) {
+        ("ok", 0) => "ok".to_string(),
+        ("ok", n) => format!("tools_refused:{}", n),
+        (status, _) => status.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1265,10 +1289,12 @@ async fn run_worker_in_worktree(
     let mut total_concerns_count = 0;
     let mut total_dismissed_concerns_count = 0;
     let mut budget_flags = 0u64;
+    let mut semcode_refusals = 0u64;
     let private_metadata = collect_private_review_metadata(&results, &patches_to_review);
 
     for res in &results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
+        semcode_refusals += res["semcode_refusals"].as_u64().unwrap_or(0);
         let patch_subject = patches_to_review
             .iter()
             .find(|p| p.index == p_idx)
@@ -1348,7 +1374,7 @@ async fn run_worker_in_worktree(
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
         ,"budget_flags": budget_flags,
-        "semcode_status": semcode_status,
+        "semcode_status": semcode_status_label(semcode_status, semcode_refusals),
         "canonical_candidates": private_metadata.canonical_candidates,
         "merge_usage": private_metadata.merge_usage.to_json(),
         "json_decode_events": private_metadata.json_decode_events,
@@ -1589,6 +1615,17 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn semcode_status_distinguishes_setup_health_from_tool_health() {
+        assert_eq!(semcode_status_label("ok", 0), "ok");
+        // The case that made this necessary: setup succeeded, every call refused.
+        assert_eq!(semcode_status_label("ok", 15), "tools_refused:15");
+        // A failed setup stays reported as such — the refusal count is 0 there
+        // only because there was nothing to refuse.
+        assert_eq!(semcode_status_label("setup_failed", 0), "setup_failed");
+        assert_eq!(semcode_status_label("disabled", 0), "disabled");
+    }
 
     #[test]
     fn prompt_prefix_cache_source_metadata_is_typed() {

@@ -105,8 +105,11 @@ impl ToolBox {
         }
     }
 
-    pub fn with_semcode(mut self, semcode: crate::worker::semcode_tools::SemcodeToolBox) -> Self {
-        self.semcode = Some(Arc::new(semcode));
+    pub fn with_semcode(
+        mut self,
+        semcode: Arc<crate::worker::semcode_tools::SemcodeToolBox>,
+    ) -> Self {
+        self.semcode = Some(semcode);
         self
     }
 

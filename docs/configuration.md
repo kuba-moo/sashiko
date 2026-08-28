@@ -302,9 +302,18 @@ into the review worktree and indexes the series' commits into that copy, so the
 master index is only ever read. The copy-and-index runs once per worktree even
 though a multi-patch series fans out one review child per patch.
 
-Reviews record whether the tools were available in `reviews.semcode_status`
-(`ok`, `setup_failed` or `disabled`); a `setup_failed` review ran without any
-semcode tools and also logs at `error` level.
+Reviews record whether the tools were available in `reviews.semcode_status`, and
+the review card in the web UI shows anything other than `ok`:
+
+| Value | Meaning |
+| --- | --- |
+| `ok` | The tools were there and answered. |
+| `disabled` | `[semcode]` is off, or absent. |
+| `setup_failed` | The database could not be copied or indexed, so the review ran with no semcode tools at all. Also logged at `error` level. |
+| `tools_refused:N` | Setup succeeded but `N` tool calls got a refusal instead of an answer, each one logged at `warn` level. Usually a stale index: one written by an older `semcode-index` than the deployed `semcode-mcp` reads, which refuses every query. Rebuild the master index with **no** `--git` range — `semcode-index` deliberately skips the schema upgrade when a range is named. |
+
+Setup health does not imply tool health, which is why the last two are separate:
+a stale index copies and indexes cleanly and then refuses every read.
 
 ### `[embargo]`
 

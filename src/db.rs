@@ -5256,7 +5256,8 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
+                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags,
+                        r.semcode_status
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -5284,6 +5285,7 @@ impl Database {
                     "id": r.get::<i64>(11).ok(),
                     "tokens_cached": r.get::<Option<u32>>(12).ok(),
                     "budget_flags": r.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
+                    "semcode_status": r.get::<Option<String>>(14).ok().flatten(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -5495,7 +5497,8 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.budget_flags,
+                        r.semcode_status
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -5522,6 +5525,7 @@ impl Database {
                     "id": r.get::<i64>(9).ok(),
                     "tokens_cached": r.get::<Option<u32>>(10).ok(),
                     "budget_flags": r.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
+                    "semcode_status": r.get::<Option<String>>(12).ok().flatten(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -5685,7 +5689,7 @@ impl Database {
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_git_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
-                        r.budget_flags, p.embargo_until
+                        r.budget_flags, p.embargo_until, r.semcode_status
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -5731,6 +5735,7 @@ impl Database {
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
                 "budget_flags": r.get::<Option<i64>>(19).ok().flatten().unwrap_or(0),
+                "semcode_status": r.get::<Option<String>>(21).ok().flatten(),
             })))
         } else {
             Ok(None)
@@ -8208,6 +8213,97 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The column existed for a while without reaching either payload, so the UI
+    /// showed nothing and a review that ran without semcode looked like any other.
+    /// Both queries pull it by positional index, which is what this pins down.
+    #[tokio::test]
+    async fn semcode_status_reaches_the_review_payloads() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_semcode_status", "Semcode Status", 90000)
+            .await
+            .unwrap();
+        let author = "Semcode Author <semcode@example.com>";
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_semcode_status",
+                "Semcode Status",
+                author,
+                90000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "msg_semcode_status",
+            thread_id,
+            None,
+            author,
+            "Semcode Status",
+            90000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_id, "msg_semcode_status", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE reviews SET status = 'Reviewed', summary = 's' WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        db.update_review_semcode_status(review_id, "tools_refused:15")
+            .await
+            .unwrap();
+
+        let details = db
+            .get_patchset_details(ps_id, None, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            details["reviews"][0]["semcode_status"], "tools_refused:15",
+            "get_patchset_details feeds the review card in the UI"
+        );
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["reviews"][0]["semcode_status"], "tools_refused:15");
+
+        let review = db
+            .get_review_details(review_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review["semcode_status"], "tools_refused:15");
     }
 
     #[tokio::test]

@@ -1839,6 +1839,12 @@ impl Reviewer {
                                         )
                                         .await;
                                 }
+                                if let Some(status) = review_content["semcode_status"].as_str() {
+                                    let _ = ctx
+                                        .db
+                                        .update_review_semcode_status(review_id, status)
+                                        .await;
+                                }
                                 if let Some(experiment) = review_content.get("model_experiment")
                                     && let Err(error) = ctx
                                         .db

@@ -776,6 +776,9 @@ impl Database {
             .try_add_column("reviews", "budget_flags", "INTEGER DEFAULT 0")
             .await;
         let _ = self
+            .try_add_column("reviews", "semcode_status", "TEXT")
+            .await;
+        let _ = self
             .try_add_column("findings", "source_stages", "TEXT")
             .await;
         let _ = self
@@ -1187,6 +1190,19 @@ impl Database {
             .execute(
                 "UPDATE reviews SET concerns_total = ?, concerns_unique = ?, findings_multi_stage = ? WHERE id = ?",
                 libsql::params![total, unique, multi_stage, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record whether the review had semcode available: "ok", "setup_failed" or
+    /// "disabled".  A review that ran without it is not wrong, just blinder, so
+    /// this is kept out of `complete_review` and written separately.
+    pub async fn update_review_semcode_status(&self, review_id: i64, status: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET semcode_status = ? WHERE id = ?",
+                libsql::params![status, review_id],
             )
             .await?;
         Ok(())

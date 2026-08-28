@@ -278,6 +278,34 @@ Optional array of additional git remotes to track.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+### `[semcode]`
+
+Optional. Gives the reviewing model semantic code-navigation tools
+(`sc_find_definition`, `sc_find_callers`, `sc_find_calls`, `sc_find_callchain`,
+`sc_grep_functions`) backed by [semcode](https://github.com/facebookexperimental/semcode)
+over an MCP subprocess. Off unless `enabled = true`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the semcode tools for review. |
+| `mcp_binary` | string | `"semcode-mcp"` | Path to the `semcode-mcp` binary. Found via `PATH` when unset. |
+| `index_binary` | string | `"semcode-index"` | Path to the `semcode-index` binary. Found via `PATH` when unset. |
+
+```toml
+[semcode]
+enabled = true
+```
+
+Requires a semcode database at `<git.repository_path>/.semcode.db`, built once
+by hand with `semcode-index`. Review never writes to it: setup reflink-copies it
+into the review worktree and indexes the series' commits into that copy, so the
+master index is only ever read. The copy-and-index runs once per worktree even
+though a multi-patch series fans out one review child per patch.
+
+Reviews record whether the tools were available in `reviews.semcode_status`
+(`ok`, `setup_failed` or `disabled`); a `setup_failed` review ran without any
+semcode tools and also logs at `error` level.
+
 ### `[embargo]`
 
 Optional. Ties the embargo to an external schedule instead of a fixed offset

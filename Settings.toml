@@ -141,3 +141,13 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+# Semantic code navigation tools for the reviewing model, backed by semcode
+# (https://github.com/facebookexperimental/semcode) over MCP. Off by default.
+# Requires a semcode database at <git.repository_path>/.semcode.db, built once by
+# hand with semcode-index; review copies it into the worktree and only ever reads
+# the master. See docs/configuration.md.
+# [semcode]
+# enabled = true
+# mcp_binary = "semcode-mcp"      # Default: found via PATH
+# index_binary = "semcode-index"  # Default: found via PATH

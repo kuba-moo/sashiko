@@ -576,7 +576,8 @@ async fn review_single_patch(
                 .await
             {
                 Ok(semcode) => tools = tools.with_semcode(semcode),
-                Err(error) => tracing::warn!("Failed to start semcode tools: {}", error),
+                // Loud: this patch is about to be reviewed without semcode.
+                Err(error) => tracing::error!("Failed to start semcode tools: {}", error),
             }
         }
         tools.set_active_patch_files(patch_files);
@@ -1156,31 +1157,44 @@ async fn run_worker_in_worktree(
         },
     );
 
-    let semcode_ready = if let Some(settings) = semcode.filter(|settings| settings.enabled) {
-        let setup = async {
-            crate::worker::semcode_tools::copy_semcode_db(&worktree.repo_path, &worktree.path)
-                .await?;
-            let target = patch_shas
+    let (semcode_ready, semcode_status) =
+        if let Some(settings) = semcode.filter(|settings| settings.enabled) {
+            // Index to the tip of the series, not to this child's own patch. The
+            // reviewer gives every child of a series the same worktree, so asking
+            // for one shared range is what lets all but the first skip the work —
+            // and each child ends up with the whole series indexed rather than only
+            // its own prefix. `patches` carries every patch's commit id, while
+            // `patch_shas` holds only the patch this child was asked to review.
+            let target = patches
                 .iter()
-                .max_by_key(|(index, _)| *index)
-                .map(|(_, sha)| sha.as_str())
-                .unwrap_or("HEAD");
-            crate::worker::semcode_tools::run_semcode_index(
+                .max_by_key(|p| p.index)
+                .and_then(|p| p.commit_id.clone())
+                .or_else(|| {
+                    patch_shas
+                        .iter()
+                        .max_by_key(|(index, _)| *index)
+                        .map(|(_, sha)| sha.clone())
+                })
+                .unwrap_or_else(|| "HEAD".to_string());
+
+            let range = format!("{}..{}", baseline_sha, target);
+            let setup = crate::worker::semcode_tools::setup_worktree_db(
                 settings,
+                &worktree.repo_path,
                 &worktree.path,
-                &format!("{}..{}", baseline_sha, target),
-            )
-            .await
-        };
-        if let Err(error) = setup.await {
-            tracing::warn!("Semcode setup failed; continuing without it: {}", error);
-            false
+                &range,
+            );
+            if let Err(error) = setup.await {
+                // Loud: this review is about to run blind, and the failure was
+                // invisible in the data until it was recorded on the review row.
+                tracing::error!("Semcode setup failed; continuing without it: {}", error);
+                (false, "setup_failed")
+            } else {
+                (true, "ok")
+            }
         } else {
-            true
-        }
-    } else {
-        false
-    };
+            (false, "disabled")
+        };
 
     let rich_patches: Vec<Value> = patches_to_review
         .iter()
@@ -1334,6 +1348,7 @@ async fn run_worker_in_worktree(
         "concerns_count": total_concerns_count,
         "dismissed_concerns_count": total_dismissed_concerns_count
         ,"budget_flags": budget_flags,
+        "semcode_status": semcode_status,
         "canonical_candidates": private_metadata.canonical_candidates,
         "merge_usage": private_metadata.merge_usage.to_json(),
         "json_decode_events": private_metadata.json_decode_events,

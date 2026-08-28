@@ -3408,6 +3408,7 @@ dependencies = [
  "google-cloud-auth",
  "hmac 0.13.0",
  "lettre",
+ "libc",
  "libsql",
  "mail-parser",
  "percent-encoding",

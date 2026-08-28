@@ -103,27 +103,14 @@ impl ReviewStage for Stage9 {
     fn name(&self) -> &'static str {
         "Concern/dismissed-concern conflict resolution"
     }
+    /// Stage 9 returns a keep/discard plan over input IDs, so the concern shape
+    /// is checked against the inputs by the session rather than here.
     fn validate(&mut self, response: &AiResponse) -> Result<Value, ValidationError> {
-        let parsed = parse_json_response(response, 9)?;
-        if let Some(c) = parsed.get("concerns") {
-            if !c.is_array() {
-                return Err(ValidationError::FormatViolation(
-                    "output 'concerns' is not an array".to_string(),
-                ));
-            }
-            validate_source_stages(c, "concern")?;
-            validate_model_provenance(c, "concern")?;
-        } else {
-            return Err(ValidationError::FormatViolation(
-                "missing 'concerns' array in output".to_string(),
-            ));
-        }
-        Ok(parsed)
+        parse_json_response(response, 9)
     }
     fn format_validation_feedback(&self, violation: &str) -> String {
         format!(
-            "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' array.",
-            violation
+            "\n\nYour previous Stage 9 response was rejected. {violation}\n\nReturn one corrected compact plan with `keep` and `discard` arrays. Every consolidated concern ID must appear exactly once."
         )
     }
 }

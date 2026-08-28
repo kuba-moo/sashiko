@@ -219,29 +219,48 @@ Rejected plans are recorded in response-health statistics under
 ## Stage 9. Concern/dismissed-concern conflict resolution
 This stage compares the consolidated `concerns` and `dismissed_concerns` from Stage 8. The LLM should identify cases where a concern and a dismissed concern describe the same root cause, code path, or failure mode but reach opposite conclusions. For each conflict, it should inspect the actual code and keep the concern only when the concern is correct; otherwise it should discard the concern.
 
+Its decision is the entire output. Like Stage 8, the LLM partitions stable
+finding IDs rather than reproducing concern objects, and Rust materializes the
+kept concerns from its own copies of the Stage 8 output. This stage is not
+licensed to rewrite a concern: measured over the corpus it changed a retained
+concern's `description` in 0.9% of cases, while re-emitting the whole list cost
+more output tokens than any other merge stage bar Stage 10.
+
 **System Prompt:**
 You are the lead reviewer reconciling consolidated concerns with consolidated dismissed_concerns.
 Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume either side is correct. Treat both as hypotheses and verify them against the actual code before deciding whether to keep or discard a concern.
 1. Compare each concern against the dismissed_concerns list and find conflicts or overlaps where one says the issue is real and the other says the same candidate issue is disproved.
 2. For every conflict, inspect the actual code and reasoning to decide which side is correct.
-3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
-4. If there is no direct conflict for a concern, keep it unchanged.
+3. If the concern is correct, keep it. If the dismissed_concern is correct, discard that concern and name the dismissed_concern that disproves it.
+4. If there is no direct conflict for a concern, keep it.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
+6. You do not rewrite concerns; kept concerns are copied verbatim by the tooling.
 
-**Expected input:** The consolidated `concerns` and consolidated `dismissed_concerns` from Stage 8.
+**Expected input:** The consolidated `concerns` and consolidated `dismissed_concerns` from Stage 8. Stage 8 materializes dismissed concerns without provenance, so Rust labels each one with a `dismissed_id` (`d1`, `d2`, …) for `disproved_by` to cite.
 **Expected output JSON:**
 ```json
 {
-  "concerns": [
+  "keep": ["main-1-0"],
+  "discard": [
     {
-      "type": "Category",
-      "description": "Description of the remaining concern.",
-      "reasoning": "Reasoning steps.",
-      "preexisting": false
+      "id": "main-3-1",
+      "disproved_by": "d2",
+      "why": "The dismissed concern shows the caller already holds the lock."
     }
   ]
 }
 ```
+
+Rust validates the complete plan before accepting it: unknown, missing, or
+duplicate concern IDs, a `disproved_by` that names no dismissed concern, a `why`
+over 600 characters, and structural errors are reported together. A concern
+named by any of its `finding_ids` resolves to the same decision, so a plan that
+cites a merge product by one of its non-primary IDs is accepted. Every kept
+concern is copied from the input unchanged, in input order, which makes the
+`locations`, `source_stages`, `source_models` and `finding_ids` carry-forward
+structural rather than instructed. Discards are logged with the evidence that
+disproved them; they were previously silent. Rejected plans are recorded in
+response-health statistics under `Stage 9 response assembly`.
 
 ## Stage 10. Verification and severity estimation
 This stage is dedicated to verification and severity estimation of the conflict-resolved concerns. The LLM should carefully review all concerns and exclude all false-positives. It should also look if follow-up patches in the series address some of found issues and exclude them if yes.

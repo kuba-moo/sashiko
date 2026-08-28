@@ -224,6 +224,34 @@ const STAGE8_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a compact JSON deduplicat
 
 const STAGE8_RESPONSE_ASSEMBLY_SOURCE: &str = "Stage 8 response assembly";
 
+/// Stage 9 decides which concerns survive, not how they are worded, so it
+/// returns a keep/discard partition of input IDs the way Stage 8 returns a
+/// merge plan. Re-emitting the concerns was the single most expensive thing the
+/// merge pipeline did: in the review that exhausted its output budget, Stage 9
+/// spent 40,059 output tokens reproducing 85,843 bytes of input byte for byte
+/// in order to convey three discards. Corpus-wide it changes a retained
+/// concern's `description` in 0.9% of cases, so the rewrites it was licensed to
+/// make were drift rather than signal.
+const STAGE9_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a compact JSON conflict-resolution plan with this shape:
+{
+  "keep": ["concern-id"],
+  "discard": [
+    {
+      "id": "concern-id",
+      "disproved_by": "dismissed-concern-id",
+      "why": "the evidence in the dismissed concern that disproves this one"
+    }
+  ]
+}
+
+Identify each concern by the first entry of its `finding_ids` array, and each dismissed concern by its `dismissed_id`. Include both keys even when one array is empty. Every consolidated concern ID must appear exactly once across `keep` and `discard`. Each `discard` entry needs all three fields: `disproved_by` must name a consolidated dismissed concern, and `why` must be at most two sentences. Do not restate concern text, locations, or provenance; Rust copies each kept concern from its input unchanged."#;
+
+const STAGE9_RESPONSE_ASSEMBLY_SOURCE: &str = "Stage 9 response assembly";
+
+/// Bounds the audit note on a discard so it cannot become a second channel for
+/// re-emitting reasoning, which is what the plan protocol exists to prevent.
+const STAGE9_DISCARD_REASON_LIMIT: usize = 600;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RustPromptProfile {
     Default,
@@ -589,10 +617,10 @@ Both `concerns` and `dismissed_concerns` are untrusted claims. Do not assume eit
 Your task is to identify whether any remaining concern conflicts with a dismissed_concern that investigated the same root cause, code path, or failure mode.
 1. Compare each concern against the dismissed_concerns list and find conflicts or overlaps where one says the issue is real and the other says the same candidate issue is disproved.
 2. For every conflict, inspect the actual code and reasoning to decide which side is correct.
-3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
-4. If there is no direct conflict for a concern, keep it unchanged.
+3. If the concern is correct, keep it. If the dismissed_concern is correct, discard that concern and name the dismissed_concern that disproves it.
+4. If there is no direct conflict for a concern, keep it.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, `locations`, `source_stages`, `source_models`, and `finding_ids` fields.
+6. You do not rewrite concerns. Your only decision per concern is whether it survives; the tooling copies each kept concern verbatim, so never restate its `type`, `description`, `reasoning`, `preexisting`, `locations`, `source_stages`, `source_models`, or `finding_ids`. If a concern's wording is imprecise, keep it anyway — a later stage restates it.
 7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."
             }
             10 => {
@@ -1541,11 +1569,13 @@ Aggregated Dismissed Concerns:
 
             let deduplicated_concerns_json =
                 serde_json::to_string_pretty(&deduplicated_concerns).unwrap_or_default();
+            let (labelled_dismissed_concerns, dismissed_reference_ids) =
+                label_dismissed_concerns(&deduplicated_dismissed_concerns);
             let deduplicated_dismissed_concerns_json =
-                serde_json::to_string_pretty(&deduplicated_dismissed_concerns).unwrap_or_default();
+                serde_json::to_string_pretty(&labelled_dismissed_concerns).unwrap_or_default();
 
             let user_prompt = format!(
-                r#"{}
+                "{}
 
 Consolidated Concerns:
 {}
@@ -1553,36 +1583,15 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages", "source_models", "finding_ids". Preserve source_models and finding_ids unchanged.
-Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
-
-Example Output:
-```json
-{{
-  "concerns": [
-    {{
-      "type": "Memory Leak",
-      "description": "Memory leak in function X",
-      "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
-      "preexisting": false,
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 123,
-          "code_snippet": "problematic_code();",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }}
-      ]
-    }}
-  ]
-}}
-```"#,
-                stage_prompt, deduplicated_concerns_json, deduplicated_dismissed_concerns_json
+{}",
+                stage_prompt,
+                deduplicated_concerns_json,
+                deduplicated_dismissed_concerns_json,
+                STAGE9_OUTPUT_INSTRUCTION,
             );
 
             let clean_user_prompt = format!(
-                r#"{}
+                "{}
 
 Consolidated Concerns:
 {}
@@ -1590,34 +1599,11 @@ Consolidated Concerns:
 Consolidated Dismissed Concerns:
 {}
 
-Return ONLY a JSON object with a 'concerns' array containing the remaining concerns after resolving conflicts. Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations", "source_stages", "source_models", "finding_ids". Preserve source_models and finding_ids unchanged.
-Preserve the most precise locations from the retained concerns. Do not invent line numbers; use null when exact values are unknown.
-
-Example Output:
-```json
-{{
-  "concerns": [
-    {{
-      "type": "Memory Leak",
-      "description": "Memory leak in function X",
-      "reasoning": "1. X is called.\n2. Y is allocated but not freed on error path.",
-      "preexisting": false,
-      "locations": [
-        {{
-          "file": "path/to/file.c",
-          "function_or_symbol": "function_name",
-          "line": 123,
-          "code_snippet": "problematic_code();",
-          "why_this_location_matters": "This is where the newly allocated resource is dropped on the error path."
-        }}
-      ]
-    }}
-  ]
-}}
-```"#,
+{}",
                 clean_stage_prompt,
                 deduplicated_concerns_json,
-                deduplicated_dismissed_concerns_json
+                deduplicated_dismissed_concerns_json,
+                STAGE9_OUTPUT_INSTRUCTION,
             );
 
             let stage_impl = create_stage(stage);
@@ -1630,18 +1616,22 @@ Example Output:
                 self.temperature,
                 self.context_tag.as_deref(),
             );
-            session.require_provenance(
+            // Materializing kept concerns from Rust's own copies makes the
+            // provenance carry-forward that require_provenance used to police
+            // structurally impossible to get wrong.
+            session.require_conflict_plan(
                 deduplicated_concerns
                     .as_array()
                     .cloned()
                     .unwrap_or_default(),
-                false,
-                "concerns",
-            );
+                dismissed_reference_ids,
+            )?;
             let provider = self.provider_for_budget(self.merge_budget.as_ref());
             let runner = SessionRunner::new(provider.as_ref())
                 .with_conversation_dump(self.conversation_dumper.clone(), format!("s{}", stage))
                 .with_budget(self.merge_budget.clone())
+                // The plan is small enough that a correction costs little, and
+                // Rust reports every problem in one message.
                 .with_max_validation_attempts(3)
                 .with_max_turns(self.max_interactions)
                 .with_turn_callback(move |turn, max_turns| {
@@ -1659,6 +1649,17 @@ Example Output:
             total_tokens_out += result.usage.completion_tokens as u32;
             total_tokens_cached += result.usage.cached_tokens.unwrap_or(0) as u32;
             self.global_history.extend(result.history);
+
+            // Discards used to be silent: a concern simply failed to reappear in
+            // the re-emitted list, with no record of what disproved it.
+            for discard in result.output["discarded"].as_array().into_iter().flatten() {
+                info!(
+                    "Stage 9 discarded concern {} as disproved by dismissed concern {}: {}",
+                    discard["id"].as_str().unwrap_or("?"),
+                    discard["disproved_by"].as_str().unwrap_or("?"),
+                    discard["why"].as_str().unwrap_or(""),
+                );
+            }
 
             conflict_resolved_concerns = result.output.get("concerns").unwrap().clone();
         }
@@ -3280,6 +3281,274 @@ fn format_deduplication_problems(problems: &[String]) -> String {
     message
 }
 
+/// Names the ID the rest of the pipeline treats as an item's stable identity:
+/// the first entry of `finding_ids`, which is what Stage 10's baseline decisions
+/// key on and what Stage 11 prints as `[Finding: <id>]`.
+fn primary_finding_id(item: &Value, label: &str, order: usize) -> Result<String> {
+    let ids = item
+        .get("finding_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{label} input {order} is missing finding_ids"))?;
+    let id = ids
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{label} input {order} has an empty finding_ids"))?
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} input {order} has a non-string finding ID"))?;
+    Ok(id.to_string())
+}
+
+/// Labels each consolidated dismissed concern for the Stage 9 prompt.
+///
+/// Stage 8 materializes dismissed concerns without provenance, so they reach
+/// Stage 9 carrying no ID at all. `disproved_by` needs something stable to cite,
+/// and a per-item label is less error-prone for a model to copy than an array
+/// index it has to count.
+fn label_dismissed_concerns(dismissed: &Value) -> (Value, BTreeSet<String>) {
+    let mut labelled = Vec::new();
+    let mut ids = BTreeSet::new();
+    for (index, item) in dismissed.as_array().into_iter().flatten().enumerate() {
+        let id = format!("d{}", index + 1);
+        ids.insert(id.clone());
+        match item {
+            Value::Object(object) => {
+                let mut object = object.clone();
+                object.insert("dismissed_id".to_string(), json!(id));
+                labelled.push(Value::Object(object));
+            }
+            other => labelled.push(other.clone()),
+        }
+    }
+    (json!(labelled), ids)
+}
+
+struct ConflictInputs {
+    /// Consolidated concerns keyed by primary finding ID.
+    concerns: BTreeMap<String, DeduplicationInputItem>,
+    /// Every finding ID any concern carries, mapped to that concern's primary
+    /// ID. Stage 8's merge products own several IDs, so a plan that cites one of
+    /// the others still resolves instead of costing a whole retry.
+    aliases: BTreeMap<String, String>,
+    /// Labels assigned by [`label_dismissed_concerns`].
+    dismissed_ids: BTreeSet<String>,
+}
+
+impl ConflictInputs {
+    fn new(concerns: Vec<Value>, dismissed_ids: BTreeSet<String>) -> Result<Self> {
+        let mut indexed = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
+        for (order, item) in concerns.into_iter().enumerate() {
+            let primary = primary_finding_id(&item, "concern", order)?;
+            for id in item["finding_ids"].as_array().into_iter().flatten() {
+                let id = id
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("concern input {order} has a non-string finding ID")
+                    })?
+                    .to_string();
+                if let Some(other) = aliases.insert(id.clone(), primary.clone())
+                    && other != primary
+                {
+                    anyhow::bail!("concern inputs contain duplicate finding ID {id}");
+                }
+            }
+            if indexed
+                .insert(
+                    primary.clone(),
+                    DeduplicationInputItem { value: item, order },
+                )
+                .is_some()
+            {
+                anyhow::bail!("concern inputs contain duplicate finding ID {primary}");
+            }
+        }
+        Ok(Self {
+            concerns: indexed,
+            aliases,
+            dismissed_ids,
+        })
+    }
+
+    /// Maps a plan ID onto the primary ID it identifies, or `None` when no input
+    /// claims it.
+    fn resolve(&self, id: &str) -> Option<&str> {
+        self.aliases.get(id).map(String::as_str)
+    }
+}
+
+#[derive(Default)]
+struct ConflictPlan {
+    /// Primary IDs of the concerns that survive, in plan order.
+    keep: Vec<String>,
+    discards: Vec<ConflictDiscard>,
+}
+
+struct ConflictDiscard {
+    id: String,
+    disproved_by: String,
+    why: String,
+}
+
+fn parse_conflict_discards(
+    value: Option<&Value>,
+    path: &str,
+    inputs: &ConflictInputs,
+    problems: &mut Vec<String>,
+) -> Vec<ConflictDiscard> {
+    let values = match value {
+        None => {
+            problems.push(format!("{path} is missing"));
+            &[][..]
+        }
+        Some(value) => match value.as_array() {
+            Some(values) => values.as_slice(),
+            None => {
+                problems.push(format!("{path} must be an array"));
+                &[][..]
+            }
+        },
+    };
+
+    let mut discards = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let Some(object) = value.as_object() else {
+            problems.push(format!("{item_path} must be an object"));
+            continue;
+        };
+        for key in object.keys() {
+            if !matches!(key.as_str(), "id" | "disproved_by" | "why") {
+                problems.push(format!("{item_path}.{key} is not an allowed field"));
+            }
+        }
+        let mut field = |name: &str| match object.get(name).and_then(Value::as_str) {
+            Some(text) => text.to_string(),
+            None => {
+                problems.push(format!("{item_path}.{name} must be a string"));
+                String::new()
+            }
+        };
+        let id = field("id");
+        let disproved_by = field("disproved_by");
+        let why = field("why");
+
+        if !disproved_by.is_empty() && !inputs.dismissed_ids.contains(&disproved_by) {
+            problems.push(format!(
+                "{item_path}.disproved_by must be the dismissed_id of a consolidated dismissed concern"
+            ));
+        }
+        if why.chars().count() > STAGE9_DISCARD_REASON_LIMIT {
+            problems.push(format!(
+                "{item_path}.why must be at most {STAGE9_DISCARD_REASON_LIMIT} characters"
+            ));
+        }
+        discards.push(ConflictDiscard {
+            id,
+            disproved_by,
+            why,
+        });
+    }
+    discards
+}
+
+/// Checks that a Stage 9 plan partitions the consolidated concerns exactly once
+/// each, mirroring the Stage 8 exhaustiveness rules so every input is decided
+/// deliberately rather than by omission.
+fn parse_conflict_plan(
+    plan: &Value,
+    inputs: &ConflictInputs,
+    problems: &mut Vec<String>,
+) -> ConflictPlan {
+    let Some(object) = plan.as_object() else {
+        problems.push("top-level response must be an object".to_string());
+        return ConflictPlan::default();
+    };
+    for key in object.keys() {
+        if !matches!(key.as_str(), "keep" | "discard") {
+            problems.push(format!("top-level field {key} is not allowed"));
+        }
+    }
+
+    let keep = string_list(object.get("keep"), "keep", problems);
+    let discards = parse_conflict_discards(object.get("discard"), "discard", inputs, problems);
+
+    let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for id in keep.iter().chain(discards.iter().map(|d| &d.id)) {
+        if id.is_empty() {
+            continue;
+        }
+        match inputs.resolve(id) {
+            Some(primary) => *occurrences.entry(primary).or_default() += 1,
+            None => unknown.push(id.as_str()),
+        }
+    }
+    if !unknown.is_empty() {
+        problems.push(format!("plan contains unknown IDs: {}", unknown.join(", ")));
+    }
+    let duplicates: Vec<&str> = occurrences
+        .iter()
+        .filter_map(|(id, count)| (*count > 1).then_some(*id))
+        .collect();
+    if !duplicates.is_empty() {
+        problems.push(format!(
+            "plan decides these concerns more than once: {}",
+            duplicates.join(", ")
+        ));
+    }
+    let missing: Vec<&str> = inputs
+        .concerns
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !occurrences.contains_key(id))
+        .collect();
+    if !missing.is_empty() {
+        problems.push(format!("plan omits these concerns: {}", missing.join(", ")));
+    }
+
+    ConflictPlan { keep, discards }
+}
+
+/// Copies each kept concern out of Rust's own inputs, in input order.
+///
+/// Nothing here reads the model's text, so `locations`, `source_stages`,
+/// `source_models` and `finding_ids` cannot drift.
+fn materialize_conflict_plan(plan: ConflictPlan, inputs: &ConflictInputs) -> Value {
+    let mut kept: Vec<&DeduplicationInputItem> = plan
+        .keep
+        .iter()
+        .filter_map(|id| inputs.resolve(id))
+        .filter_map(|primary| inputs.concerns.get(primary))
+        .collect();
+    kept.sort_by_key(|item| item.order);
+    json!({
+        "concerns": kept
+            .into_iter()
+            .map(|item| item.value.clone())
+            .collect::<Vec<Value>>(),
+        "discarded": plan
+            .discards
+            .into_iter()
+            .map(|discard| json!({
+                "id": inputs.resolve(&discard.id).unwrap_or(&discard.id),
+                "disproved_by": discard.disproved_by,
+                "why": discard.why,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+fn validate_and_materialize_conflict_plan(
+    plan: &Value,
+    inputs: &ConflictInputs,
+) -> std::result::Result<Value, Vec<String>> {
+    let mut problems = Vec::new();
+    let parsed = parse_conflict_plan(plan, inputs, &mut problems);
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(materialize_conflict_plan(parsed, inputs))
+}
+
 fn provenance_map(items: &[Value]) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
     let mut provenance = std::collections::BTreeMap::new();
     for item in items {
@@ -3783,8 +4052,10 @@ struct ReviewStageSession {
     required_provenance: Option<(Vec<Value>, bool, &'static str)>,
     required_experiment_findings: Option<Value>,
     required_deduplication_inputs: Option<DeduplicationInputs>,
+    required_conflict_inputs: Option<ConflictInputs>,
     pending_json_decode_error: Option<String>,
-    pending_stage8_assembly_error: Option<String>,
+    /// Health source and detail for a compact plan Rust refused to assemble.
+    pending_assembly_error: Option<(&'static str, String)>,
 }
 
 impl ReviewStageSession {
@@ -3819,8 +4090,9 @@ impl ReviewStageSession {
             required_provenance: None,
             required_experiment_findings: None,
             required_deduplication_inputs: None,
+            required_conflict_inputs: None,
             pending_json_decode_error: None,
-            pending_stage8_assembly_error: None,
+            pending_assembly_error: None,
         }
     }
 
@@ -3851,6 +4123,17 @@ impl ReviewStageSession {
         Ok(())
     }
 
+    /// Requires a Stage 9 keep/discard plan over `concerns`, whose kept entries
+    /// Rust materializes from these inputs.
+    fn require_conflict_plan(
+        &mut self,
+        concerns: Vec<Value>,
+        dismissed_ids: std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        self.required_conflict_inputs = Some(ConflictInputs::new(concerns, dismissed_ids)?);
+        Ok(())
+    }
+
     fn finish_response_health(&mut self, outcome: crate::json_health::JsonDecodeOutcome) {
         if let Some(error) = self.pending_json_decode_error.take() {
             crate::json_health::record(
@@ -3859,8 +4142,8 @@ impl ReviewStageSession {
                 &error,
             );
         }
-        if let Some(error) = self.pending_stage8_assembly_error.take() {
-            crate::json_health::record(STAGE8_RESPONSE_ASSEMBLY_SOURCE, outcome, &error);
+        if let Some((source, error)) = self.pending_assembly_error.take() {
+            crate::json_health::record(source, outcome, &error);
         }
     }
 }
@@ -3996,8 +4279,21 @@ impl LlmSession for ReviewStageSession {
                     Ok(materialized) => output = materialized,
                     Err(problems) => {
                         let violation = format_deduplication_problems(&problems);
-                        self.pending_stage8_assembly_error
-                            .get_or_insert_with(|| problems.join("; "));
+                        self.pending_assembly_error.get_or_insert_with(|| {
+                            (STAGE8_RESPONSE_ASSEMBLY_SOURCE, problems.join("; "))
+                        });
+                        return Err(ValidationError::FormatViolation(violation));
+                    }
+                }
+            }
+            if let Some(inputs) = &self.required_conflict_inputs {
+                match validate_and_materialize_conflict_plan(&output, inputs) {
+                    Ok(materialized) => output = materialized,
+                    Err(problems) => {
+                        let violation = format_deduplication_problems(&problems);
+                        self.pending_assembly_error.get_or_insert_with(|| {
+                            (STAGE9_RESPONSE_ASSEMBLY_SOURCE, problems.join("; "))
+                        });
                         return Err(ValidationError::FormatViolation(violation));
                     }
                 }
@@ -4497,6 +4793,243 @@ mod tests {
             events[0].outcome,
             crate::json_health::JsonDecodeOutcome::Fatal
         );
+    }
+
+    /// Builds a concern in the shape Stage 8 materializes, which is what Stage 9
+    /// receives: several finding IDs when the concern is a merge product.
+    fn conflict_test_concern(ids: &[&str], stages: &[u64], description: &str) -> Value {
+        json!({
+            "type": "Logic",
+            "description": description,
+            "reasoning": format!("reasoning for {description}"),
+            "preexisting": false,
+            "locations": [{"file": format!("{}.c", ids[0])}],
+            "source_stages": stages,
+            "source_models": ["main", "variant"],
+            "finding_ids": ids,
+        })
+    }
+
+    #[test]
+    fn dismissed_concerns_are_labelled_for_citation() {
+        // Stage 8 materializes dismissed concerns without finding_ids, so the
+        // label is the only thing a discard can point at.
+        let (labelled, ids) = label_dismissed_concerns(&json!([
+            {"type": "Logic", "description": "first"},
+            {"type": "Logic", "description": "second"},
+        ]));
+
+        assert_eq!(labelled[0]["dismissed_id"], "d1");
+        assert_eq!(labelled[1]["dismissed_id"], "d2");
+        assert_eq!(labelled[1]["description"], "second");
+        assert_eq!(ids, BTreeSet::from(["d1".to_string(), "d2".to_string()]));
+    }
+
+    #[test]
+    fn stage_nine_accepts_what_stage_eight_materializes() {
+        let dedup_inputs = DeduplicationInputs::new(
+            vec![
+                deduplication_test_item("a", 1, "main", "solo concern", false, "a.c"),
+                deduplication_test_item("b", 3, "main", "merged concern", false, "b.c"),
+                deduplication_test_item("c", 4, "variant", "duplicate", false, "c.c"),
+            ],
+            vec![deduplication_test_item(
+                "d",
+                5,
+                "main",
+                "dismissed",
+                false,
+                "d.c",
+            )],
+        )
+        .unwrap();
+        let stage8 = validate_and_materialize_deduplication_plan(
+            &json!({
+                "concerns": {"keep": ["a"], "merge": [{"ids": ["b", "c"], "base": "b"}]},
+                "dismissed_concerns": {"keep": ["d"], "merge": []}
+            }),
+            &dedup_inputs,
+        )
+        .unwrap();
+
+        // Stage 8 materializes dismissed concerns without provenance, which is
+        // why Stage 9 labels them rather than citing their finding IDs.
+        assert!(stage8["dismissed_concerns"][0].get("finding_ids").is_none());
+        let (_, dismissed_ids) = label_dismissed_concerns(&stage8["dismissed_concerns"]);
+
+        let inputs = ConflictInputs::new(
+            stage8["concerns"].as_array().cloned().unwrap(),
+            dismissed_ids,
+        )
+        .unwrap();
+        let output = validate_and_materialize_conflict_plan(
+            &json!({
+                "keep": ["a"],
+                "discard": [{"id": "b", "disproved_by": "d1", "why": "disproved"}]
+            }),
+            &inputs,
+        )
+        .unwrap();
+
+        assert_eq!(output["concerns"], json!([stage8["concerns"][0]]));
+        assert_eq!(output["discarded"][0]["id"], "b");
+    }
+
+    #[test]
+    fn compact_conflict_plan_keeps_concerns_byte_for_byte() {
+        let first = conflict_test_concern(&["a"], &[1], "keep this");
+        let merged = conflict_test_concern(&["b", "c"], &[3, 4], "merged concern");
+        let inputs = ConflictInputs::new(
+            vec![
+                first.clone(),
+                merged.clone(),
+                conflict_test_concern(&["e"], &[5], "disproved concern"),
+            ],
+            BTreeSet::from(["d1".to_string(), "d2".to_string()]),
+        )
+        .unwrap();
+        let plan = json!({
+            // Out of input order, and citing the merged concern by its second ID.
+            "keep": ["c", "a"],
+            "discard": [{
+                "id": "e",
+                "disproved_by": "d2",
+                "why": "the dismissed concern shows the caller already holds the lock"
+            }]
+        });
+
+        let output = validate_and_materialize_conflict_plan(&plan, &inputs).unwrap();
+
+        // Input order is restored and every field is the input's own, so
+        // locations and provenance cannot drift.
+        assert_eq!(output["concerns"], json!([first, merged]));
+        assert_eq!(
+            output["discarded"],
+            json!([{
+                "id": "e",
+                "disproved_by": "d2",
+                "why": "the dismissed concern shows the caller already holds the lock"
+            }])
+        );
+    }
+
+    #[test]
+    fn compact_conflict_plan_validation_reports_all_detected_problems() {
+        let inputs = ConflictInputs::new(
+            vec![
+                conflict_test_concern(&["a"], &[1], "a"),
+                conflict_test_concern(&["b"], &[2], "b"),
+                conflict_test_concern(&["c"], &[3], "c"),
+            ],
+            BTreeSet::from(["d1".to_string()]),
+        )
+        .unwrap();
+        let plan = json!({
+            "unexpected": true,
+            "keep": ["a", "a", "unknown"],
+            "discard": [{
+                "id": "b",
+                "disproved_by": "d9",
+                "why": "x".repeat(STAGE9_DISCARD_REASON_LIMIT + 1),
+                "reasoning": "restating the concern here is what this protocol exists to prevent"
+            }]
+        });
+
+        let problems = validate_and_materialize_conflict_plan(&plan, &inputs).unwrap_err();
+        let message = format_deduplication_problems(&problems);
+        for expected in [
+            "top-level field unexpected is not allowed",
+            "discard[0].reasoning is not an allowed field",
+            "discard[0].disproved_by must be the dismissed_id",
+            "discard[0].why must be at most 600 characters",
+            "plan contains unknown IDs: unknown",
+            "plan decides these concerns more than once: a",
+            "plan omits these concerns: c",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing problem: {expected}\n{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_nine_session_returns_materialized_concerns() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = ReviewStageSession::new(
+            create_stage(9),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            0.0,
+            None,
+        );
+        session
+            .require_conflict_plan(
+                vec![conflict_test_concern(&["a"], &[1], "unchanged")],
+                BTreeSet::from(["d1".to_string()]),
+            )
+            .unwrap();
+
+        let output = session
+            .validate(&stage_test_response(r#"{"keep": ["a"], "discard": []}"#))
+            .unwrap();
+
+        assert_eq!(output["concerns"][0]["description"], "unchanged");
+        assert_eq!(output["concerns"][0]["source_stages"], json!([1]));
+        assert_eq!(
+            output["concerns"][0]["source_models"],
+            json!(["main", "variant"])
+        );
+        assert_eq!(output["concerns"][0]["finding_ids"], json!(["a"]));
+        assert!(output["discarded"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovered_stage_nine_assembly_error_is_recorded() {
+        let _guard = crate::json_health::TEST_GUARD.blocking_lock();
+        crate::json_health::drain();
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = ReviewStageSession::new(
+            create_stage(9),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(ToolBox::new(temp.path().to_path_buf(), None)),
+            0.0,
+            None,
+        );
+        session
+            .require_conflict_plan(
+                vec![conflict_test_concern(&["a"], &[1], "unchanged")],
+                BTreeSet::from(["d1".to_string()]),
+            )
+            .unwrap();
+
+        // A discard with nothing to disprove it must not silently drop a concern.
+        assert!(
+            session
+                .validate(&stage_test_response(
+                    r#"{"keep": [], "discard": [{"id": "a", "disproved_by": "d4", "why": "no"}]}"#,
+                ))
+                .is_err()
+        );
+        assert!(
+            session
+                .validate(&stage_test_response(r#"{"keep": ["a"], "discard": []}"#,))
+                .is_ok()
+        );
+        drop(session);
+
+        let events = crate::json_health::drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, STAGE9_RESPONSE_ASSEMBLY_SOURCE);
+        assert_eq!(
+            events[0].outcome,
+            crate::json_health::JsonDecodeOutcome::RecoveredOnRetry
+        );
+        assert!(events[0].detail.contains("disproved_by"));
     }
 
     #[test]

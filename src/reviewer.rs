@@ -1593,7 +1593,14 @@ impl Reviewer {
 
             let review_id = if let Some(id) = ctx
                 .db
-                .get_pending_review_id(patchset_id, Some(patch_id))
+                .take_pending_review(
+                    patchset_id,
+                    Some(patch_id),
+                    &ctx.settings.ai.provider,
+                    &ctx.settings.ai.model,
+                    baseline_id,
+                    prompts_hash,
+                )
                 .await?
             {
                 id
@@ -1632,7 +1639,14 @@ impl Reviewer {
 
         let mut existing_pending_review_id = ctx
             .db
-            .get_pending_review_id(patchset_id, Some(patch_id))
+            .take_pending_review(
+                patchset_id,
+                Some(patch_id),
+                &ctx.settings.ai.provider,
+                &ctx.settings.ai.model,
+                baseline_id,
+                prompts_hash,
+            )
             .await?;
 
         loop {

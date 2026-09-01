@@ -1027,10 +1027,24 @@ impl Database {
         Ok(lists)
     }
 
-    pub async fn get_pending_review_id(
+    /// Adopt the Pending review row for this patch, if one is left over from an
+    /// earlier attempt, and re-stamp it for the run adopting it.
+    ///
+    /// `complete_review` only writes the result columns, so the provenance a row
+    /// carries is whatever `create_review` stamped on it. Adopting a row without
+    /// re-stamping would file the new review under the old attempt's model,
+    /// provider, baseline and start time -- and rows can outlive the run that
+    /// made them by months, since `reset_reviewing_status` flips an interrupted
+    /// review back to Pending and nothing closes it if the patchset then fails.
+    /// Refreshing here keeps an adopted row indistinguishable from a fresh one.
+    pub async fn take_pending_review(
         &self,
         patchset_id: i64,
         patch_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
     ) -> Result<Option<i64>> {
         let mut rows = match patch_id {
             Some(pid) => {
@@ -1040,11 +1054,28 @@ impl Database {
                 self.conn.query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id IS NULL AND status = 'Pending' LIMIT 1", libsql::params![patchset_id]).await?
             }
         };
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
+        let Ok(Some(row)) = rows.next().await else {
+            return Ok(None);
+        };
+        let review_id: i64 = row.get(0)?;
+
+        self.conn
+            .execute(
+                "UPDATE reviews SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?, created_at = ? WHERE id = ?",
+                libsql::params![
+                    provider,
+                    model,
+                    baseline_id,
+                    prompts_hash,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs() as i64,
+                    review_id
+                ],
+            )
+            .await?;
+
+        Ok(Some(review_id))
     }
 
     pub async fn create_review(
@@ -9412,6 +9443,92 @@ mod tests {
         let cached: u32 = row.get(0).unwrap();
 
         assert_eq!(cached, 25);
+    }
+
+    #[tokio::test]
+    async fn take_pending_review_restamps_an_adopted_row() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO patchsets (id, thread_id) VALUES (1, 1);
+                 INSERT INTO messages (message_id, thread_id) VALUES ('p1', 1);
+                 INSERT INTO patches (id, patchset_id, message_id, part_index)
+                    VALUES (1, 1, 'p1', 1);
+                 INSERT INTO baselines (id) VALUES (7), (9);",
+            )
+            .await
+            .unwrap();
+
+        // An attempt from an earlier run that was interrupted and reset to
+        // Pending by reset_reviewing_status, months ago.
+        let review_id = db
+            .create_review(1, Some(1), "bedrock", "opus-4-7", Some(7), Some("old-hash"))
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = unixepoch('now', '-120 days') WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+
+        let adopted = db
+            .take_pending_review(1, Some(1), "anthropic", "opus-5", Some(9), Some("new-hash"))
+            .await
+            .unwrap();
+        assert_eq!(adopted, Some(review_id), "the Pending row is reused");
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT provider, model, baseline_id, prompts_hash, status,
+                        created_at > unixepoch('now', '-1 day')
+                 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "anthropic");
+        assert_eq!(row.get::<String>(1).unwrap(), "opus-5");
+        assert_eq!(row.get::<i64>(2).unwrap(), 9);
+        assert_eq!(row.get::<String>(3).unwrap(), "new-hash");
+        assert_eq!(row.get::<String>(4).unwrap(), "Pending");
+        assert_eq!(row.get::<i64>(5).unwrap(), 1, "created_at is refreshed");
+
+        // Once the row reaches a terminal state it is no longer adoptable, so a
+        // later run cannot overwrite a finished review's provenance.
+        db.complete_review(
+            review_id,
+            ReviewStatus::Reviewed.as_str(),
+            "done",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.take_pending_review(1, Some(1), "other", "other-model", None, None)
+                .await
+                .unwrap(),
+            None
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT provider, model FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "anthropic");
+        assert_eq!(row.get::<String>(1).unwrap(), "opus-5");
     }
 
     #[tokio::test]

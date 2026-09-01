@@ -458,6 +458,55 @@ mod tests {
     }
 
     #[test]
+    fn test_git_read_files_empty_file_with_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path();
+
+        std::fs::write(repo_path.join("empty.c"), "").unwrap();
+        for args in [
+            vec!["init"],
+            vec!["add", "empty.c"],
+            vec![
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "empty",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(repo_path)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?} failed", args);
+        }
+
+        let toolbox = ToolBox::new(repo_path.to_path_buf(), None);
+        let rt = Runtime::new().unwrap();
+
+        // A line range against a zero-line file used to panic the review binary
+        // in the clamp of start_line.
+        let args = json!({
+            "revision": "HEAD",
+            "files": [
+                { "path": "empty.c", "start_line": 1, "end_line": 40 }
+            ]
+        });
+        let result = rt.block_on(toolbox.call("git_read_files", args)).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+
+        let res = &results[0];
+        assert!(res["error"].is_null(), "unexpected error: {}", res["error"]);
+        assert_eq!(res["content"].as_str(), Some(""));
+        assert_eq!(res["total_lines"].as_u64(), Some(0));
+        assert_eq!(res["metadata"]["returned_items"].as_u64(), Some(0));
+    }
+
+    #[test]
     fn test_git_show_truncation() {
         let (linux_path, _prompts_path) = get_test_paths();
         let toolbox = ToolBox::new(linux_path, None);

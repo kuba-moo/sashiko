@@ -1051,7 +1051,18 @@ impl Reviewer {
                                 .await
                                 {
                                     Ok(PatchResult::Success) => {}
-                                    _ => failed += 1,
+                                    Ok(PatchResult::ReviewFailed) => failed += 1,
+                                    Err(error) => {
+                                        // Every ReviewFailed above has already
+                                        // logged and left a Failed review row.
+                                        // An Err writes nothing anywhere, so
+                                        // this line is the only record of it.
+                                        error!(
+                                            "Review of patch {}/{} (ID: {}) failed: {:#}",
+                                            patchset_id, job.index, job.patch_id, error
+                                        );
+                                        failed += 1;
+                                    }
                                 }
                             } else {
                                 break;
@@ -1098,7 +1109,14 @@ impl Reviewer {
                     .await
                     {
                         Ok(PatchResult::Success) => {}
-                        _ => main_failed += 1,
+                        Ok(PatchResult::ReviewFailed) => main_failed += 1,
+                        Err(error) => {
+                            error!(
+                                "Review of patch {}/{} (ID: {}) failed: {:#}",
+                                patchset_id, job.index, job.patch_id, error
+                            );
+                            main_failed += 1;
+                        }
                     }
                 } else {
                     break;

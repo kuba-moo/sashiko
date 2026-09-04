@@ -60,6 +60,7 @@ from pathlib import Path
 
 # Anthropic list prices, $/Mtok of input and output.  Bedrock tracks these.
 BASE_RATES = {
+    "fable-5-1": (10.0, 50.0),
     "fable-5": (10.0, 50.0),
     "opus-5": (5.0, 25.0),
     "opus-4-8": (5.0, 25.0),

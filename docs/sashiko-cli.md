@@ -152,6 +152,37 @@ sashiko-cli cancel [OPTIONS] <ID>
 |------|-------------|
 | `-f, --force` | Force cancel even if the review is already in progress. |
 
+### lift-embargo
+
+Lift the embargo on a patchset, publishing its findings ahead of the
+`embargo_hours` policy window (see [configuration](configuration.md#embargo))
+or of the dynamic release schedule.
+
+```
+sashiko-cli lift-embargo <ID>
+```
+
+`ID` is a patchset ID, slug, or the message-ID of the cover letter or of any
+patch in the series -- the same keys `show` accepts.
+
+```bash
+sashiko-cli lift-embargo 5227
+sashiko-cli lift-embargo 20260831025441.635045-7-wei.fang@oss.nxp.com
+```
+
+The daemon does not publish on the spot: it brings the release time forward and
+the reviewer loop performs the release on its next pass, roughly ten seconds
+later, queueing the review emails, clearing the embargo and enqueueing any
+cross-reviews. A patchset whose review has not finished yet publishes as soon
+as it does.
+
+Embargo is a property of the patchset, so this releases the findings for every
+patch in the series; there is no per-patch lift. The command reports
+`Not modified` for a patchset that is not embargoed or whose window has already
+lapsed. It requires the same access as `cancel` and `rerun`: the request must
+come from loopback, unless the daemon was started with
+`--enable-unsafe-all-submit`, and a read-only daemon refuses it outright.
+
 ### local
 
 Run a local review without requiring a running daemon, database, or network

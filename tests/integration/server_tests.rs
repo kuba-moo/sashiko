@@ -573,3 +573,160 @@ async fn test_review_endpoint_returns_logs() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["logs"].as_str().unwrap(), logs_json);
 }
+
+// ── Embargo Tests ────────────────────────────────────────────────────────
+
+/// Far enough out that the handler's real clock always sees it as pending.
+const FUTURE_EMBARGO: i64 = 4_102_444_800; // 2100-01-01
+
+/// Seeds one embargoed, reviewed patchset with a cover letter and one patch.
+async fn seed_embargoed_patchset(db: &Arc<Database>, embargo_until: Option<i64>) {
+    let until = match embargo_until {
+        Some(until) => until.to_string(),
+        None => "NULL".to_string(),
+    };
+    // Messages first: patchsets and patches both carry a foreign key into them.
+    db.conn
+        .execute(
+            "INSERT INTO messages (message_id, subject, author, date) VALUES \
+               ('cover@example.com', '[PATCH 0/1] test series', 'Author <a@b.com>', 1234567890), \
+               ('part1@example.com', '[PATCH 1/1] test patch', 'Author <a@b.com>', 1234567890)",
+            (),
+        )
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            &format!(
+                "INSERT INTO patchsets \
+                   (id, status, subject, author, date, cover_letter_message_id, embargo_until) \
+                 VALUES (1, 'Reviewed', '[PATCH 0/1] test series', 'Author <a@b.com>', \
+                         1234567890, 'cover@example.com', {until})"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO patches (id, patchset_id, message_id, part_index) \
+             VALUES (1, 1, 'part1@example.com', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+}
+
+async fn stored_embargo_until(db: &Arc<Database>, id: i64) -> Option<i64> {
+    let mut rows = db
+        .conn
+        .query(
+            "SELECT embargo_until FROM patchsets WHERE id = ?",
+            libsql::params![id],
+        )
+        .await
+        .unwrap();
+    rows.next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<Option<i64>>(0)
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lift_embargo_by_patch_message_id() {
+    let server = spawn_test_server(false).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    // A message-ID from inside the series, not the cover letter: that is what
+    // an operator has at hand when reading the list.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift?id=part1@example.com",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "lifted");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["patchset_status"], "Reviewed");
+    assert_eq!(body["was_embargoed_until"], FUTURE_EMBARGO);
+
+    // Due, but still set: the release path only finds rows that hold a
+    // non-NULL release time.
+    let until = stored_embargo_until(&server.db, 1).await.unwrap();
+    assert!(until < FUTURE_EMBARGO);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lift_embargo_reports_unembargoed_patchset() {
+    let server = spawn_test_server(false).await;
+    seed_embargoed_patchset(&server.db, None).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift?id=1",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "not_modified");
+    assert!(body["reason"].as_str().unwrap().contains("not embargoed"));
+    assert_eq!(stored_embargo_until(&server.db, 1).await, None);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lift_embargo_unknown_patchset_is_not_found() {
+    let server = spawn_test_server(false).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift?id=absent@example.com",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lift_embargo_rejected_in_read_only_mode() {
+    let server = spawn_test_server(/* read_only */ true).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift?id=1",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        stored_embargo_until(&server.db, 1).await,
+        Some(FUTURE_EMBARGO)
+    );
+}

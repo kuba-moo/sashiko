@@ -143,6 +143,29 @@ pub enum PatchsetReviewOutcome {
     Incomplete,
 }
 
+/// Outcome of a manual embargo lift. The no-op cases are kept apart so the
+/// caller can say which one it hit instead of reporting a silent success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbargoLift {
+    /// The release time was moved into the past; the reviewer loop's release
+    /// stage publishes the findings on its next pass.
+    Lifted {
+        /// Release time the patchset had been holding until.
+        was_until: i64,
+        /// Patchset status, which decides whether the release stage acts now
+        /// (`Reviewed`) or only once the review finishes.
+        status: String,
+    },
+    /// The release time had already passed, so a release is already due.
+    AlreadyDue {
+        status: String,
+    },
+    /// The patchset carries no embargo: either it never had one, or it has
+    /// already been released.
+    NotEmbargoed,
+    NotFound,
+}
+
 /// How long an embargo release claim (`embargo_release_started_at`) is honoured
 /// before it is treated as abandoned and the patchset becomes eligible again.
 const EMBARGO_RELEASE_CLAIM_STALE_SECS: i64 = 600;
@@ -6145,6 +6168,98 @@ impl Database {
         Ok(updated == 1)
     }
 
+    /// Brings an embargo's release time forward so the reviewer loop releases
+    /// the patchset on its next pass, as an operator override of the policy or
+    /// schedule window.
+    ///
+    /// Moves `embargo_until` into the past rather than clearing it: both
+    /// [`Self::get_releasable_embargoed_patchsets`] and
+    /// [`Self::claim_patchset_embargo_release`] require a non-NULL value, so a
+    /// NULL here would leave the patchset looking released everywhere while its
+    /// notifications were never queued.
+    ///
+    /// `embargo_release_started_at` is deliberately left alone. A live claim
+    /// means the release path is already queueing notifications and clearing it
+    /// would let a second pass queue them again; a claim old enough to be
+    /// abandoned does not hold the release back in the first place.
+    pub async fn lift_patchset_embargo(&self, id: i64, now: i64) -> Result<EmbargoLift> {
+        // Read first, so a patchset that does not exist is distinguishable from
+        // one that carries no embargo. The UPDATE stays guarded, so a release
+        // landing in between just turns this into a no-op.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status, embargo_until FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(EmbargoLift::NotFound);
+        };
+        let status: String = row.get(0).unwrap_or_default();
+        let Some(was_until) = row.get::<Option<i64>>(1)? else {
+            return Ok(EmbargoLift::NotEmbargoed);
+        };
+        if was_until <= now {
+            return Ok(EmbargoLift::AlreadyDue { status });
+        }
+
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE patchsets SET embargo_until = ?
+                 WHERE id = ? AND embargo_until IS NOT NULL",
+                libsql::params![now - 1, id],
+            )
+            .await?;
+        if updated == 1 {
+            Ok(EmbargoLift::Lifted { was_until, status })
+        } else {
+            Ok(EmbargoLift::NotEmbargoed)
+        }
+    }
+
+    /// Resolves the patchset keys the API accepts — numeric id, slug, or the
+    /// message-ID of the cover letter or of any patch in the series — to a
+    /// patchset id.
+    ///
+    /// Key shapes are told apart the way `/api/patch` tells them apart, so the
+    /// same key that displays a patchset also acts on it.
+    pub async fn resolve_patchset_id(&self, key: &str) -> Result<Option<i64>> {
+        if let Ok(id) = key.parse::<i64>() {
+            let mut rows = self
+                .conn
+                .query("SELECT id FROM patchsets WHERE id = ?", libsql::params![id])
+                .await?;
+            return Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()));
+        }
+
+        if key.contains('-') && !key.contains('@') {
+            return self
+                .first_patchset_id("SELECT id FROM patchsets WHERE slug = ?", key)
+                .await;
+        }
+
+        // Cover letter first, then any patch in the series, so a message-ID
+        // copied from the middle of a series still resolves.
+        if let Some(id) = self
+            .first_patchset_id(
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
+                key,
+            )
+            .await?
+        {
+            return Ok(Some(id));
+        }
+        self.first_patchset_id("SELECT patchset_id FROM patches WHERE message_id = ?", key)
+            .await
+    }
+
+    async fn first_patchset_id(&self, sql: &str, key: &str) -> Result<Option<i64>> {
+        let mut rows = self.conn.query(sql, libsql::params![key]).await?;
+        Ok(rows.next().await?.and_then(|row| row.get::<i64>(0).ok()))
+    }
+
     pub async fn get_completed_reviews_for_release(
         &self,
         patchset_id: i64,
@@ -8586,6 +8701,134 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(embargo_until(5).await, Some(target));
+    }
+
+    /// Reads the embargo columns of one patchset.
+    async fn embargo_columns(db: &Arc<Database>, id: i64) -> (Option<i64>, Option<i64>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT embargo_until, embargo_release_started_at FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get::<Option<i64>>(0).unwrap(),
+            row.get::<Option<i64>>(1).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lifted_embargo_becomes_releasable_without_being_cleared() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        assert_eq!(
+            db.lift_patchset_embargo(1, now).await.unwrap(),
+            EmbargoLift::Lifted {
+                was_until: now + 3600,
+                status: "Reviewed".to_string(),
+            }
+        );
+
+        // Past, not NULL: the release path keys on a non-NULL value, so
+        // clearing it here would strand the notifications.
+        assert_eq!(embargo_columns(&db, 1).await, (Some(now - 1), None));
+        let releasable: Vec<i64> = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|patchset| patchset.id)
+            .collect();
+        assert!(releasable.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn lift_embargo_names_the_rows_it_leaves_alone() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        // Already released: there is no embargo left to lift.
+        assert_eq!(
+            db.lift_patchset_embargo(3, now).await.unwrap(),
+            EmbargoLift::NotEmbargoed
+        );
+        assert_eq!(embargo_columns(&db, 3).await, (None, None));
+
+        // Window already lapsed, so the release stage owns it either way.
+        assert_eq!(
+            db.lift_patchset_embargo(2, now).await.unwrap(),
+            EmbargoLift::AlreadyDue {
+                status: "In Review".to_string(),
+            }
+        );
+        assert_eq!(embargo_columns(&db, 2).await, (Some(now - 3600), None));
+
+        assert_eq!(
+            db.lift_patchset_embargo(404, now).await.unwrap(),
+            EmbargoLift::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn lift_embargo_leaves_a_release_claim_in_place() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+
+        assert!(matches!(
+            db.lift_patchset_embargo(4, now).await.unwrap(),
+            EmbargoLift::Lifted { .. }
+        ));
+
+        // Clearing the claim would let a second pass queue the notifications
+        // the in-flight release is already queueing.
+        assert_eq!(embargo_columns(&db, 4).await, (Some(now - 1), Some(now)));
+        let releasable: Vec<i64> = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|patchset| patchset.id)
+            .collect();
+        assert!(!releasable.contains(&4));
+    }
+
+    #[tokio::test]
+    async fn resolve_patchset_id_accepts_every_key_form() {
+        let now = 1_787_000_000;
+        let db = setup_dynamic_embargo_db(now).await;
+        db.conn
+            .execute_batch(&format!(
+                "UPDATE patchsets SET slug = 'linux-42' WHERE id = 1;
+                 INSERT INTO messages (message_id, thread_id, date)
+                    VALUES ('part2@example.com', 1, {now});
+                 INSERT INTO patches (id, patchset_id, message_id, part_index)
+                    VALUES (1, 1, 'part2@example.com', 2);"
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(db.resolve_patchset_id("1").await.unwrap(), Some(1));
+        assert_eq!(db.resolve_patchset_id("linux-42").await.unwrap(), Some(1));
+        assert_eq!(
+            db.resolve_patchset_id("future@example.com").await.unwrap(),
+            Some(1)
+        );
+        // A message-ID from the middle of a series, not its cover letter.
+        assert_eq!(
+            db.resolve_patchset_id("part2@example.com").await.unwrap(),
+            Some(1)
+        );
+
+        assert_eq!(db.resolve_patchset_id("999").await.unwrap(), None);
+        assert_eq!(db.resolve_patchset_id("linux-99").await.unwrap(), None);
+        assert_eq!(
+            db.resolve_patchset_id("absent@example.com").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

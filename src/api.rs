@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db::Database;
+use crate::db::{Database, EmbargoLift};
 use crate::events::Event;
 use crate::fetcher::FetchRequest;
 use axum::{
@@ -264,6 +264,12 @@ pub struct CancelQuery {
 }
 
 #[derive(Deserialize)]
+pub struct EmbargoLiftQuery {
+    /// Patchset id, slug, or message-ID, as accepted by `/api/patch`.
+    pub id: String,
+}
+
+#[derive(Deserialize)]
 pub struct InjectRequest {
     pub raw: String,
     pub group: Option<String>,
@@ -389,6 +395,7 @@ pub fn build_router(
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
+        .route("/api/patchset/embargo/lift", post(lift_patchset_embargo))
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -1362,6 +1369,72 @@ async fn cancel_patchset(
             "status": "not_modified",
             "reason": reason
         })))
+    }
+}
+
+/// Lifts a patchset's embargo, publishing its findings ahead of the policy or
+/// schedule window.
+///
+/// The release itself stays with the reviewer loop, which queues the
+/// notifications, clears the embargo and enqueues cross-reviews. This handler
+/// only brings the release time forward, so a lift takes effect on the loop's
+/// next pass rather than immediately.
+async fn lift_patchset_embargo(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EmbargoLiftQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let id = state
+        .db
+        .resolve_patchset_id(&query.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to resolve patchset {}: {}", query.id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let now = chrono::Utc::now().timestamp();
+    let outcome = state.db.lift_patchset_embargo(id, now).await.map_err(|e| {
+        error!("Failed to lift embargo for patchset {}: {}", id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match outcome {
+        EmbargoLift::Lifted { was_until, status } => {
+            info!(
+                "Embargo for patchset {} lifted by request (was held until {})",
+                id, was_until
+            );
+            Ok(Json(serde_json::json!({
+                "status": "lifted",
+                "id": id,
+                "patchset_status": status,
+                "was_embargoed_until": was_until,
+            })))
+        }
+        EmbargoLift::AlreadyDue { status } => Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "id": id,
+            "patchset_status": status,
+            "reason": "Embargo has already expired; the release is pending",
+        }))),
+        EmbargoLift::NotEmbargoed => Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "id": id,
+            "reason": "Patchset is not embargoed",
+        }))),
+        // resolve_patchset_id found the row, so this is a delete racing the
+        // lift rather than a bad key.
+        EmbargoLift::NotFound => Err(StatusCode::NOT_FOUND),
     }
 }
 

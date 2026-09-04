@@ -162,6 +162,11 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
+    /// Lift the embargo on a patchset, publishing its findings early
+    LiftEmbargo {
+        /// Patchset ID, slug, or message-ID of the cover letter or any patch
+        id: String,
+    },
     /// Run a local review (or queue to running server)
     Local {
         /// Git revision, range (e.g. HEAD~3..HEAD), or commit SHA
@@ -318,6 +323,7 @@ async fn run_command(
         }
         Commands::Rerun { id } => handle_rerun(client, base_url, id, format).await,
         Commands::Cancel { id, force } => handle_cancel(client, base_url, id, force, format).await,
+        Commands::LiftEmbargo { id } => handle_lift_embargo(client, base_url, id, format).await,
         Commands::Local {
             input,
             baseline,
@@ -1409,6 +1415,75 @@ async fn handle_cancel(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow::anyhow!("Cancel failed ({}): {}", status, text));
+    }
+
+    Ok(())
+}
+
+async fn handle_lift_embargo(
+    client: &Client,
+    base_url: &str,
+    id: String,
+    format: OutputFormat,
+) -> Result<()> {
+    // Message-IDs are accepted here, and their local part can carry characters
+    // that a query string reads as separators.
+    const QUERY_VALUE_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b'&')
+        .add(b'+')
+        .add(b'=')
+        .add(b'#')
+        .add(b' ')
+        .add(b'%');
+    let key = percent_encoding::utf8_percent_encode(
+        id.trim_matches(|c| c == '<' || c == '>'),
+        QUERY_VALUE_ENCODE,
+    );
+    let url = format!("{}/api/patchset/embargo/lift?id={}", base_url, key);
+    let resp = client.post(&url).send().await?;
+
+    if resp.status().is_success() {
+        let result: serde_json::Value = resp.json().await?;
+        match format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            OutputFormat::Text => {
+                let patchset = result["id"].as_i64().unwrap_or_default();
+                if result["status"].as_str() == Some("lifted") {
+                    print_colored(Color::Green, "Embargo lifted: ");
+                    // The reviewer loop owns the release, so nothing has been
+                    // published yet in either case.
+                    if result["patchset_status"].as_str() == Some("Reviewed") {
+                        println!(
+                            "Patchset {} publishes on the next reviewer pass (~10s).",
+                            patchset
+                        );
+                    } else {
+                        println!(
+                            "Patchset {} publishes as soon as its review completes.",
+                            patchset
+                        );
+                    }
+                } else {
+                    print_colored(Color::Yellow, "Not modified: ");
+                    println!(
+                        "{}",
+                        result["reason"]
+                            .as_str()
+                            .unwrap_or("Embargo could not be lifted.")
+                    );
+                }
+            }
+        }
+    } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow::anyhow!("No patchset matches '{}'", id));
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Embargo lift failed ({}): {}",
+            status,
+            text
+        ));
     }
 
     Ok(())

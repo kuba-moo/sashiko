@@ -726,26 +726,35 @@ impl Reviewer {
         // peer job exists. The clean predicate counts every finding on the series,
         // imported ones included, so enqueueing first would let a fast merge race
         // the fast path.
-        if patchset.embargo_until.is_some()
-            && let Err(e) = Self::release_patchset_results(ctx, patchset).await
-        {
-            error!(
-                "Failed to release clean patchset {} immediately: {}",
-                patchset.id, e
-            );
+        let mut enqueued = false;
+        if patchset.embargo_until.is_some() {
+            match Self::release_patchset_results(ctx, patchset).await {
+                Ok(released) => enqueued = released,
+                Err(e) => error!(
+                    "Failed to release clean patchset {} immediately: {}",
+                    patchset.id, e
+                ),
+            }
         }
         // Cross-review does not wait for the local embargo. The local hold runs
         // for up to a week while a peer publishes in a day, and the merge only
         // writes rows the embargo already redacts, so a token holder peeking
         // early sees the peer's findings instead of a gap.
         //
-        // `release_patchset_results` reports Ok when it merely declines the claim
-        // -- the normal outcome for a series that has findings -- so this must not
-        // be made conditional on the release above.
-        Self::enqueue_peer_cross_reviews(ctx, patchset.id, chrono::Utc::now().timestamp()).await;
+        // A release that went through has already enqueued. Anything else has not,
+        // including the ordinary case of a series with findings, where the release
+        // above declines an ineligible claim and still reports Ok -- so this is
+        // driven by what the release did, never by whether it errored.
+        if !enqueued {
+            Self::enqueue_peer_cross_reviews(ctx, patchset.id, chrono::Utc::now().timestamp())
+                .await;
+        }
     }
 
-    async fn release_patchset_results(ctx: &ReviewContext, patchset: &PatchsetRow) -> Result<()> {
+    /// Publishes an embargoed patchset's held results. Reports whether the
+    /// release actually happened, which is also whether it enqueued the peer
+    /// cross-reviews; an ineligible or already-claimed patchset is `Ok(false)`.
+    async fn release_patchset_results(ctx: &ReviewContext, patchset: &PatchsetRow) -> Result<bool> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -759,7 +768,7 @@ impl Reviewer {
                 "Patchset {} is no longer eligible for embargo release or is already claimed",
                 patchset.id
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let result = Self::queue_patchset_notifications(ctx, patchset).await;
@@ -780,7 +789,7 @@ impl Reviewer {
                 patchset.id, e
             );
         }
-        result
+        result.map(|()| true)
     }
 
     async fn queue_patchset_notifications(
@@ -3645,6 +3654,42 @@ mod tests {
             )
             .await?;
         assert!(rows.next().await?.unwrap().get::<Option<i64>>(0)?.is_some());
+        Ok(())
+    }
+
+    /// The other half of that contract: a clean series does release on the spot,
+    /// and that release has already enqueued, so `publish_successful_review` must
+    /// not enqueue a second time.
+    ///
+    /// The duplicate is invisible in the resulting rows -- `enqueue_cross_reviews`
+    /// is idempotent, which is why the bug was survivable -- so what is asserted
+    /// here is the signal the guard reads: a release that happened reports `true`,
+    /// and a claim it declines reports `false`.
+    #[tokio::test]
+    async fn clean_embargoed_review_enqueues_once() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (ctx, db, _temp_dir) = setup_embargoed_release_ctx(now + 7 * 24 * 60 * 60).await?;
+        let patchset = releasable_patchset(&db, now).await;
+
+        // No findings, so the clean predicate lets it out ahead of the window.
+        assert!(Reviewer::release_patchset_results(&ctx, &patchset).await?);
+        // Already released, so the second claim is refused -- and this is the
+        // reading that has to stay distinct from the `Ok` a decline also returns.
+        assert!(!Reviewer::release_patchset_results(&ctx, &patchset).await?);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT embargo_until FROM patchsets WHERE id = ?",
+                libsql::params![patchset.id],
+            )
+            .await?;
+        assert!(rows.next().await?.unwrap().get::<Option<i64>>(0)?.is_none());
+        drop(rows);
+
+        let claimed = db.claim_due_cross_reviews(now + 60, 10).await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].source_name, "peer");
         Ok(())
     }
 

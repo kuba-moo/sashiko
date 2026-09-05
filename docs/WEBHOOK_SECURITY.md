@@ -264,9 +264,13 @@ server {
 
 ```
 sashiko.example.com {
-    reverse_proxy localhost:8080
+    reverse_proxy 127.0.0.1:8080
 }
 ```
+
+The upstream is spelled numerically to match the default `[server] host` of
+`127.0.0.1`; `localhost:8080` may resolve to `::1` first and find nothing
+listening.
 
 Caddy automatically obtains and renews TLS certificates via Let's Encrypt.
 

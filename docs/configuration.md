@@ -242,7 +242,7 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
+| `host` | string | `"127.0.0.1"` | Listen address. The shipped default is IPv4 loopback, because the API has no TLS of its own and passes embargo bypass tokens as bearer headers or a `?token=` query parameter, so it belongs behind a reverse proxy. Use `"::"` to bind every interface (IPv4 and IPv6), or `"0.0.0.0"` for IPv4 only -- the container image already sets the latter via `SASHIKO__SERVER__HOST`. A proxy on the same host should name its upstream `127.0.0.1:8080` rather than `localhost:8080`, which may resolve to `::1` first and find nothing listening. |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
 | `embargo_bypass_tokens` | list | `[]` | Secret tokens that let a client see embargoed findings and lift an embargo. Several may be active at once, so one can be rotated in before the old one is dropped. |

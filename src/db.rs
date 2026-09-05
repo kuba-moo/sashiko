@@ -6019,12 +6019,17 @@ impl Database {
             )
             .await?;
 
-        if let Ok(Some(row)) = rows.next().await {
-            let count: i64 = row.get(0)?;
-            Ok(count as usize)
-        } else {
-            Ok(0)
-        }
+        // Propagated rather than collapsed to `Ok(0)` the way the read paths
+        // elsewhere in this file do: this one is called only after a full batch
+        // was already read, so a zero it cannot tell apart from a failure would
+        // log "found 10 pending patchsets for review (0 queued in total)" and
+        // leave the caller's warn arm for this case unreachable.
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("pending patchset count returned no row"))?;
+        let count: i64 = row.get(0)?;
+        Ok(count as usize)
     }
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {

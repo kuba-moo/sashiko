@@ -7,10 +7,10 @@ Proposed and approved for implementation.
 ## Problem
 
 One Sashiko deployment may review the same patch series as another deployment
-using a different model. After the local review is published, the local
-instance should import the remote deployment's published findings, compare
-them with the local canonical findings, validate novel remote findings, and
-update the locally rendered result.
+using a different model. Once the local review completes, the local instance
+should import the remote deployment's published findings, compare them with the
+local canonical findings, validate novel remote findings, and update the locally
+rendered result.
 
 The remote deployment is not under our control. It is assumed to run Sashiko
 from origin/main and cannot be changed to expose a purpose-built peer API.
@@ -18,7 +18,8 @@ from origin/main and cannot be changed to expose a purpose-built peer API.
 ## Goals
 
 - Configure zero or more named remote Sashiko instances.
-- Start cross-review work only after the normal local review is published.
+- Start cross-review work as soon as the normal local review completes,
+  independently of whether a local embargo is still withholding it.
 - Persist all polling state so work resumes after process restarts.
 - Poll a remote hourly for up to three days while its result is unavailable.
 - Stop immediately when the remote reports a terminal error.
@@ -36,7 +37,9 @@ from origin/main and cannot be changed to expose a purpose-built peer API.
 - Fetching embargoed findings before the remote publishes them.
 - Comparing remote token costs or stage-level execution.
 - Asking the remote model to confirm local-only findings.
-- Editing email that has already been sent.
+- Editing email that has already been sent. An embargoed patchset has not sent
+  any yet, so its release email is composed from the merged report; see
+  [Local Embargo Independence](#local-embargo-independence).
 - Treating remote instances as model experiment executions.
 
 ## Configuration
@@ -98,7 +101,7 @@ There is one Tokio polling task for the service, not one task or thread per
 patchset or remote. All authoritative state is stored in the database.
 
 ```text
-local review published
+local review completed
         |
         v
 create one job per configured remote
@@ -388,9 +391,11 @@ finding is published with the remote's own problem and reasoning text, still
 anchored and still tagged. Publication of a verified remote finding never
 depends on a model being reachable.
 
-Email already sent by the initial review cannot be edited, so a spliced comment
-reaches the web and API surfaces only. A separate follow-up email policy may be
-added later.
+Email already sent by the initial review cannot be edited, so for a patchset that
+mailed its review at review time a spliced comment reaches the web and API
+surfaces only. A separate follow-up email policy may be added later. An embargoed
+patchset is the exception, because it has not mailed anything yet; see
+[Local Embargo Independence](#local-embargo-independence).
 
 ### If A Full Re-render Is Revisited
 
@@ -419,12 +424,73 @@ Anyone attempting it should know:
   and displayed versions would then diverge in wording, not just in content,
   which is a larger change in behaviour than adding a block.
 
+## Local Embargo Independence
+
+Cross-review originally started only once the local embargo had lifted. That was
+incidental to the design rather than required by it, and it stopped being tenable
+once the two sides began holding for different lengths of time: a remote instance
+on a fixed 24h embargo publishes days before a local dynamic embargo with a long
+`max_hold_hours` does. Maintainers who hold an embargo bypass token can already
+peek a review early, and what they saw was a merged report missing findings that
+had been public for days. Jobs are therefore created when the local review
+completes, embargoed or not.
+
+Nothing in the polling or merge machinery needed the local release. The
+consequences that did need deciding:
+
+- **Redaction covers the imported half.** The merge writes `findings`,
+  `reviews.inline_review` and `ai_interactions.output_raw` -- rows the embargo
+  read paths already redact. An anonymous reader sees the embargo banner; a token
+  holder sees the merged report. The cross-review rollup
+  (`cross_review_status`, `cross_reviewed_at`, and the `cross_review` object on
+  the patchset endpoints) is withheld too: a "Cross-reviewed" badge beside a
+  withheld review only invites the question of what the peer found.
+- **The release email carries confirmed remote findings.** The release query
+  reads exactly the rows the merge rewrites, so an embargoed patchset mails the
+  merged report and posts a Patchwork check derived from it. This is accepted,
+  not incidental. It is asymmetric with a non-embargoed patchset, whose email is
+  already gone before any peer answers -- and that asymmetry is inherent to
+  emailing at review time.
+- **A confirmed remote finding blocks the early-release fast path.** The clean
+  patchset predicate counts every finding on a reviewed series, imported ones
+  included, so importing one holds the series to its full embargo window. Keeping
+  it that way is deliberate: the fast path exists because "no findings" means
+  there is nothing to hold, and releasing early would mail a remote finding out
+  under a release that claims the series is clean. The review pass runs the
+  immediate release *before* enqueueing peer jobs, so the common case is decided
+  by ordering rather than by a race.
+- **Enqueueing is idempotent.** Two call sites now enqueue the same generation:
+  the review pass, and the release pass. The release pass is the backfill -- for a
+  patchset that was already reviewed and embargoed before this change shipped and
+  so has no jobs at all, and for a generation whose three-day deadline expired
+  while a week-long embargo was still running. Re-enqueueing a recorded generation
+  must not walk a completed cross-review back to pending or move its completion
+  time to the release, so the rollup is derived from the job rows that exist
+  rather than assumed. The release path reports success when it merely declines an
+  ineligible embargo claim, so the enqueue cannot be made conditional on it.
+- **The peer's embargo is still honoured.** The client is an unauthenticated GET
+  and a remote reporting `Embargoed` stays retryable. Only the local embargo
+  stopped being a gate.
+- **The deadline now runs from review completion, not release.** A peer that is
+  unreachable throughout loses the local embargo as extra window, which the
+  expired-generation re-arm in the release pass exists to offset.
+- **`/api/stats/cross-reviews` is deliberately not redacted.** It has no patchset
+  filter, so embargoed patchsets now contribute to its global outcome-by-severity
+  histogram. No stats query filters on embargo, and the response carries no
+  patchset identity, message ID or problem text.
+- **Merge timing affects the release email.** The release pass runs in the service
+  loop while merges run as detached tasks. A merge committing after the release
+  has read its rows is omitted from that email and its Patchwork check, with no
+  later publication path -- the same outcome as a post-release merge today, but
+  reached by timing rather than by construction.
+
 ## Failure Isolation
 
-Cross-review begins only after normal publication and never changes the result
-of the initial local review. Remote network, protocol, deduplication, or model
+Cross-review begins only after the local review has completed and never changes
+the result of that review. Remote network, protocol, deduplication, or model
 confirmation failures update only cross-review state. They do not change the
-patchset or review status from `Reviewed` to `Failed`.
+patchset or review status from `Reviewed` to `Failed`, and they never hold up a
+local publication or embargo release.
 
 ## Security
 
@@ -436,9 +502,10 @@ patchset or review status from `Reviewed` to `Failed`.
 - Remote strings are treated as untrusted data and validated before storage or
   prompt construction.
 - Report rendering turns untrusted remote text into text that is displayed and,
-  on a later review, mailed. The render prompt forbids following instructions
-  found in finding or patch text, and the tag lines that drive severity, finding
-  identity and source attribution are emitted by Rust rather than by the model,
+  for an embargoed patchset or on a later review, mailed. The render prompt
+  forbids following instructions found in finding or patch text, and the tag
+  lines that drive severity, finding identity and source attribution are emitted
+  by Rust rather than by the model,
   so a hostile remote cannot escalate its own severity or impersonate another
   source. Returned prose has tag-shaped text defused and is length bounded.
 - The remote API has no peer authentication in origin/main, so embargoed

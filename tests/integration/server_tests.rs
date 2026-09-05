@@ -902,3 +902,151 @@ async fn test_token_lift_embargo_rejected_in_read_only_mode() {
         Some(FUTURE_EMBARGO)
     );
 }
+
+// ── Redaction of cross-reviewed embargoed patchsets ──────────────────────
+
+/// Merges a peer's finding into the seeded patchset the way the reviewer does:
+/// a completed cross-review job, a `findings` row tagged with it, and the
+/// spliced comment block in both `inline_review` and the stored model output.
+async fn seed_imported_remote_finding(db: &Arc<Database>) {
+    db.conn
+        .execute(
+            "INSERT INTO ai_interactions (id, input_context, output_raw) \
+             VALUES ('local', 'ctx', \
+                     '{\"review\":{\"findings\":[{\"problem\":\"Peer found a leak\"}]}}')",
+            (),
+        )
+        .await
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO reviews \
+               (id, patchset_id, patch_id, interaction_id, status, created_at, inline_review) \
+             VALUES (1, 1, 1, 'local', 'Reviewed', 1234567890, \
+                     'local comment\n\n[Finding: peer-abc123] Peer found a leak')",
+            (),
+        )
+        .await
+        .unwrap();
+
+    db.enqueue_cross_reviews(
+        1,
+        &[("peer".to_string(), "https://peer.example".to_string())],
+        1000,
+    )
+    .await
+    .unwrap();
+    let job = db
+        .claim_due_cross_reviews(1000, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO findings \
+               (review_id, severity, problem, preexisting, cross_review_job_id, \
+                external_finding_id) \
+             VALUES (1, 3, 'Peer found a leak', 0, ?, 'remote-1')",
+            libsql::params![job.id],
+        )
+        .await
+        .unwrap();
+    db.finish_cross_review_job(&job, "complete", 1100, None)
+        .await
+        .unwrap();
+}
+
+/// Cross-review runs during the local embargo now, so the merged report exists
+/// while the patchset is still withheld. The existing embargo redaction has to
+/// cover the imported half of it, not just the locally generated half.
+#[tokio::test]
+#[ignore]
+async fn test_embargoed_patchset_hides_imported_remote_finding() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+    seed_imported_remote_finding(&server.db).await;
+
+    let anonymous: serde_json::Value = reqwest::get(format!("{}/api/patch?id=1", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(anonymous["status"], "Embargoed");
+    assert!(anonymous["reviews"].as_array().unwrap().is_empty());
+    let serialized = anonymous.to_string();
+    assert!(!serialized.contains("Peer found a leak"), "{serialized}");
+    assert!(!serialized.contains("peer-abc123"), "{serialized}");
+    // Even the bare fact that a peer weighed in stays behind the embargo: a
+    // "Cross-reviewed" badge next to a withheld review only invites the question
+    // of what the peer found.
+    assert!(anonymous.get("cross_review").is_none(), "{serialized}");
+
+    let bypassed: serde_json::Value = reqwest::get(format!(
+        "{}/api/patch?id=1&token={BYPASS_TOKEN}",
+        server.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(bypassed["status"], "Reviewed");
+    let reviews = bypassed["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert!(
+        reviews[0]["inline_review"]
+            .as_str()
+            .unwrap()
+            .contains("[Finding: peer-abc123]")
+    );
+    assert!(
+        reviews[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("Peer found a leak")
+    );
+    assert_eq!(bypassed["cross_review"]["status"], "complete");
+    assert_eq!(bypassed["cross_review"]["sources"][0]["name"], "peer");
+}
+
+/// The list query carries the cross-review rollup as its own columns, which the
+/// per-patchset handler's status gate does not reach.
+#[tokio::test]
+#[ignore]
+async fn test_embargoed_patchset_list_hides_cross_review_metadata() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+    seed_imported_remote_finding(&server.db).await;
+
+    // `q` is set so the request bypasses the shared homepage cache either way,
+    // making the two responses differ only by the token.
+    let anonymous: serde_json::Value =
+        reqwest::get(format!("{}/api/patchsets?q=test", server.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let row = &anonymous["items"][0];
+    assert_eq!(row["status"], "Embargoed");
+    assert!(row["cross_review_status"].is_null(), "{row}");
+    assert!(row["cross_reviewed_at"].is_null(), "{row}");
+    assert_eq!(row["findings_high"], 0);
+
+    let bypassed: serde_json::Value = reqwest::get(format!(
+        "{}/api/patchsets?q=test&token={BYPASS_TOKEN}",
+        server.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let row = &bypassed["items"][0];
+    assert_eq!(row["status"], "Reviewed");
+    assert_eq!(row["cross_review_status"], "complete");
+    assert_eq!(row["cross_reviewed_at"], 1100);
+    assert_eq!(row["findings_high"], 1);
+}

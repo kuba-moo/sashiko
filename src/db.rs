@@ -170,6 +170,17 @@ pub enum EmbargoLift {
 /// before it is treated as abandoned and the patchset becomes eligible again.
 const EMBARGO_RELEASE_CLAIM_STALE_SECS: i64 = 600;
 
+/// Recognises a patchset that is fully reviewed and found nothing, so its
+/// embargo has nothing left to protect.
+///
+/// The last clause counts *every* finding on a `Reviewed` review, imported
+/// cross-review findings included. That is deliberate: a confirmed remote
+/// finding is a finding, and `get_completed_reviews_for_release` would otherwise
+/// mail it out under a release that claims the series is clean. Since
+/// cross-review no longer waits for the local embargo, a peer's finding arriving
+/// mid-embargo can therefore take a series back out of the early-release path and
+/// hold it to `embargo_until`. `review_patchset_task` runs the immediate release
+/// before enqueueing peer jobs so the common case does not depend on that timing.
 const CLEAN_PATCHSET_PREDICATE: &str = "
     EXISTS (
         SELECT 1 FROM reviews r
@@ -1329,14 +1340,32 @@ impl Database {
                 )
                 .await?;
         }
+        // An expired generation gets a fresh window when a later caller
+        // re-enqueues it. `deadline_at` is three days from the local review and a
+        // local embargo can outlast that, so the release pass is the second
+        // chance for a peer that was unreachable throughout. Terminal 'error' and
+        // 'complete' rows are left alone.
         self.conn
             .execute(
-                "UPDATE patchsets SET cross_review_status = 'pending',
-                 cross_reviewed_at = NULL, cross_review_generation = ? WHERE id = ?",
+                "UPDATE cross_review_jobs
+                 SET status = 'pending', next_attempt_at = ?, deadline_at = ?,
+                     lease_until = NULL, lease_token = NULL, last_error = NULL
+                 WHERE patchset_id = ? AND generation = ? AND status = 'expired'",
+                libsql::params![now, now + 3 * 24 * 60 * 60, patchset_id, generation],
+            )
+            .await?;
+        // The generation stamp has to land unconditionally, because every job
+        // query fences on it. The status is then derived from the rows that exist
+        // rather than assumed to be 'pending': both the review pass and the
+        // release pass enqueue the same generation, and the second call must not
+        // reopen a cross-review that already completed.
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cross_review_generation = ? WHERE id = ?",
                 libsql::params![generation, patchset_id],
             )
             .await?;
-        Ok(())
+        self.refresh_cross_review_status(patchset_id, now).await
     }
 
     pub async fn claim_due_cross_reviews(
@@ -1587,11 +1616,17 @@ impl Database {
             "pending"
         };
         let completed_at = (status == "complete").then_some(now);
+        // `enqueue_cross_reviews` refreshes a generation that may already be
+        // complete, so keep the first completion time rather than moving it to
+        // the re-enqueue. A stamp cannot outlive its generation: any status other
+        // than 'complete' clears it, and a new generation always starts 'pending'.
         connection
             .execute(
-                "UPDATE patchsets SET cross_review_status = ?, cross_reviewed_at = ?
+                "UPDATE patchsets SET cross_review_status = ?,
+                 cross_reviewed_at = CASE WHEN ? IS NULL THEN NULL
+                                          ELSE COALESCE(cross_reviewed_at, ?) END
                  WHERE id = ?",
-                libsql::params![status, completed_at, patchset_id],
+                libsql::params![status, completed_at, completed_at, patchset_id],
             )
             .await?;
         Ok(())
@@ -5030,8 +5065,12 @@ impl Database {
                         concerns_unique: row.get(25).ok(),
                         findings_multi_stage: row.get(26).ok(),
                         budget_flags_or: row.get::<Option<i64>>(27).ok().flatten(),
-                        cross_review_status: row.get(28).ok(),
-                        cross_reviewed_at: row.get(29).ok(),
+                        // Withheld for the same reason as the finding counts: a
+                        // cross-review completes during the embargo now, and API
+                        // consumers should not learn a peer weighed in before the
+                        // review itself is readable.
+                        cross_review_status: if is_embargoed { None } else { row.get(28).ok() },
+                        cross_reviewed_at: if is_embargoed { None } else { row.get(29).ok() },
                     });
                 }
                 Ok(None) => break,
@@ -8575,6 +8614,130 @@ mod tests {
         assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
     }
 
+    /// Cross-review runs during the local embargo now, so a peer's finding can
+    /// land on a series that was on the early-release fast path. It has to take
+    /// the series back off that path: the release would otherwise mail the
+    /// imported finding out while claiming the series is clean.
+    #[tokio::test]
+    async fn imported_remote_finding_holds_a_clean_embargoed_patchset() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_clean_imported", "Clean Imported", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_clean_imported",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Clean Imported",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_clean_imported",
+                "Clean Imported",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_clean_imported", 1, "diff")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("clean"),
+            None,
+            Some("No issues found."),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            ps_id,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            now,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .claim_due_cross_reviews(now, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        assert!(
+            db.get_releasable_embargoed_patchsets(now, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|patchset| patchset.id == ps_id)
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO findings
+                    (review_id, severity, problem, preexisting, cross_review_job_id,
+                     external_finding_id)
+                 VALUES (?, 2, 'Peer found a leak', 0, ?, 'remote-1')",
+                libsql::params![review_id, job.id],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !db.get_releasable_embargoed_patchsets(now, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|patchset| patchset.id == ps_id)
+        );
+        assert!(!db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+        // The hold is only of the fast path: the patchset still publishes when
+        // its own embargo window lapses.
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, now + 3600)
+                .await
+                .unwrap()
+        );
+    }
+
     /// Seeds patchsets directly: the dynamic embargo path only reads the
     /// embargo columns, so the full ingestion flow would add noise.
     async fn setup_dynamic_embargo_db(now: i64) -> Arc<Database> {
@@ -11928,6 +12091,174 @@ mod tests {
                 .iter()
                 .all(|source| source["status"] == "complete")
         );
+    }
+
+    /// Seeds the minimum a cross-review job needs: a patchset with a
+    /// message ID to look up on the peer.
+    async fn setup_cross_review_enqueue_db() -> Arc<Database> {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "INSERT INTO threads (id, root_message_id) VALUES (1, 'root');
+                 INSERT INTO messages (message_id, thread_id) VALUES ('cover@example', 1);
+                 INSERT INTO patchsets
+                    (id, thread_id, cover_letter_message_id, status)
+                    VALUES (1, 1, 'cover@example', 'Reviewed');",
+            )
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn cross_review_rollup(db: &Database) -> (Option<String>, Option<i64>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT cross_review_status, cross_reviewed_at FROM patchsets WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).ok(), row.get(1).ok())
+    }
+
+    async fn cross_review_job_states(db: &Database) -> Vec<(String, String)> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT source_name, status FROM cross_review_jobs
+                 WHERE patchset_id = 1 ORDER BY source_name",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut states = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            states.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        states
+    }
+
+    /// Cross-review is enqueued when the local review finishes *and* again when
+    /// the embargo releases, so the second call for the same generation must not
+    /// reopen a cross-review that already completed days earlier.
+    #[tokio::test]
+    async fn enqueue_cross_reviews_is_idempotent_for_a_recorded_generation() {
+        let db = setup_cross_review_enqueue_db().await;
+        let sources = [("peer".to_string(), "https://peer.example".to_string())];
+        db.enqueue_cross_reviews(1, &sources, 1000).await.unwrap();
+        let job = db
+            .claim_due_cross_reviews(1000, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            db.finish_cross_review_job(&job, "complete", 1100, None)
+                .await
+                .unwrap()
+        );
+
+        db.enqueue_cross_reviews(1, &sources, 2000).await.unwrap();
+
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![("peer".to_string(), "complete".to_string())]
+        );
+        let (status, completed_at) = cross_review_rollup(&db).await;
+        assert_eq!(status.as_deref(), Some("complete"));
+        // Not 2000: the re-enqueue must not move the completion time forward.
+        assert_eq!(completed_at, Some(1100));
+        assert!(
+            db.claim_due_cross_reviews(2000, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A newly configured peer is still picked up by a re-enqueue, which takes
+    /// the rollup back to pending because the generation is no longer covered.
+    #[tokio::test]
+    async fn enqueue_cross_reviews_adds_a_new_source_to_a_recorded_generation() {
+        let db = setup_cross_review_enqueue_db().await;
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer-a".to_string(), "https://a.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .claim_due_cross_reviews(1000, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db.finish_cross_review_job(&job, "complete", 1100, None)
+            .await
+            .unwrap();
+        assert_eq!(cross_review_rollup(&db).await.1, Some(1100));
+
+        db.enqueue_cross_reviews(
+            1,
+            &[
+                ("peer-a".to_string(), "https://a.example".to_string()),
+                ("peer-b".to_string(), "https://b.example".to_string()),
+            ],
+            2000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![
+                ("peer-a".to_string(), "complete".to_string()),
+                ("peer-b".to_string(), "pending".to_string()),
+            ]
+        );
+        let (status, completed_at) = cross_review_rollup(&db).await;
+        assert_eq!(status.as_deref(), Some("pending"));
+        assert_eq!(completed_at, None);
+        let claimed = db.claim_due_cross_reviews(2000, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].source_name, "peer-b");
+    }
+
+    /// `deadline_at` is three days from the local review, and a local embargo can
+    /// outlast that, so the release pass is the second chance for a peer that was
+    /// unreachable throughout the hold.
+    #[tokio::test]
+    async fn enqueue_cross_reviews_rearms_an_expired_generation() {
+        let db = setup_cross_review_enqueue_db().await;
+        let sources = [("peer".to_string(), "https://peer.example".to_string())];
+        db.enqueue_cross_reviews(1, &sources, 1000).await.unwrap();
+
+        let expiry = 1000 + 3 * 24 * 60 * 60;
+        assert!(
+            db.claim_due_cross_reviews(expiry, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![("peer".to_string(), "expired".to_string())]
+        );
+        assert_eq!(cross_review_rollup(&db).await.0.as_deref(), Some("expired"));
+
+        db.enqueue_cross_reviews(1, &sources, expiry).await.unwrap();
+
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![("peer".to_string(), "pending".to_string())]
+        );
+        assert_eq!(cross_review_rollup(&db).await.0.as_deref(), Some("pending"));
+        let claimed = db.claim_due_cross_reviews(expiry, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].deadline_at, expiry + 3 * 24 * 60 * 60);
     }
 
     #[tokio::test]

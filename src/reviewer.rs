@@ -665,6 +665,58 @@ impl Reviewer {
         Ok(())
     }
 
+    /// Enqueues one cross-review job per configured peer for a local review that
+    /// has finished.
+    ///
+    /// Idempotent, so the release pass can call it for a patchset the review pass
+    /// already enqueued: a generation that is already recorded keeps its rollup
+    /// and only an expired one is re-armed.
+    async fn enqueue_peer_cross_reviews(ctx: &ReviewContext, patchset_id: i64, now: i64) {
+        if ctx.settings.cross_review.instances.is_empty() {
+            return;
+        }
+        let instances: Vec<(String, String)> = ctx
+            .settings
+            .cross_review
+            .instances
+            .iter()
+            .map(|instance| (instance.name.clone(), instance.url.clone()))
+            .collect();
+        if let Err(error) = ctx
+            .db
+            .enqueue_cross_reviews(patchset_id, &instances, now)
+            .await
+        {
+            error!("Failed to enqueue cross-reviews for {patchset_id}: {error}");
+        }
+    }
+
+    /// Runs the two follow-ups to a locally successful review: the fast-path
+    /// release of a clean embargoed series, then the peer cross-review enqueue.
+    async fn publish_successful_review(ctx: &ReviewContext, patchset: &PatchsetRow) {
+        // A clean patchset publishes right now, so attempt the release before any
+        // peer job exists. The clean predicate counts every finding on the series,
+        // imported ones included, so enqueueing first would let a fast merge race
+        // the fast path.
+        if patchset.embargo_until.is_some()
+            && let Err(e) = Self::release_patchset_results(ctx, patchset).await
+        {
+            error!(
+                "Failed to release clean patchset {} immediately: {}",
+                patchset.id, e
+            );
+        }
+        // Cross-review does not wait for the local embargo. The local hold runs
+        // for up to a week while a peer publishes in a day, and the merge only
+        // writes rows the embargo already redacts, so a token holder peeking
+        // early sees the peer's findings instead of a gap.
+        //
+        // `release_patchset_results` reports Ok when it merely declines the claim
+        // -- the normal outcome for a series that has findings -- so this must not
+        // be made conditional on the release above.
+        Self::enqueue_peer_cross_reviews(ctx, patchset.id, chrono::Utc::now().timestamp()).await;
+    }
+
     async fn release_patchset_results(ctx: &ReviewContext, patchset: &PatchsetRow) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -684,20 +736,10 @@ impl Reviewer {
 
         let result = Self::queue_patchset_notifications(ctx, patchset).await;
         if result.is_ok() {
-            let instances: Vec<(String, String)> = ctx
-                .settings
-                .cross_review
-                .instances
-                .iter()
-                .map(|instance| (instance.name.clone(), instance.url.clone()))
-                .collect();
-            if let Err(error) = ctx
-                .db
-                .enqueue_cross_reviews(patchset.id, &instances, now)
-                .await
-            {
-                error!("Failed to enqueue cross-reviews: {}", error);
-            }
+            // Backfill: a patchset reviewed before cross-review stopped waiting on
+            // the local embargo has no jobs at all, and a generation that expired
+            // while the embargo held gets a fresh window here.
+            Self::enqueue_peer_cross_reviews(ctx, patchset.id, now).await;
         }
         if result.is_err()
             && let Err(e) = ctx
@@ -1183,38 +1225,8 @@ impl Reviewer {
                     .update_patchset_status(patchset_id, &final_status)
                     .await;
 
-                if review_success
-                    && patchset.embargo_until.is_none()
-                    && !ctx.settings.cross_review.instances.is_empty()
-                {
-                    let instances: Vec<(String, String)> = ctx
-                        .settings
-                        .cross_review
-                        .instances
-                        .iter()
-                        .map(|instance| (instance.name.clone(), instance.url.clone()))
-                        .collect();
-                    if let Err(error) = ctx
-                        .db
-                        .enqueue_cross_reviews(
-                            patchset_id,
-                            &instances,
-                            chrono::Utc::now().timestamp(),
-                        )
-                        .await
-                    {
-                        error!("Failed to enqueue cross-reviews: {}", error);
-                    }
-                }
-
-                if review_success
-                    && patchset.embargo_until.is_some()
-                    && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
-                {
-                    error!(
-                        "Failed to release clean patchset {} immediately: {}",
-                        patchset_id, e
-                    );
+                if review_success {
+                    Self::publish_successful_review(&ctx, &patchset).await;
                 }
             }
         } else {
@@ -3423,6 +3435,317 @@ mod tests {
                 .await?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    /// One embargoed, `Reviewed` patchset with a single reviewed patch, plus a
+    /// context configured with one cross-review peer and a live email policy so
+    /// the release path actually queues something.
+    ///
+    /// `_temp_dir` is returned because the policy file has to outlive the context.
+    async fn setup_embargoed_release_ctx(
+        embargo_until: i64,
+    ) -> Result<(ReviewContext, Arc<Database>, tempfile::TempDir)> {
+        let temp_dir = tempdir()?;
+        let policy_path = temp_dir.path().join("email_policy.toml");
+        std::fs::write(
+            &policy_path,
+            r#"
+            [defaults]
+            mute_all = false
+            reply_all = true
+
+            [defaults.patchwork]
+            enabled = true
+            api_url = "https://patchwork.example/api/1.3"
+            "#,
+        )?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.email_policy_path = policy_path.to_str().unwrap().to_string();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "localhost".to_string(),
+            port: 25,
+            username: None,
+            password: None,
+            sender_address: "bot@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: true,
+        });
+        settings.cross_review.instances = vec![crate::settings::CrossReviewInstanceSettings {
+            name: "peer".to_string(),
+            url: "https://peer.example".to_string(),
+        }];
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("cover@example", "Subject", 1000).await?;
+        db.create_message(
+            "patch@example",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Subject",
+            1000,
+            "body",
+            "to@example.com",
+            "cc@example.com",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "cover@example",
+                "Subject",
+                "Author <author@example.com>",
+                1000,
+                1,
+                1,
+                "to@example.com",
+                "cc@example.com",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "patch@example", 1, "diff").await?;
+        let review_id = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "local-model",
+                "local-provider",
+                None,
+                None,
+            )
+            .await?;
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "Review completed successfully.",
+            Some("inline review content"),
+            None,
+            Some("No issues found."),
+            None,
+            None,
+        )
+        .await?;
+        db.update_patchset_status(ps_id, "Reviewed").await?;
+        db.set_patchset_embargo_until(ps_id, embargo_until).await?;
+
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(1)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(
+                crate::baseline::BaselineRegistry::new(Path::new("."), None).unwrap(),
+            ),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+        };
+        Ok((ctx, db, temp_dir))
+    }
+
+    /// Loads the patchset the way the release pass does, so the row carries the
+    /// same fields `release_patchset_results` sees in production.
+    async fn releasable_patchset(db: &Database, now: i64) -> PatchsetRow {
+        db.get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap()
+            .pop()
+            .expect("patchset is not releasable")
+    }
+
+    async fn patchset_cross_review(db: &Database, id: i64) -> (Option<String>, Option<i64>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT cross_review_status, cross_reviewed_at FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).ok(), row.get(1).ok())
+    }
+
+    /// The feature: a finished local review hands the series to its peers even
+    /// though the local embargo still holds the findings back. The series carries
+    /// a finding, so the fast-path release declines -- and the decline reports
+    /// `Ok`, which is exactly why the enqueue cannot be conditional on it.
+    #[tokio::test]
+    async fn embargoed_review_enqueues_cross_reviews() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (ctx, db, _temp_dir) = setup_embargoed_release_ctx(now + 7 * 24 * 60 * 60).await?;
+        let patchset = releasable_patchset(&db, now).await;
+        db.create_finding(crate::db::Finding {
+            review_id: 1,
+            severity: crate::db::Severity::High,
+            severity_explanation: None,
+            problem: "Local issue".to_string(),
+            preexisting: Some(false),
+            locations: None,
+            source_stages: None,
+        })
+        .await?;
+
+        Reviewer::publish_successful_review(&ctx, &patchset).await;
+
+        // A minute past `now`, because the code under test stamps
+        // `next_attempt_at` from its own clock read, which can land a second
+        // later than the one this test captured.
+        let claimed = db.claim_due_cross_reviews(now + 60, 10).await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].source_name, "peer");
+        // The embargo is untouched: cross-review starts, publication does not.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT embargo_until FROM patchsets WHERE id = ?",
+                libsql::params![patchset.id],
+            )
+            .await?;
+        assert!(rows.next().await?.unwrap().get::<Option<i64>>(0)?.is_some());
+        Ok(())
+    }
+
+    /// The release pass enqueues too, for the backfill in the next test. Doing so
+    /// must not walk a completed cross-review back to `pending` or move its
+    /// completion time to the release.
+    #[tokio::test]
+    async fn release_does_not_reopen_a_completed_cross_review() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (ctx, db, _temp_dir) = setup_embargoed_release_ctx(now - 60).await?;
+        let patchset = releasable_patchset(&db, now).await;
+
+        db.enqueue_cross_reviews(
+            patchset.id,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            now - 3600,
+        )
+        .await?;
+        let job = db
+            .claim_due_cross_reviews(now - 3600, 1)
+            .await?
+            .pop()
+            .unwrap();
+        db.finish_cross_review_job(&job, "complete", now - 3000, None)
+            .await?;
+
+        Reviewer::release_patchset_results(&ctx, &patchset).await?;
+
+        assert_eq!(
+            patchset_cross_review(&db, patchset.id).await,
+            (Some("complete".to_string()), Some(now - 3000))
+        );
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT (SELECT COUNT(*) FROM email_outbox),
+                        (SELECT embargo_until FROM patchsets WHERE id = ?)",
+                libsql::params![patchset.id],
+            )
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<i64>(0)?, 1);
+        assert_eq!(row.get::<Option<i64>>(1)?, None);
+        Ok(())
+    }
+
+    /// Patchsets already `Reviewed` and embargoed when this ships have no peer
+    /// jobs at all -- up to a week's worth, at `max_hold_hours = 168`. The release
+    /// pass is their only chance to get any.
+    #[tokio::test]
+    async fn release_backfills_cross_reviews_for_a_patchset_that_has_none() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (ctx, db, _temp_dir) = setup_embargoed_release_ctx(now - 60).await?;
+        let patchset = releasable_patchset(&db, now).await;
+        // 'disabled' is the ingestion default: no generation has ever been
+        // enqueued, which is the state of every patchset embargoed at ship time.
+        assert_eq!(
+            patchset_cross_review(&db, patchset.id).await,
+            (Some("disabled".to_string()), None)
+        );
+
+        Reviewer::release_patchset_results(&ctx, &patchset).await?;
+
+        assert_eq!(
+            patchset_cross_review(&db, patchset.id).await.0.as_deref(),
+            Some("pending")
+        );
+        // Past `now`: the release stamps `next_attempt_at` from its own clock
+        // read, which can land a second later than the one captured above.
+        let claimed = db.claim_due_cross_reviews(now + 60, 10).await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].source_name, "peer");
+        Ok(())
+    }
+
+    /// Cross-review merges into the very rows the release reads, so a peer finding
+    /// that lands during the embargo reaches the release email and the patchwork
+    /// check. That asymmetry with non-embargoed patchsets -- whose email is
+    /// already gone by then -- is accepted, not accidental.
+    #[tokio::test]
+    async fn release_email_carries_imported_remote_findings() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (ctx, db, _temp_dir) = setup_embargoed_release_ctx(now - 60).await?;
+        let patchset = releasable_patchset(&db, now).await;
+        db.enqueue_cross_reviews(
+            patchset.id,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            now - 3600,
+        )
+        .await?;
+        let job = db
+            .claim_due_cross_reviews(now - 3600, 1)
+            .await?
+            .pop()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE reviews SET inline_review =
+                    'inline review content\n\n[Finding: peer-abc123] Peer found a leak'
+                 WHERE id = 1",
+                (),
+            )
+            .await?;
+        db.conn
+            .execute(
+                "INSERT INTO findings
+                    (review_id, severity, problem, preexisting, cross_review_job_id,
+                     external_finding_id)
+                 VALUES (1, 2, 'Peer found a leak', 0, ?, 'remote-1')",
+                libsql::params![job.id],
+            )
+            .await?;
+
+        Reviewer::release_patchset_results(&ctx, &patchset).await?;
+
+        let mut rows = db.conn.query("SELECT body FROM email_outbox", ()).await?;
+        let body: String = rows.next().await?.expect("no release email").get(0)?;
+        assert!(body.contains("[Medium] Peer found a leak"), "{body}");
+        assert!(body.contains("[Finding: peer-abc123]"), "{body}");
+        drop(rows);
+
+        let mut rows = db
+            .conn
+            .query("SELECT check_state, description FROM patchwork_outbox", ())
+            .await?;
+        let row = rows.next().await?.expect("no patchwork check");
+        // A Medium finding is below the default `fail_severity = "High"`.
+        assert_eq!(row.get::<String>(0)?, "warning");
+        assert_eq!(row.get::<String>(1)?, "Medium: 1");
         Ok(())
     }
 

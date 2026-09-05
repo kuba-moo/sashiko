@@ -417,7 +417,7 @@ annotated example.
 | `defaults.cc` | list | `[]` | Static CC addresses. |
 | `defaults.ignored_emails` | list | `[]` | Author addresses to ignore entirely. |
 | `defaults.subject_prefixes` | list | `[]` | Subject prefix patterns to match for this scope. |
-| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. When a patch matches multiple subsystems, the shortest configured embargo wins. |
+| `defaults.embargo_hours` | integer | -- | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds; a confirmed [cross-instance](#cross-instance-reviews) finding counts as a finding, so importing one holds the patchset for the full window. When a patch matches multiple subsystems, the shortest configured embargo wins. |
 | `defaults.send_positive_review` | bool | `false` | Send email even when no issues are found. |
 
 The email policy also supports per-subsystem overrides via
@@ -518,7 +518,7 @@ Downstream tools can parse this format with simple line splitting.
 ## Cross-instance reviews
 
 Configure one or more public Sashiko instances whose final results should be
-imported after the local review is published:
+imported once the local review completes:
 
 ```toml
 [[cross_review.instances]]
@@ -535,7 +535,24 @@ Sashiko polls the remote `/api/patchset` endpoint by message ID. Pending,
 in-progress, missing, and embargoed results are retried hourly for up to three
 days. All polling state is stored in the database and survives restarts.
 Remote-only findings are batch-confirmed by the local main model before they
-are added to the local web and API result. Previously sent email is unchanged.
+are added to the local web and API result.
+
+Polling starts as soon as the local review finishes, whether or not a local
+embargo is holding the result back. That matters when the two sides hold for
+different lengths of time: a remote instance on a fixed 24h embargo publishes
+days before a local [dynamic embargo](#embargo) with a long `max_hold_hours`
+does, and waiting for the local release would leave the merged report empty for
+exactly as long. While the local embargo is in force, imported findings are
+redacted along with the local ones -- an anonymous reader sees only the embargo
+banner, and a holder of an
+[embargo bypass token](#server) sees the merged report.
+
+Email that has already gone out is unchanged, so a non-embargoed patchset keeps
+the local-only review it mailed at review time. An embargoed patchset has not
+mailed anything yet, and its release email and Patchwork check are composed from
+the merged report -- confirmed remote findings included. A confirmed remote
+finding therefore also makes an otherwise clean patchset non-clean, which holds
+it to its full embargo window instead of releasing it early.
 
 ## Environment variables
 

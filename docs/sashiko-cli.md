@@ -172,9 +172,14 @@ sashiko-cli lift-embargo 20260831025441.635045-7-wei.fang@oss.nxp.com
 
 The daemon does not publish on the spot: it brings the release time forward and
 the reviewer loop performs the release on its next pass, roughly ten seconds
-later, queueing the review emails, clearing the embargo and enqueueing any
-cross-reviews. A patchset whose review has not finished yet publishes as soon
-as it does.
+later, queueing the review emails and clearing the embargo. A patchset whose
+review has not finished yet publishes as soon as it does.
+
+[Cross-instance reviews](configuration.md#cross-instance-reviews) are not part of
+that: they are enqueued when the local review finishes, embargo or no embargo, so
+lifting an embargo early does not start them. The release pass only fills the gap
+-- it enqueues for a patchset that has no cross-review jobs at all, and gives a
+generation that ran out its deadline during a long embargo a fresh window.
 
 Embargo is a property of the patchset, so this releases the findings for every
 patch in the series; there is no per-patch lift. The command reports

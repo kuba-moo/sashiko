@@ -879,17 +879,6 @@ async fn get_patchset(
     match result {
         Ok(Some(mut details)) => {
             if let Some(obj) = details.as_object_mut() {
-                // Cross-review now runs during the local embargo, so an embargoed
-                // patchset can have peer jobs to report. Gate on the status the
-                // read path already redacted: no bypass leaves it "Embargoed", and
-                // reporting "Cross-reviewed" beside a withheld review only invites
-                // the question of what the peer found.
-                if let Some(id) = obj.get("id").and_then(serde_json::Value::as_i64)
-                    && obj.get("status").and_then(serde_json::Value::as_str) != Some("Embargoed")
-                    && let Ok(status) = state.db.get_cross_review_status(id).await
-                {
-                    obj.insert("cross_review".to_string(), status);
-                }
                 obj.insert(
                     "smtp_enabled".to_string(),
                     serde_json::Value::Bool(state.smtp_enabled),
@@ -962,17 +951,6 @@ async fn get_patchset_summary(
     match result {
         Ok(Some(mut details)) => {
             if let Some(obj) = details.as_object_mut() {
-                // Cross-review now runs during the local embargo, so an embargoed
-                // patchset can have peer jobs to report. Gate on the status the
-                // read path already redacted: no bypass leaves it "Embargoed", and
-                // reporting "Cross-reviewed" beside a withheld review only invites
-                // the question of what the peer found.
-                if let Some(id) = obj.get("id").and_then(serde_json::Value::as_i64)
-                    && obj.get("status").and_then(serde_json::Value::as_str) != Some("Embargoed")
-                    && let Ok(status) = state.db.get_cross_review_status(id).await
-                {
-                    obj.insert("cross_review".to_string(), status);
-                }
                 obj.insert(
                     "smtp_enabled".to_string(),
                     serde_json::Value::Bool(state.smtp_enabled),

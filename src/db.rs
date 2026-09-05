@@ -5099,6 +5099,25 @@ impl Database {
                         )
                     };
 
+                    // Withheld alongside the severity counts. Each of these is
+                    // derived from the findings the embargo is holding back:
+                    // `findings_multi_stage` counts the ones more than one stage
+                    // corroborated, and a non-zero concern count reports that the
+                    // review has something to say. Zeroing the four severities
+                    // while leaving these would have described the withheld
+                    // findings in aggregate instead of hiding them.
+                    let (concerns_total, concerns_unique, findings_multi_stage, budget_flags_or) =
+                        if is_embargoed {
+                            (None, None, None, None)
+                        } else {
+                            (
+                                row.get(24).ok(),
+                                row.get(25).ok(),
+                                row.get(26).ok(),
+                                row.get::<Option<i64>>(27).ok().flatten(),
+                            )
+                        };
+
                     let mut status: Option<String> = row.get(2).ok();
                     if is_embargoed && status.as_deref() == Some("Reviewed") {
                         status = Some("Embargoed".to_string());
@@ -5133,10 +5152,10 @@ impl Database {
                         mr_title: row.get(21).ok(),
                         mr_number: row.get(22).ok(),
                         slug: row.get(23).ok(),
-                        concerns_total: row.get(24).ok(),
-                        concerns_unique: row.get(25).ok(),
-                        findings_multi_stage: row.get(26).ok(),
-                        budget_flags_or: row.get::<Option<i64>>(27).ok().flatten(),
+                        concerns_total,
+                        concerns_unique,
+                        findings_multi_stage,
+                        budget_flags_or,
                         // Withheld for the same reason as the finding counts: a
                         // cross-review completes during the embargo now, and API
                         // consumers should not learn a peer weighed in before the
@@ -5484,7 +5503,7 @@ impl Database {
 
             let reviews = if is_embargoed { Vec::new() } else { reviews };
 
-            Ok(Some(serde_json::json!({
+            let mut details = serde_json::json!({
                 "id": pid,
                 "message_id": mid,
                 "subject": subject,
@@ -5511,7 +5530,22 @@ impl Database {
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
                 "slug": slug
-            })))
+            });
+            // Withheld under embargo for the same reason the reviews array is:
+            // cross-review completes during the local hold now, and reporting that
+            // a peer weighed in, beside a review the reader cannot see, only
+            // invites the question of what it found. Gated here on `is_embargoed`
+            // rather than by the caller on the rendered status, which reads
+            // "Embargoed" only when the stored status was exactly "Reviewed" --
+            // every other embargoed state empties `reviews` but would have passed
+            // a status-based gate.
+            if !is_embargoed
+                && let Ok(status) = self.get_cross_review_status(pid).await
+                && let Some(object) = details.as_object_mut()
+            {
+                object.insert("cross_review".to_string(), status);
+            }
+            Ok(Some(details))
         } else {
             Ok(None)
         }
@@ -5723,7 +5757,7 @@ impl Database {
 
             let reviews = if is_embargoed { Vec::new() } else { reviews };
 
-            Ok(Some(serde_json::json!({
+            let mut details = serde_json::json!({
                 "id": pid,
                 "message_id": mid,
                 "subject": subject,
@@ -5750,7 +5784,22 @@ impl Database {
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
                 "slug": slug
-            })))
+            });
+            // Withheld under embargo for the same reason the reviews array is:
+            // cross-review completes during the local hold now, and reporting that
+            // a peer weighed in, beside a review the reader cannot see, only
+            // invites the question of what it found. Gated here on `is_embargoed`
+            // rather than by the caller on the rendered status, which reads
+            // "Embargoed" only when the stored status was exactly "Reviewed" --
+            // every other embargoed state empties `reviews` but would have passed
+            // a status-based gate.
+            if !is_embargoed
+                && let Ok(status) = self.get_cross_review_status(pid).await
+                && let Some(object) = details.as_object_mut()
+            {
+                object.insert("cross_review".to_string(), status);
+            }
+            Ok(Some(details))
         } else {
             Ok(None)
         }
@@ -8433,7 +8482,8 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "UPDATE reviews SET status = 'Reviewed', summary = 'private review', budget_flags = 0x42 WHERE id = ?",
+                "UPDATE reviews SET status = 'Reviewed', summary = 'private review', budget_flags = 0x42,
+                 concerns_total = 7, concerns_unique = 5, findings_multi_stage = 3 WHERE id = ?",
                 libsql::params![review_id],
             )
             .await
@@ -8457,6 +8507,12 @@ mod tests {
 
         let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
         assert_eq!(patchsets[0].status.as_deref(), Some("Embargoed"));
+        // Each of these describes the withheld findings, so zeroing only the four
+        // severities would report them in aggregate instead of hiding them.
+        assert_eq!(patchsets[0].concerns_total, None);
+        assert_eq!(patchsets[0].concerns_unique, None);
+        assert_eq!(patchsets[0].findings_multi_stage, None);
+        assert_eq!(patchsets[0].budget_flags_or, None);
         let details = db
             .get_patchset_details(ps_id, None, None, false)
             .await
@@ -8477,6 +8533,10 @@ mod tests {
 
         let patchsets = db.get_patchsets(10, 0, None, None, false).await.unwrap();
         assert_eq!(patchsets[0].status.as_deref(), Some("Reviewed"));
+        assert_eq!(patchsets[0].concerns_total, Some(7));
+        assert_eq!(patchsets[0].concerns_unique, Some(5));
+        assert_eq!(patchsets[0].findings_multi_stage, Some(3));
+        assert_eq!(patchsets[0].budget_flags_or, Some(0x42));
         let details = db
             .get_patchset_details(ps_id, None, None, false)
             .await
@@ -12351,6 +12411,50 @@ mod tests {
         let claimed = db.claim_due_cross_reviews(expiry, 10).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].deadline_at, expiry + 3 * 24 * 60 * 60);
+    }
+
+    /// The rendered status only reads "Embargoed" when the stored status was
+    /// exactly "Reviewed", so a gate keyed off the string fails open on every
+    /// other embargoed state -- which still empties the `reviews` array, leaving a
+    /// cross-review report attached to a review the reader cannot see.
+    #[tokio::test]
+    async fn embargoed_patchset_withholds_cross_review_whatever_its_status() {
+        let db = setup_cross_review_enqueue_db().await;
+        let embargo_until = chrono::Utc::now().timestamp() + 3600;
+        db.conn
+            .execute(
+                // Not 'Reviewed': a rerun requested during the hold puts a
+                // patchset back to 'In Review' with a recorded generation.
+                "UPDATE patchsets SET status = 'In Review', embargo_until = ? WHERE id = 1",
+                libsql::params![embargo_until],
+            )
+            .await
+            .unwrap();
+        db.enqueue_cross_reviews(
+            1,
+            &[("peer".to_string(), "https://peer.example".to_string())],
+            1000,
+        )
+        .await
+        .unwrap();
+
+        let hidden = db
+            .get_patchset_details(1, None, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hidden["status"], "In Review");
+        assert!(
+            hidden.get("cross_review").is_none(),
+            "cross-review leaked on an embargoed patchset that is not 'Reviewed': {hidden}"
+        );
+
+        let shown = db
+            .get_patchset_details(1, None, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown["cross_review"]["status"], "pending");
     }
 
     /// Neither the claim query nor the polling pass filters on the configured

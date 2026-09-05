@@ -1257,10 +1257,22 @@ impl Reviewer {
                     ReviewStatus::Failed.as_str().to_string()
                 };
 
-                let _ = ctx
+                // Worth a log rather than a discarded Result: everything
+                // downstream keys off `Reviewed`. A patchset that fails to reach
+                // it is refused by `claim_patchset_embargo_release` and never
+                // returned by `get_releasable_embargoed_patchsets`, so it holds
+                // its embargo forever and mails nothing, while the decline logs
+                // only as "no longer eligible" and the cause disappears.
+                if let Err(error) = ctx
                     .db
                     .update_patchset_status(patchset_id, &final_status)
-                    .await;
+                    .await
+                {
+                    error!(
+                        "Failed to set patchset {} to {}: {}",
+                        patchset_id, final_status, error
+                    );
+                }
 
                 if review_success {
                     Self::publish_successful_review(&ctx, &patchset).await;

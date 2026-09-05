@@ -122,7 +122,10 @@ prompt_caching = true
 # context_window_size = 200000
 
 [server]
-host = "::"
+# Loopback only. The API has no TLS of its own and embargo bypass tokens are
+# passed as bearer tokens or query parameters, so it must sit behind the nginx
+# reverse proxy (which forwards to 127.0.0.1:8080) rather than face the network.
+host = "127.0.0.1"
 port = 8080
 
 [git]

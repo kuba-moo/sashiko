@@ -5886,6 +5886,26 @@ impl Database {
         Ok(diffs)
     }
 
+    /// Total number of patchsets waiting for review, ignoring any dispatch
+    /// batch limit. `get_pending_patchsets` saturates at its `limit`, so this
+    /// is what reports the real queue depth.
+    pub async fn count_pending_patchsets(&self) -> Result<usize> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE status = 'Pending'",
+                (),
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            let count: i64 = row.get(0)?;
+            Ok(count as usize)
+        } else {
+            Ok(0)
+        }
+    }
+
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
             "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug

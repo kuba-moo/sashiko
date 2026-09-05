@@ -41,6 +41,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
 
+/// How many pending patchsets one dispatch pass pulls from the database. The
+/// loop runs continuously, so this only bounds a single batch, not the backlog.
+const PENDING_DISPATCH_BATCH: usize = 10;
+
 #[derive(Clone)]
 struct ReviewContext {
     semaphore: Arc<Semaphore>,
@@ -351,13 +355,37 @@ impl Reviewer {
         shutdown: &watch::Receiver<bool>,
         review_tasks: &mut ReviewTasks,
     ) -> Result<()> {
-        let patchsets = self.db.get_pending_patchsets(10).await?;
+        let patchsets = self
+            .db
+            .get_pending_patchsets(PENDING_DISPATCH_BATCH)
+            .await?;
 
         if patchsets.is_empty() {
             return Ok(());
         }
 
-        info!("Found {} pending patchsets for review", patchsets.len());
+        // A full batch means the queue is at least this deep but says nothing
+        // about how much deeper, so the count pins itself to the limit and a
+        // growing backlog looks identical to a steady one. Ask for the real
+        // depth in that case; a short batch already is the whole queue.
+        if patchsets.len() < PENDING_DISPATCH_BATCH {
+            info!("Found {} pending patchsets for review", patchsets.len());
+        } else {
+            match self.db.count_pending_patchsets().await {
+                Ok(total) => info!(
+                    "Found {} pending patchsets for review ({} queued in total)",
+                    patchsets.len(),
+                    total
+                ),
+                Err(e) => {
+                    warn!("Failed to count pending patchsets: {}", e);
+                    info!(
+                        "Found {} pending patchsets for review (queue depth unknown)",
+                        patchsets.len()
+                    );
+                }
+            }
+        }
 
         for patchset in patchsets {
             let Some(permit) = Self::try_acquire_review_permit(self.semaphore.clone(), shutdown)

@@ -17,9 +17,15 @@ use tokio::sync::mpsc;
 
 /// Build a minimal [`Settings`] for integration tests.
 ///
-/// The `read_only` flag on `server` is set from the parameter; all other
-/// fields use harmless defaults that don't require external resources.
-fn test_settings(read_only: bool) -> Settings {
+/// The `read_only` flag and `embargo_bypass_tokens` on `server` are set from the
+/// parameters; all other fields use harmless defaults that don't require
+/// external resources.
+fn test_settings(read_only: bool, bypass_tokens: &[&str]) -> Settings {
+    let tokens = bypass_tokens
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let toml = format!(
         r#"
 [database]
@@ -41,6 +47,7 @@ model = "test"
 host = "127.0.0.1"
 port = 0
 read_only = {read_only}
+embargo_bypass_tokens = [{tokens}]
 
 [git]
 repository_path = "."
@@ -75,6 +82,11 @@ struct TestServer {
 /// [`TestServer`] goes out of scope (the task is detached, so cleanup is
 /// automatic when the tokio runtime shuts down).
 async fn spawn_test_server(read_only: bool) -> TestServer {
+    spawn_test_server_with_tokens(read_only, &[]).await
+}
+
+/// Like [`spawn_test_server`], with embargo-bypass tokens configured.
+async fn spawn_test_server_with_tokens(read_only: bool, bypass_tokens: &[&str]) -> TestServer {
     let db_settings = DatabaseSettings {
         url: ":memory:".to_string(),
         token: String::new(),
@@ -85,7 +97,7 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
     let (event_tx, event_rx) = mpsc::channel::<Event>(100);
     let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(100);
 
-    let settings = Arc::new(test_settings(read_only));
+    let settings = Arc::new(test_settings(read_only, bypass_tokens));
     let app = build_router(
         settings,
         Arc::clone(&db),
@@ -720,6 +732,166 @@ async fn test_lift_embargo_rejected_in_read_only_mode() {
             "{}/api/patchset/embargo/lift?id=1",
             server.base_url
         ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        stored_embargo_until(&server.db, 1).await,
+        Some(FUTURE_EMBARGO)
+    );
+}
+
+// ── Token-authorized embargo lift ───────────────────────────────────────
+//
+// Every server here is spawned with `allow_all_submit` true, so a token
+// endpoint that fell back to the origin check the way the localhost one does
+// would answer 200 to the unauthorized cases below rather than 401.
+
+const BYPASS_TOKEN: &str = "s3cret-lift-token";
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_with_bearer_token() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=part1@example.com",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "lifted");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["patchset_status"], "Reviewed");
+    assert_eq!(body["was_embargoed_until"], FUTURE_EMBARGO);
+
+    let until = stored_embargo_until(&server.db, 1).await.unwrap();
+    assert!(until < FUTURE_EMBARGO);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_with_query_token() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    // `?token=` is the other way the read paths take a token, so it has to
+    // authorize this too — a link handed to somebody is how the token gets
+    // into a browser in the first place.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=1&token={BYPASS_TOKEN}",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "lifted");
+    assert!(stored_embargo_until(&server.db, 1).await.unwrap() < FUTURE_EMBARGO);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_without_token_is_unauthorized() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=1",
+            server.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(
+        stored_embargo_until(&server.db, 1).await,
+        Some(FUTURE_EMBARGO)
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_with_wrong_token_is_unauthorized() {
+    let server = spawn_test_server_with_tokens(false, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=1",
+            server.base_url
+        ))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(
+        stored_embargo_until(&server.db, 1).await,
+        Some(FUTURE_EMBARGO)
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_unauthorized_when_no_tokens_configured() {
+    // An instance that configures no token has nothing to authorize with, so
+    // this route must refuse everyone rather than let a request past for want
+    // of anything to compare it against.
+    let server = spawn_test_server_with_tokens(false, &[]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=1",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(
+        stored_embargo_until(&server.db, 1).await,
+        Some(FUTURE_EMBARGO)
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_token_lift_embargo_rejected_in_read_only_mode() {
+    let server = spawn_test_server_with_tokens(/* read_only */ true, &[BYPASS_TOKEN]).await;
+    seed_embargoed_patchset(&server.db, Some(FUTURE_EMBARGO)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "{}/api/patchset/embargo/lift-token?id=1",
+            server.base_url
+        ))
+        .bearer_auth(BYPASS_TOKEN)
         .send()
         .await
         .unwrap();

@@ -2714,6 +2714,72 @@
         // =====================================================================
         // PATCHSET DETAIL VIEW
         // =====================================================================
+
+        // Behind the "Lift now" button on the embargo banner, wired to the
+        // token-authorized lift endpoint: the other one is the CLI's, is
+        // localhost-only, and a browser arrives through the reverse proxy.
+        //
+        // The release itself belongs to the reviewer loop, which runs it on its
+        // next pass and only for a patchset that is already Reviewed. So what
+        // this reports is what the lift did to the schedule, not that anything
+        // has been published yet.
+        async function liftEmbargoNow(patchsetId, btn) {
+            if (!confirm("Lift the embargo now, publishing this patchset's findings ahead of schedule?")) return;
+
+            const note = document.getElementById('embargoLiftNote');
+            const say = (msg, color) => {
+                if (!note) return;
+                note.style.display = 'block';
+                note.style.color = `var(${color})`;
+                note.textContent = msg;
+            };
+
+            btn.disabled = true;
+            say('Lifting…', '--text-dim');
+
+            let res;
+            try {
+                res = await apiFetch(
+                    `api/patchset/embargo/lift-token?id=${encodeURIComponent(patchsetId)}`,
+                    { method: 'POST' });
+            } catch (e) {
+                btn.disabled = false;
+                say(`Request failed: ${e.message}`, '--error-title');
+                return;
+            }
+
+            if (!res.ok) {
+                btn.disabled = false;
+                // The endpoint's two refusals are told apart because they need
+                // different things done about them: a token this server does not
+                // know, versus an instance that takes no writes at all.
+                if (res.status === 401) {
+                    say('Refused: this server does not accept the bypass token stored in this browser.', '--error-title');
+                } else if (res.status === 403) {
+                    say('Refused: this instance is read-only.', '--error-title');
+                } else {
+                    say(`Failed: ${res.status} ${res.statusText}`, '--error-title');
+                }
+                return;
+            }
+
+            const body = await res.json().catch(() => ({}));
+            if (body.status !== 'lifted') {
+                say(body.reason || 'Nothing to lift.', '--text-dim');
+                return;
+            }
+
+            if (body.patchset_status === 'Reviewed') {
+                say('Embargo lifted. The release runs on the next pass of the review loop.',
+                    '--status-embargoed');
+                // That pass is ten seconds away, so come back once for it.
+                setTimeout(() => router(), 12000);
+            } else {
+                say(`Embargo lifted. The patchset is ${body.patchset_status || 'not reviewed yet'}, `
+                    + 'so the release waits for the review to finish.', '--status-embargoed');
+            }
+        }
+
         async function renderPatchsetView(id, query = {}) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
@@ -2977,9 +3043,23 @@
             let embargoHtml = '';
             const embargoUntil = data.embargo_until;
             if (embargoUntil && embargoUntil * 1000 > Date.now()) {
+                // "Lift now" only for a browser that holds a bypass token: the token
+                // is what authorizes the endpoint, so offered without one the button
+                // could do nothing but collect a 401.
+                //
+                // Numeric id only. It goes into an onclick attribute, and a
+                // message-ID key would have to survive escaping for HTML and for a
+                // JS string literal both to be safe there.
+                const liftBtnHtml = (getBypassToken() && Number.isInteger(data.id))
+                    ? `<button onclick="liftEmbargoNow(${data.id}, this)" title="Publish this patchset's findings now, ahead of the embargo">Lift now</button>`
+                    : '';
                 embargoHtml = `
                     <div class="section" style="margin-bottom:16px; border-left:4px solid var(--status-embargoed);">
-                        <h3 style="margin:0; color:var(--status-embargoed);">🔒 Under embargo until ${formatDate(embargoUntil, true)}</h3>
+                        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                            <h3 style="margin:0; color:var(--status-embargoed);">🔒 Under embargo until ${formatDate(embargoUntil, true)}</h3>
+                            ${liftBtnHtml}
+                        </div>
+                        <div id="embargoLiftNote" style="display:none; margin-top:8px; font-size:0.9em;"></div>
                     </div>
                 `;
             }

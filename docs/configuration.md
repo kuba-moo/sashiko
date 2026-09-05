@@ -245,6 +245,22 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
+| `embargo_bypass_tokens` | list | `[]` | Secret tokens that let a client see embargoed findings and lift an embargo. Several may be active at once, so one can be rotated in before the old one is dropped. |
+
+A token is presented as `Authorization: Bearer <token>` or as `?token=<token>`;
+the web UI stores one from the latter and sends it as the former from then on.
+Holding it does two things: embargoed patchsets render in full instead of
+redacted, and `POST /api/patchset/embargo/lift-token?id=<key>` lifts an embargo
+(which is what the UI's "Lift now" button calls). That is a second endpoint
+rather than a widening of the first: `/api/patchset/embargo/lift`, the one
+[`sashiko-cli lift-embargo`](sashiko-cli.md#lift-embargo) uses, stays reachable
+only from loopback and accepts no token, so a deployment that configures one
+does not thereby expose the CLI's route to the network. Both are refused
+outright by a `read_only` daemon.
+
+Tokens are secrets in a system with no TLS of its own: serve the API behind a
+reverse proxy, and remember that a token in a query string reaches the proxy's
+access log and any `Referer` a page sends.
 
 ### `[git]`
 

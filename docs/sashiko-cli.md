@@ -183,6 +183,11 @@ lapsed. It requires the same access as `cancel` and `rerun`: the request must
 come from loopback, unless the daemon was started with
 `--enable-unsafe-all-submit`, and a read-only daemon refuses it outright.
 
+A holder of an [embargo bypass token](configuration.md#server) can do the same
+from a browser, through the "Lift now" button on the patchset page; that goes to
+a separate endpoint that authorizes on the token instead of on the origin, and
+leaves this one loopback-only.
+
 ### local
 
 Run a local review without requiring a running daemon, database, or network

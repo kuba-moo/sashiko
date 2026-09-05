@@ -396,6 +396,10 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patchset/embargo/lift", post(lift_patchset_embargo))
+        .route(
+            "/api/patchset/embargo/lift-token",
+            post(lift_patchset_embargo_token),
+        )
         .route("/api/patch/rerun", post(rerun_patch))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
@@ -1375,10 +1379,8 @@ async fn cancel_patchset(
 /// Lifts a patchset's embargo, publishing its findings ahead of the policy or
 /// schedule window.
 ///
-/// The release itself stays with the reviewer loop, which queues the
-/// notifications, clears the embargo and enqueues cross-reviews. This handler
-/// only brings the release time forward, so a lift takes effect on the loop's
-/// next pass rather than immediately.
+/// Localhost only, like the other write endpoints. `lift_patchset_embargo_token`
+/// is the same operation for a client that authorizes with a token instead.
 async fn lift_patchset_embargo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -1392,12 +1394,66 @@ async fn lift_patchset_embargo(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    lift_embargo(&state, &query.id, "localhost").await
+}
+
+/// Lifts a patchset's embargo on the strength of an embargo-bypass token.
+///
+/// The same operation as `lift_patchset_embargo`, authorized by what the caller
+/// knows instead of where it comes from, which is what the web UI needs: it
+/// reaches the API through the reverse proxy, so every request it makes already
+/// looks like localhost and the origin check cannot tell it apart from the CLI.
+///
+/// A route of its own rather than a second way past the check on the existing
+/// one: that one is the CLI's, and a token accepted there would silently turn
+/// every deployment that configures a token into one whose loopback-only route
+/// answers to the network too — including deployments that only wanted the
+/// token to read embargoed findings.
+///
+/// No valid token is a 401 and not the silent fallback the read paths take.
+/// There is no unauthenticated version of a write to fall back to, and the UI
+/// has to be able to say which of the two refusals it got.
+async fn lift_patchset_embargo_token(
+    BypassEmbargo(authorized): BypassEmbargo,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<EmbargoLiftQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !authorized {
+        info!(
+            "Refused token embargo lift for {}: no configured token presented",
+            query.id
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    lift_embargo(&state, &query.id, "token").await
+}
+
+/// Brings a patchset's embargo release time forward, behind both lift endpoints.
+///
+/// The release itself stays with the reviewer loop, which queues the
+/// notifications, clears the embargo and enqueues cross-reviews. This only
+/// brings the release time forward, so a lift takes effect on the loop's next
+/// pass rather than immediately.
+///
+/// `how` says which endpoint it came through. The two differ only in how they
+/// authorize, and nothing else in the row records which of them a lift was
+/// asked for by.
+async fn lift_embargo(
+    state: &AppState,
+    key: &str,
+    how: &str,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let id = state
         .db
-        .resolve_patchset_id(&query.id)
+        .resolve_patchset_id(key)
         .await
         .map_err(|e| {
-            error!("Failed to resolve patchset {}: {}", query.id, e);
+            error!("Failed to resolve patchset {}: {}", key, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
@@ -1411,8 +1467,8 @@ async fn lift_patchset_embargo(
     match outcome {
         EmbargoLift::Lifted { was_until, status } => {
             info!(
-                "Embargo for patchset {} lifted by request (was held until {})",
-                id, was_until
+                "Embargo for patchset {} lifted by {} request (was held until {})",
+                id, how, was_until
             );
             Ok(Json(serde_json::json!({
                 "status": "lifted",

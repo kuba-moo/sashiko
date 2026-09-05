@@ -1273,6 +1273,17 @@ impl Database {
         Ok(())
     }
 
+    /// Creates one job per configured peer for a finished local review and
+    /// re-derives the patchset rollup.
+    ///
+    /// The whole thing commits atomically. Two callers enqueue the same
+    /// generation -- the review pass and the release pass -- while the merge task
+    /// commits `complete` from a connection of its own, so a non-transactional
+    /// rollup here could read `processing`, lose the race with that commit, and
+    /// write `pending` back over a finished cross-review that nothing refreshes
+    /// again. The job inserts also have to land with the generation stamp they
+    /// are fenced on, or a failure between the two would leave rows at a
+    /// generation no query can see.
     pub async fn enqueue_cross_reviews(
         &self,
         patchset_id: i64,
@@ -1282,8 +1293,55 @@ impl Database {
         if instances.is_empty() {
             return Ok(());
         }
-        let mut rows = self
-            .conn
+        if self.is_in_memory {
+            let _transaction_guard = self.in_memory_transaction.lock().await;
+            self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+            let result = self
+                .enqueue_cross_reviews_on(&self.conn, patchset_id, instances, now)
+                .await;
+            return match result {
+                Ok(()) => {
+                    self.conn.execute("COMMIT", ()).await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            };
+        }
+        let connection = self.database.connect()?;
+        let _ = connection
+            .query("PRAGMA busy_timeout = 5000", ())
+            .await?
+            .next()
+            .await;
+        let transaction = connection
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        let result = self
+            .enqueue_cross_reviews_on(&transaction, patchset_id, instances, now)
+            .await;
+        match result {
+            Ok(()) => {
+                transaction.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn enqueue_cross_reviews_on(
+        &self,
+        connection: &libsql::Connection,
+        patchset_id: i64,
+        instances: &[(String, String)],
+        now: i64,
+    ) -> Result<()> {
+        let mut rows = connection
             .query(
                 "SELECT (SELECT message_id FROM patches
                          WHERE patchset_id = patchsets.id ORDER BY part_index LIMIT 1),
@@ -1315,7 +1373,7 @@ impl Database {
         drop(rows);
 
         for (name, url) in instances {
-            self.conn
+            connection
                 .execute(
                     "INSERT INTO cross_review_jobs
                      (patchset_id, source_name, source_url, local_model,
@@ -1339,33 +1397,47 @@ impl Database {
                     ],
                 )
                 .await?;
+            // An expired generation gets a fresh window when a later caller
+            // re-enqueues it. `deadline_at` is three days from the local review
+            // and a local embargo can outlast that, so the release pass is the
+            // second chance for a peer that was unreachable throughout. Terminal
+            // 'error' and 'complete' rows are left alone.
+            //
+            // Scoped to the peer being enqueued: a patchset can hold expired jobs
+            // for a peer the operator has since dropped from the configuration,
+            // and neither the claim query nor the polling pass filters on the
+            // configured set, so re-arming one would poll a retired peer's stored
+            // URL for three more days and pin the rollup off 'complete'.
+            connection
+                .execute(
+                    "UPDATE cross_review_jobs
+                     SET status = 'pending', next_attempt_at = ?, deadline_at = ?,
+                         lease_until = NULL, lease_token = NULL, last_error = NULL
+                     WHERE patchset_id = ? AND generation = ? AND source_name = ?
+                       AND status = 'expired'",
+                    libsql::params![
+                        now,
+                        now + 3 * 24 * 60 * 60,
+                        patchset_id,
+                        generation,
+                        name.clone(),
+                    ],
+                )
+                .await?;
         }
-        // An expired generation gets a fresh window when a later caller
-        // re-enqueues it. `deadline_at` is three days from the local review and a
-        // local embargo can outlast that, so the release pass is the second
-        // chance for a peer that was unreachable throughout. Terminal 'error' and
-        // 'complete' rows are left alone.
-        self.conn
-            .execute(
-                "UPDATE cross_review_jobs
-                 SET status = 'pending', next_attempt_at = ?, deadline_at = ?,
-                     lease_until = NULL, lease_token = NULL, last_error = NULL
-                 WHERE patchset_id = ? AND generation = ? AND status = 'expired'",
-                libsql::params![now, now + 3 * 24 * 60 * 60, patchset_id, generation],
-            )
-            .await?;
         // The generation stamp has to land unconditionally, because every job
         // query fences on it. The status is then derived from the rows that exist
         // rather than assumed to be 'pending': both the review pass and the
         // release pass enqueue the same generation, and the second call must not
         // reopen a cross-review that already completed.
-        self.conn
+        connection
             .execute(
                 "UPDATE patchsets SET cross_review_generation = ? WHERE id = ?",
                 libsql::params![generation, patchset_id],
             )
             .await?;
-        self.refresh_cross_review_status(patchset_id, now).await
+        self.refresh_cross_review_status_on(connection, patchset_id, now)
+            .await
     }
 
     pub async fn claim_due_cross_reviews(
@@ -12279,6 +12351,51 @@ mod tests {
         let claimed = db.claim_due_cross_reviews(expiry, 10).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].deadline_at, expiry + 3 * 24 * 60 * 60);
+    }
+
+    /// Neither the claim query nor the polling pass filters on the configured
+    /// instances, so re-arming an expired job for a peer the operator has dropped
+    /// would poll its stored URL for three more days and keep the rollup off
+    /// `complete` for a peer nobody asked about.
+    #[tokio::test]
+    async fn enqueue_cross_reviews_leaves_a_dropped_peer_expired() {
+        let db = setup_cross_review_enqueue_db().await;
+        let both = [
+            ("peer-a".to_string(), "https://a.example".to_string()),
+            ("peer-b".to_string(), "https://b.example".to_string()),
+        ];
+        db.enqueue_cross_reviews(1, &both, 1000).await.unwrap();
+
+        let expiry = 1000 + 3 * 24 * 60 * 60;
+        assert!(
+            db.claim_due_cross_reviews(expiry, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![
+                ("peer-a".to_string(), "expired".to_string()),
+                ("peer-b".to_string(), "expired".to_string()),
+            ]
+        );
+
+        // peer-b has since been removed from `cross_review.instances`.
+        db.enqueue_cross_reviews(1, &both[..1], expiry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cross_review_job_states(&db).await,
+            vec![
+                ("peer-a".to_string(), "pending".to_string()),
+                ("peer-b".to_string(), "expired".to_string()),
+            ]
+        );
+        let claimed = db.claim_due_cross_reviews(expiry, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].source_name, "peer-a");
     }
 
     #[tokio::test]

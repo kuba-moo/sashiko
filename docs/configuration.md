@@ -343,14 +343,14 @@ from receipt. Disabled unless `schedule_url` is set, in which case
 | `schedule_url` | string | -- | URL of a JSON map from series message-ID to target release time. Must be HTTP(S); an invalid URL fails at startup. |
 | `release_lead_hours` | integer | `24` | How far ahead of a series' target release time to lift its embargo. |
 | `refresh_minutes` | integer | `15` | How often to re-read the schedule. Targets move as the file is regenerated, so this is a poll rather than a one-shot load. |
-| `max_hold_hours` | integer | `168` | Upper bound on the hold, measured from the series' `Date` header, so a stale or bogus far-future target cannot withhold findings indefinitely. |
+| `max_hold_hours` | integer | `96` | Upper bound on the hold: four days, so no review is withheld longer than that whatever the schedule asks for, and a stale or bogus far-future target cannot withhold findings indefinitely. Measured from `patchsets.date`, when sashiko first recorded the series -- the cover letter's `Date` header for mail ingestion, the submission time for series submitted through the API, which runs some tens of minutes later. |
 | `dry_run` | bool | `false` | Log the changes each cycle would make without writing them. |
 
 ```toml
 [embargo]
 schedule_url = "https://netdev-ctrl.bots.linux.dev/suie-scores.json"
 release_lead_hours = 24
-max_hold_hours = 168
+max_hold_hours = 96
 ```
 
 The schedule file is expected to look like this; only `by_message_id` is read,

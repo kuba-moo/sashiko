@@ -772,8 +772,9 @@ pub struct EmbargoSettings {
     /// regenerated, so this is a poll, not a one-shot load.
     #[serde(default = "default_embargo_refresh_minutes")]
     pub refresh_minutes: u64,
-    /// Upper bound on the hold, measured from the series date, so a stale or
-    /// bogus far-future target cannot withhold findings indefinitely.
+    /// Upper bound on the hold, measured from the series date: four days, so no
+    /// review is withheld longer than that whatever the schedule asks for, and a
+    /// stale or bogus far-future target cannot withhold findings indefinitely.
     #[serde(default = "default_max_hold_hours")]
     pub max_hold_hours: u32,
     /// Log the embargo changes each cycle would make without writing them.
@@ -802,7 +803,7 @@ fn default_embargo_refresh_minutes() -> u64 {
 }
 
 fn default_max_hold_hours() -> u32 {
-    168
+    96
 }
 
 /// Validate an optional HTTP(S) URL at config-load time, so a typo fails
@@ -1055,6 +1056,19 @@ mod tests {
                 std::env::remove_var("XDG_CONFIG_HOME");
             }
         }
+    }
+
+    /// The four-day maximum has to hold for a deployment that never writes an
+    /// `[embargo]` section, so pin both the field default and the `Default` impl
+    /// that `Settings::embargo`'s `#[serde(default)]` falls back to.
+    #[test]
+    fn embargo_holds_are_capped_at_four_days_by_default() {
+        assert_eq!(default_max_hold_hours(), 4 * 24);
+        assert_eq!(EmbargoSettings::default().max_hold_hours, 4 * 24);
+
+        let empty: EmbargoSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.max_hold_hours, 4 * 24);
+        assert_eq!(empty.schedule_url, None);
     }
 
     #[test]

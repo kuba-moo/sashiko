@@ -325,6 +325,16 @@ mod tests {
         assert!(!desired.clamped);
     }
 
+    /// The live shape at the configured cap: netdev-ctrl targets sit days out, so
+    /// the four-day bound, not the target, is what decides most holds.
+    #[test]
+    fn four_day_cap_bounds_a_target_days_out() {
+        let series_date = 1_787_000_000;
+        let desired = desired_embargo_until(series_date + 6 * DAY, series_date, 12, 96);
+        assert_eq!(desired.until, series_date + 4 * DAY);
+        assert!(desired.clamped);
+    }
+
     #[test]
     fn zero_lead_holds_until_the_target_itself() {
         let series_date = 1_787_000_000;

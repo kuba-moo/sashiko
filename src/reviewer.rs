@@ -3749,8 +3749,8 @@ mod tests {
     }
 
     /// Patchsets already `Reviewed` and embargoed when this ships have no peer
-    /// jobs at all -- up to a week's worth, at `max_hold_hours = 168`. The release
-    /// pass is their only chance to get any.
+    /// jobs at all -- up to four days' worth, at `max_hold_hours = 96`. The
+    /// release pass is their only chance to get any.
     #[tokio::test]
     async fn release_backfills_cross_reviews_for_a_patchset_that_has_none() -> Result<()> {
         let now = chrono::Utc::now().timestamp();

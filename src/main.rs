@@ -1071,7 +1071,7 @@ fn render_progress(state: &mut ProgressState) {
                             (st, turn)
                         })
                         .collect();
-                    stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
+                    stages_with_turns.sort_by_key(|item| std::cmp::Reverse(item.1));
 
                     let (top_stage, top_turn) = stages_with_turns[0];
                     let stage_name = stage_short_name(top_stage);

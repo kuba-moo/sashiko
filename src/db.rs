@@ -1188,12 +1188,22 @@ impl Database {
                 "patchset_id, status",
             )
             .await;
+        // Covers every reviews column the cost stats read.  Most of them sit
+        // after `logs` in the row, and SQLite walks a review's whole overflow
+        // chain to reach them, so scanning the table instead reads the logs of
+        // every review ever run -- 10GB a query, past nginx's 60s once the
+        // page cache is cold.  Its (day, status) prefix replaces idx_reviews_day.
         let _ = self
             .try_create_index(
-                "idx_reviews_day",
+                "idx_reviews_day_usage",
                 "reviews",
-                "strftime('%Y-%m-%d', created_at, 'unixepoch'), status",
+                "strftime('%Y-%m-%d', created_at, 'unixepoch'), status, created_at, \
+                 completed_at, patch_id, interaction_id, budget_flags, provider, model",
             )
+            .await;
+        let _ = self
+            .conn
+            .execute("DROP INDEX IF EXISTS idx_reviews_day", ())
             .await;
         Ok(())
     }

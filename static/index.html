@@ -4200,15 +4200,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             try {
                 if (!state.statsData) {
+                    // Name the endpoint and status: a proxy timeout's HTML page
+                    // otherwise surfaces only as a JSON.parse error.
+                    const statsJson = path => apiFetch(path).then(r => {
+                        if (!r.ok) throw new Error(`${path}: ${r.status} ${r.statusText}`);
+                        return r.json();
+                    });
                     const [timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode, patchwork] = await Promise.all([
-                        apiFetch('api/stats/timeline').then(r => r.json()),
-                        apiFetch('api/stats/reviews').then(r => r.json()),
-                        apiFetch('api/stats/tools').then(r => r.json()),
-                        apiFetch('api/stats/cost').then(r => r.json()),
-                        apiFetch('api/stats/model-experiments').then(r => r.json()),
-                        apiFetch('api/stats/cross-reviews').then(r => r.json()),
-                        apiFetch('api/stats/json-decode').then(r => r.json()),
-                        apiFetch('api/stats/patchwork').then(r => r.json())
+                        statsJson('api/stats/timeline'),
+                        statsJson('api/stats/reviews'),
+                        statsJson('api/stats/tools'),
+                        statsJson('api/stats/cost'),
+                        statsJson('api/stats/model-experiments'),
+                        statsJson('api/stats/cross-reviews'),
+                        statsJson('api/stats/json-decode'),
+                        statsJson('api/stats/patchwork')
                     ]);
                     state.statsData = { timeline, reviewsData, tools, cost, modelExperiments, crossReviews, jsonDecode, patchwork };
                 }

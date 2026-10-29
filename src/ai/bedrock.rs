@@ -29,7 +29,7 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Blob, Document, Number};
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Error returned by the Bedrock Converse API.
 ///
@@ -139,6 +139,8 @@ pub struct BedrockClient {
     max_tokens: u32,
     thinking: Option<String>,
     effort: Option<String>,
+    send_temperature: bool,
+    openai_style: bool,
 }
 
 impl BedrockClient {
@@ -155,6 +157,10 @@ impl BedrockClient {
         } else {
             128_000
         };
+        let openai_style = is_openai_model(&model_id);
+        if openai_style && thinking.is_some() {
+            warn!("[ai.bedrock] thinking is Anthropic-only; ignoring it for {model_id}");
+        }
 
         Self {
             client: tokio::sync::OnceCell::new(),
@@ -165,7 +171,14 @@ impl BedrockClient {
             max_tokens,
             thinking,
             effort,
+            send_temperature: true,
+            openai_style,
         }
+    }
+
+    pub fn with_send_temperature(mut self, send_temperature: bool) -> Self {
+        self.send_temperature = send_temperature;
+        self
     }
 
     async fn get_client(&self) -> &Client {
@@ -190,6 +203,21 @@ struct ConverseParams {
     tool_config: Option<ToolConfiguration>,
     inference_config: Option<InferenceConfiguration>,
     additional_model_request_fields: Option<Document>,
+}
+
+/// Application inference profile ARNs carry no model name and fall back to Anthropic fields.
+fn is_openai_model(model_id: &str) -> bool {
+    model_id.contains("openai.")
+}
+
+/// OpenAI models on Bedrock take Responses-style `reasoning.effort`; top-level `reasoning_effort` is rejected.
+fn build_openai_additional_fields(effort: Option<&str>) -> Option<Document> {
+    let e = effort?;
+    let mut reasoning: HashMap<String, Document> = HashMap::new();
+    reasoning.insert("effort".to_string(), Document::String(e.to_string()));
+    let mut map: HashMap<String, Document> = HashMap::new();
+    map.insert("reasoning".to_string(), Document::Object(reasoning));
+    Some(Document::Object(map))
 }
 
 fn build_additional_fields(thinking: Option<&str>, effort: Option<&str>) -> Option<Document> {
@@ -586,14 +614,25 @@ fn estimate_tokens_generic(request: &AiRequest) -> usize {
 
 #[async_trait]
 impl AiProvider for BedrockClient {
-    async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let params = translate_request(
-            &request,
-            self.enable_caching,
-            self.max_tokens,
-            self.thinking.as_deref(),
-            self.effort.as_deref(),
-        )?;
+    async fn generate_content(&self, mut request: AiRequest) -> Result<AiResponse> {
+        if !self.send_temperature {
+            request.temperature = None;
+        }
+        let params = if self.openai_style {
+            let mut p =
+                translate_request(&request, self.enable_caching, self.max_tokens, None, None)?;
+            p.additional_model_request_fields =
+                build_openai_additional_fields(self.effort.as_deref());
+            p
+        } else {
+            translate_request(
+                &request,
+                self.enable_caching,
+                self.max_tokens,
+                self.thinking.as_deref(),
+                self.effort.as_deref(),
+            )?
+        };
 
         let resp = self
             .get_client()
@@ -999,6 +1038,20 @@ mod tests {
         assert_eq!(json["thinking"]["type"], "adaptive");
         assert_eq!(json["output_config"]["effort"], "high");
         Ok(())
+    }
+
+    #[test]
+    fn test_openai_model_detection() {
+        assert!(is_openai_model("global.openai.gpt-6-astra"));
+        assert!(is_openai_model("openai.gpt-oss-120b-1:0"));
+        assert!(!is_openai_model("global.anthropic.claude-opus-5-5"));
+    }
+
+    #[test]
+    fn test_openai_additional_fields_use_reasoning_effort() {
+        assert!(build_openai_additional_fields(None).is_none());
+        let json = document_to_json(&build_openai_additional_fields(Some("high")).unwrap());
+        assert_eq!(json, serde_json::json!({"reasoning": {"effort": "high"}}));
     }
 
     #[test]

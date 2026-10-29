@@ -171,6 +171,15 @@ cp docs/examples/Settings.claude-bedrock.toml Settings.toml
 - Cross-region inference profiles (e.g. `us.anthropic.claude-*`)
 - Full tool/function calling support
 
+**Non-Claude models:** `prompt_caching` and `thinking` under
+`[ai.bedrock]` are Anthropic-specific; set `prompt_caching = false` and
+leave `thinking` unset. For model IDs containing `openai.`, `effort` and
+`retry_effort` are sent as `reasoning.effort` instead of
+`output_config.effort` (GPT-6 Astra accepts `none`, `low`, `medium`,
+`high`, `xhigh`, `max`); for other non-Claude models leave them unset.
+Models that reject the temperature field (e.g. GPT reasoning models) also
+need `send_temperature = false`.
+
 ## Google Cloud Vertex AI
 
 Uses Claude models (and potentially others) via Google Cloud
@@ -400,3 +409,41 @@ Three things to watch:
   of the `review` child, so no key needs to reach the child.
 - Add each new deployment name to the `PRICING` table in `static/index.html`, or
   its reviews report no cost in the UI.
+
+## OpenAI models on Amazon Bedrock (Responses API)
+
+GPT models on Bedrock can be used through Bedrock's OpenAI-compatible Responses
+API with `provider = "openai-responses"`. Unlike the Converse API used by
+`provider = "bedrock"`, it accepts explicit prompt-cache breakpoints for GPT-5.6
+and later, so repeated prompt prefixes are read from cache.
+
+```toml
+[ai]
+provider = "openai-responses"
+model = "global.openai.gpt-6.1-sol"
+
+[ai.openai_compat]
+base_url = "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+context_window_size = 400000
+max_tokens = 64000
+reasoning_effort = "high"
+prompt_cache = "implicit"
+prompt_cache_ttl = "30m"
+bedrock_token = true
+```
+
+- `base_url`: `bedrock-runtime` (recommended by AWS; takes `global.`/`us.`
+  inference profile IDs) or `bedrock-mantle` (`https://bedrock-mantle.<region>.api.aws/v1`,
+  takes `openai.*` model IDs).
+- `bedrock_token = true`: short-term key from the AWS credential chain, valid only
+  in the endpoint's region. IAM needs `bedrock:InvokeModel` on the inference profile
+  and on the account's default project (`bedrock-runtime`), or
+  `bedrock-mantle:CreateInference` (`bedrock-mantle`).
+- `prompt_cache`: `implicit` additionally lets Bedrock place an automatic breakpoint
+  on the latest message, which covers the growing tool-call history. `explicit`
+  caches only up to the two breakpoints Sashiko places, on the system prompt and
+  the last user message. Bedrock allows at most 4 cache writes per request, and
+  Sashiko places at most 2 explicit breakpoints.
+- Cache writes are billed at 1.25× the input rate and reads at the cache-read rate.
+  Check the `Responses usage:` info log line (`RUST_LOG=sashiko::ai::openai_responses=info`)
+  to confirm `cache_read` grows on later turns.

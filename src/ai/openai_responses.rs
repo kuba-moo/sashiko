@@ -33,6 +33,8 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
+#[cfg(feature = "bedrock")]
+use std::time::Instant;
 use url::Url;
 
 const PROVIDER_TAG: &str = "openai-responses";
@@ -51,6 +53,8 @@ struct ResponsesRequest {
     reasoning: Option<Value>,
     include: Vec<String>,
     store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +93,8 @@ struct ResponsesUsage {
 struct InputTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u32>,
+    #[serde(default)]
+    cache_write_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,14 +110,34 @@ struct ResponsesApiError {
     message: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ResponsesOptions {
+    pub reasoning_effort: Option<String>,
+    pub api_key_env: Option<String>,
+    pub prompt_cache: Option<crate::settings::PromptCacheMode>,
+    pub prompt_cache_ttl: Option<String>,
+    pub bedrock_token: bool,
+}
+
 pub struct OpenAiResponsesClient {
     model: String,
     endpoint: String,
     context_window_size: usize,
     max_tokens: u32,
     reasoning_effort: Option<String>,
+    prompt_cache: Option<crate::settings::PromptCacheMode>,
+    prompt_cache_ttl: Option<String>,
+    bedrock_token: bool,
+    #[cfg(feature = "bedrock")]
+    token_region: Option<String>,
+    #[cfg(feature = "bedrock")]
+    token_cache: tokio::sync::Mutex<Option<(String, Instant)>>,
     client: Client,
 }
+
+/// Bedrock API keys last up to 12 h; refresh well before that.
+#[cfg(feature = "bedrock")]
+const TOKEN_REFRESH_AFTER: Duration = Duration::from_secs(11 * 3600);
 
 impl OpenAiResponsesClient {
     pub fn new(
@@ -120,28 +146,60 @@ impl OpenAiResponsesClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
-        reasoning_effort: Option<String>,
-        api_key_env: Option<String>,
+        options: ResponsesOptions,
     ) -> Result<Self> {
-        let api_key =
-            Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+        let ResponsesOptions {
+            reasoning_effort,
+            api_key_env,
+            prompt_cache,
+            prompt_cache_ttl,
+            bedrock_token,
+        } = options;
+        #[cfg(not(feature = "bedrock"))]
+        if bedrock_token {
+            return Err(anyhow!("bedrock_token requires the 'bedrock' feature"));
+        }
 
         let endpoint = Self::normalize_base_url(&base_url)?;
 
-        // Naming the variable rather than the key means a typo in `api_key_env`
-        // is silently ignored and falls back to the shared key, so record which
-        // variable actually authenticated this provider.
-        tracing::info!(
-            "OpenAI Responses provider for {model} authenticating with {}",
-            api_key_env
-                .as_deref()
-                .unwrap_or("OPENAI_API_KEY/LLM_API_KEY")
-        );
+        #[cfg(feature = "bedrock")]
+        let token_region = if bedrock_token {
+            Some(
+                crate::ai::bedrock_token::region_from_base_url(&endpoint)
+                    .or_else(|| std::env::var("AWS_REGION").ok().filter(|r| !r.is_empty()))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "bedrock_token: cannot determine the AWS region from {base_url}; set AWS_REGION"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let mut headers = reqwest::header::HeaderMap::new();
-        if !api_key.is_empty() {
-            let (name, value) = Self::auth_header(&endpoint, &api_key)?;
-            headers.insert(name, value);
+        if bedrock_token {
+            tracing::info!(
+                "OpenAI Responses provider for {model} authenticating with a short-term Amazon Bedrock API key"
+            );
+        } else {
+            let api_key =
+                Self::resolve_api_key(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+
+            // Naming the variable rather than the key means a typo in `api_key_env`
+            // is silently ignored and falls back to the shared key, so record which
+            // variable actually authenticated this provider.
+            tracing::info!(
+                "OpenAI Responses provider for {model} authenticating with {}",
+                api_key_env
+                    .as_deref()
+                    .unwrap_or("OPENAI_API_KEY/LLM_API_KEY")
+            );
+
+            if !api_key.is_empty() {
+                let (name, value) = Self::auth_header(&endpoint, &api_key)?;
+                headers.insert(name, value);
+            }
         }
 
         let client = Client::builder()
@@ -155,6 +213,13 @@ impl OpenAiResponsesClient {
             context_window_size,
             max_tokens,
             reasoning_effort,
+            prompt_cache,
+            prompt_cache_ttl,
+            bedrock_token,
+            #[cfg(feature = "bedrock")]
+            token_region,
+            #[cfg(feature = "bedrock")]
+            token_cache: tokio::sync::Mutex::new(None),
             client,
         })
     }
@@ -245,9 +310,40 @@ impl OpenAiResponsesClient {
             .is_some_and(|host| host.ends_with(".azure-api.net"))
     }
 
+    #[cfg(feature = "bedrock")]
+    async fn bedrock_bearer_token(&self) -> Result<String> {
+        let mut cache = self.token_cache.lock().await;
+        if let Some((token, created)) = cache.as_ref()
+            && created.elapsed() < TOKEN_REFRESH_AFTER
+        {
+            return Ok(token.clone());
+        }
+        let region = self
+            .token_region
+            .as_deref()
+            .ok_or_else(|| anyhow!("no region resolved for the Bedrock API key"))?;
+        let token = crate::ai::bedrock_token::generate_token(region).await?;
+        *cache = Some((token.clone(), Instant::now()));
+        Ok(token)
+    }
+
+    #[cfg(not(feature = "bedrock"))]
+    async fn bedrock_bearer_token(&self) -> Result<String> {
+        Err(anyhow!("bedrock_token requires the 'bedrock' feature"))
+    }
+
     async fn post_request(&self, body: &ResponsesRequest) -> Result<ResponsesResponse> {
         let retry_re = Regex::new(r"Please retry in ([0-9.]+)s").expect("valid retry regex");
-        let response = self.client.post(&self.endpoint).json(body).send().await;
+        let mut request = self.client.post(&self.endpoint).json(body);
+        if self.bedrock_token {
+            let token = self.bedrock_bearer_token().await.map_err(|error| {
+                OpenAiCompatError::AuthenticationError(format!(
+                    "failed to create Amazon Bedrock API key: {error:#}"
+                ))
+            })?;
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -291,17 +387,13 @@ impl OpenAiResponsesClient {
                 .into());
             }
             if let Some(usage) = &parsed.usage {
-                let cached_tokens = usage
-                    .input_tokens_details
-                    .as_ref()
-                    .and_then(|details| details.cached_tokens)
-                    .unwrap_or(0);
+                let details = usage.input_tokens_details.as_ref();
                 tracing::info!(
-                    "{}OpenAI Responses response received. Tokens: in={}, cached={}, out={}",
-                    crate::ai::get_log_prefix(),
-                    usage.input_tokens.saturating_sub(cached_tokens),
-                    cached_tokens,
-                    usage.output_tokens
+                    "Responses usage: in={}, out={}, cache_read={}, cache_write={}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    details.and_then(|d| d.cached_tokens).unwrap_or(0),
+                    details.and_then(|d| d.cache_write_tokens).unwrap_or(0)
                 );
             } else {
                 tracing::info!(
@@ -343,6 +435,81 @@ fn message_item(role: &str, content: String) -> Value {
 
 fn item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
+}
+
+/// Bedrock accepts `prompt_cache_breakpoint` only on `input_text` parts.
+fn add_cache_breakpoint(item: &mut Value) -> bool {
+    let is_prompt_message = item_type(item) == Some("message")
+        && matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("system" | "developer" | "user")
+        );
+    if !is_prompt_message {
+        return false;
+    }
+
+    let marker = json!({"mode": "explicit"});
+    match item.get_mut("content") {
+        Some(content) if content.is_string() => {
+            let text = content.take();
+            *content = json!([{
+                "type": "input_text",
+                "text": text,
+                "prompt_cache_breakpoint": marker,
+            }]);
+            true
+        }
+        Some(Value::Array(parts)) => {
+            match parts
+                .iter_mut()
+                .rev()
+                .find(|part| item_type(part) == Some("input_text"))
+            {
+                Some(part) => {
+                    part["prompt_cache_breakpoint"] = marker;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Marks the end of the system prompt and the last user message, leaving one
+/// of Bedrock's four cache writes for the automatic breakpoint in implicit mode.
+fn apply_prompt_cache(
+    request: &mut ResponsesRequest,
+    mode: crate::settings::PromptCacheMode,
+    ttl: Option<&str>,
+) {
+    let mut options = json!({"mode": mode.as_str()});
+    if let Some(ttl) = ttl {
+        options["ttl"] = json!(ttl);
+    }
+    request.prompt_cache_options = Some(options);
+
+    let input = &mut request.input;
+    let is_system = |item: &Value| {
+        item_type(item) == Some("message")
+            && matches!(
+                item.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+    };
+    let system_end = input
+        .iter()
+        .take_while(|item| is_system(item))
+        .count()
+        .checked_sub(1);
+    let last_user = input.iter().rposition(|item| {
+        item_type(item) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user")
+    });
+
+    for index in [system_end, last_user].into_iter().flatten() {
+        add_cache_breakpoint(&mut input[index]);
+    }
 }
 
 /// Keep only output items accepted as continuation input, removing a trailing
@@ -513,6 +680,7 @@ fn translate_ai_request(
         reasoning,
         include: vec!["reasoning.encrypted_content".to_string()],
         store: false,
+        prompt_cache_options: None,
     })
 }
 
@@ -622,9 +790,14 @@ fn translate_ai_response(response: ResponsesResponse) -> Result<AiResponse> {
         total_tokens: usage.total_tokens as usize,
         cached_tokens: usage
             .input_tokens_details
+            .as_ref()
             .and_then(|details| details.cached_tokens)
             .map(|tokens| tokens as usize),
-        cache_write_tokens: None,
+        cache_write_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens)
+            .map(|tokens| tokens as usize),
     });
     let truncated = incomplete_reason == Some("max_output_tokens");
 
@@ -682,12 +855,15 @@ impl AiProvider for OpenAiResponsesClient {
             "{}Sending OpenAI Responses request...",
             crate::ai::get_log_prefix()
         );
-        let body = translate_ai_request(
+        let mut body = translate_ai_request(
             request,
             self.model.clone(),
             self.max_tokens,
             self.reasoning_effort.clone(),
         )?;
+        if let Some(mode) = self.prompt_cache {
+            apply_prompt_cache(&mut body, mode, self.prompt_cache_ttl.as_deref());
+        }
         let response = self.post_request(&body).await?;
         translate_ai_response(response)
     }
@@ -865,6 +1041,49 @@ mod tests {
         assert_eq!(name, reqwest::header::AUTHORIZATION);
         assert_eq!(value.to_str()?, "Bearer sk-token");
         Ok(())
+    }
+
+    fn bedrock_token_options() -> ResponsesOptions {
+        ResponsesOptions {
+            bedrock_token: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[test]
+    fn bedrock_token_needs_no_static_api_key() {
+        // Region comes from the URL, so neither API-key nor AWS env is read.
+        let client = OpenAiResponsesClient::new(
+            "https://bedrock-mantle.eu-north-1.api.aws/v1".to_string(),
+            "model".to_string(),
+            1000,
+            100,
+            30,
+            bedrock_token_options(),
+        )
+        .expect("client without API key");
+        assert!(client.bedrock_token);
+        assert_eq!(client.token_region.as_deref(), Some("eu-north-1"));
+    }
+
+    #[cfg(not(feature = "bedrock"))]
+    #[test]
+    fn bedrock_token_requires_bedrock_feature() {
+        let error = OpenAiResponsesClient::new(
+            "https://bedrock-mantle.eu-north-1.api.aws/v1".to_string(),
+            "model".to_string(),
+            1000,
+            100,
+            30,
+            bedrock_token_options(),
+        )
+        .err()
+        .expect("must fail without the bedrock feature");
+        assert_eq!(
+            error.to_string(),
+            "bedrock_token requires the 'bedrock' feature"
+        );
     }
 
     #[test]
@@ -1111,5 +1330,169 @@ mod tests {
         let req = request(vec![assistant]);
 
         assert_eq!(estimate_tokens(&req), 900);
+    }
+
+    fn cached_request_value(
+        req: AiRequest,
+        cache: Option<(crate::settings::PromptCacheMode, Option<&str>)>,
+    ) -> Result<Value> {
+        let mut translated = translate_ai_request(req, "model".to_string(), 100, None)?;
+        if let Some((mode, ttl)) = cache {
+            apply_prompt_cache(&mut translated, mode, ttl);
+        }
+        Ok(serde_json::to_value(translated)?)
+    }
+
+    fn cache_request() -> AiRequest {
+        let mut req = request(vec![
+            message(AiRole::User, Some("first")),
+            message(AiRole::Assistant, Some("answer")),
+            message(AiRole::User, Some("second")),
+        ]);
+        req.system = Some("Be precise".to_string());
+        req.tools = Some(vec![AiTool {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: json!({"type": "object"}),
+        }]);
+        req
+    }
+
+    #[test]
+    fn prompt_cache_off_leaves_request_unchanged() -> Result<()> {
+        let value = cached_request_value(cache_request(), None)?;
+
+        assert!(value.get("prompt_cache_options").is_none());
+        assert!(!value.to_string().contains("prompt_cache_breakpoint"));
+        assert_eq!(value["input"][0]["content"], "Be precise");
+        assert_eq!(value["input"][1]["content"], "first");
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_prompt_cache_marks_system_and_last_user() -> Result<()> {
+        use crate::settings::PromptCacheMode;
+        let value = cached_request_value(
+            cache_request(),
+            Some((PromptCacheMode::Implicit, Some("30m"))),
+        )?;
+
+        assert_eq!(
+            value["prompt_cache_options"],
+            json!({"mode": "implicit", "ttl": "30m"})
+        );
+        let marker = json!({"mode": "explicit"});
+        assert_eq!(
+            value["input"][0]["content"],
+            json!([{
+                "type": "input_text",
+                "text": "Be precise",
+                "prompt_cache_breakpoint": marker,
+            }])
+        );
+        assert_eq!(value["input"][1]["content"], "first");
+        assert_eq!(value["input"][2]["content"], "answer");
+        assert_eq!(
+            value["input"][3]["content"],
+            json!([{
+                "type": "input_text",
+                "text": "second",
+                "prompt_cache_breakpoint": marker,
+            }])
+        );
+        assert_eq!(
+            value.to_string().matches("prompt_cache_breakpoint").count(),
+            2
+        );
+        assert!(
+            !value["tools"]
+                .to_string()
+                .contains("prompt_cache_breakpoint")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_prompt_cache_without_ttl_omits_ttl() -> Result<()> {
+        use crate::settings::PromptCacheMode;
+        let value = cached_request_value(cache_request(), Some((PromptCacheMode::Explicit, None)))?;
+
+        assert_eq!(value["prompt_cache_options"], json!({"mode": "explicit"}));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_cache_marks_injected_json_system_message() -> Result<()> {
+        use crate::settings::PromptCacheMode;
+        let mut req = request(vec![message(AiRole::User, Some("Score it"))]);
+        req.response_format = Some(AiResponseFormat::Json { schema: None });
+        let value = cached_request_value(req, Some((PromptCacheMode::Implicit, None)))?;
+
+        assert_eq!(
+            value["input"][0]["content"][0]["text"],
+            "Respond in JSON format."
+        );
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
+        assert_eq!(
+            value.to_string().matches("prompt_cache_breakpoint").count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_cache_keeps_replayed_items_unchanged() -> Result<()> {
+        use crate::settings::PromptCacheMode;
+        let items = vec![
+            json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}),
+            json!({"type": "message", "role": "assistant",
+                   "content": [{"type": "output_text", "text": "done"}]}),
+            json!({"type": "function_call", "call_id": "call_1", "name": "inspect",
+                   "arguments": "{}"}),
+        ];
+        let mut assistant = message(AiRole::Assistant, None);
+        assistant.reasoning = Some(vec![ReasoningBlock::ProviderOutput {
+            provider: PROVIDER_TAG.to_string(),
+            items: items.clone(),
+            token_estimate: None,
+        }]);
+        let mut tool = message(AiRole::Tool, Some("contents"));
+        tool.tool_call_id = Some("call_1".to_string());
+        let mut req = request(vec![message(AiRole::User, Some("go")), assistant, tool]);
+        req.system = Some("Be precise".to_string());
+
+        let value = cached_request_value(req, Some((PromptCacheMode::Implicit, None)))?;
+        let input = value["input"].as_array().unwrap();
+
+        assert_eq!(input[2..5], items[..]);
+        assert_eq!(input[5]["type"], "function_call_output");
+        assert!(input[5].get("prompt_cache_breakpoint").is_none());
+        assert_eq!(
+            value.to_string().matches("prompt_cache_breakpoint").count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_cache_write_tokens_from_usage() -> Result<()> {
+        let response: ResponsesResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 2048,
+                "output_tokens": 10,
+                "total_tokens": 2058,
+                "input_tokens_details": {"cached_tokens": 1920, "cache_write_tokens": 128}
+            }
+        }))?;
+        let usage = translate_ai_response(response)?.usage.unwrap();
+
+        assert_eq!(usage.cached_tokens, Some(1920));
+        assert_eq!(usage.cache_write_tokens, Some(128));
+        Ok(())
     }
 }

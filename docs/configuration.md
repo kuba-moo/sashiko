@@ -263,6 +263,9 @@ provider (`provider = "openai-responses"`).
 | `max_tokens` | integer | provider-specific | Max output tokens. Defaults to `4096` for Chat Completions and `16384` for Responses, whose limit also includes reasoning tokens. |
 | `reasoning_effort` | string | -- | Responses API reasoning effort, such as `low`, `medium`, or `high`; accepted values are deployment-specific and the setting is ignored by Chat Completions. |
 | `api_key_env` | string | -- | Name of the environment variable holding this model's API key -- the variable name, never the key itself. Lets two deployments on separate endpoints authenticate with different keys. Unset falls back to `OPENAI_API_KEY` then `LLM_API_KEY`; set but missing or empty from the environment is an error. Responses API only, ignored with a warning by Chat Completions. |
+| `prompt_cache` | string | -- | `implicit` or `explicit`: send Amazon Bedrock prompt-cache breakpoints (Responses only). |
+| `prompt_cache_ttl` | string | -- | Cache TTL sent with `prompt_cache`, e.g. `"30m"`. |
+| `bedrock_token` | bool | `false` | Authenticate with a short-term Amazon Bedrock API key from the AWS credential chain (Responses only). |
 
 Because each `[[ai.additional_models]]` entry carries its own `openai_compat`
 table, `api_key_env` is what makes two independently-keyed deployments possible:
